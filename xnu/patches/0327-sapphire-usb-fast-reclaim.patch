@@ -1,0 +1,50 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1043,7 +1043,39 @@
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_usb_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_usb_stats, "A", "USB Ethernet gadget state");
+ 
++/*
++ * 0327: reclaim a completed bulk transfer the instant its TRB HWO bit clears,
++ * on every poll (~1 ms) -- not only on the controller event, which gets lost
++ * under load (the link then froze until the next bus reset). HWO clear means the
++ * controller is done with the TRB, so taking it here is always safe; if the event
++ * does arrive, xfer_active is already clear and the handler ignores it. ud_watch
++ * keeps the slower force-rearm paths (HWO still set) on its 500 ms cadence.
++ */
+ static void
++ud_reclaim_fast(void)
++{
++	volatile uint32_t *rt = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
++	volatile uint32_t *tt = (volatile uint32_t *)(ud.dma + UD_TRB_TX);
++
++	if (!ud.configured || ud.lock == NULL) {
++		return;
++	}
++	ud_sync(UD_TRB_RX, 16);
++	if (ud.xfer_active[EP_RX] && !(rt[3] & TRB_HWO)) {
++		ud.xfer_active[EP_RX] = false;
++		ud_rx_done();           /* copies the frame and re-arms RX */
++	}
++	lck_mtx_lock(ud.lock);
++	ud_sync(UD_TRB_TX, 16);
++	if (ud.tx_busy && !(tt[3] & TRB_HWO)) {
++		ud.xfer_active[EP_TX] = false;
++		ud.tx_busy = false;
++		ud_tx_kick_locked();    /* send the next queued frame */
++	}
++	lck_mtx_unlock(ud.lock);
++}
++
++static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	uint32_t ticks = 0;
+@@ -1061,6 +1093,7 @@
+ 			}
+ 			dwc_wr(GEVNTCOUNT, count);
+ 		}
++		ud_reclaim_fast();
+ 		if ((ticks % 500) == 0) {
+ 			ud_watch();
+ 		}
