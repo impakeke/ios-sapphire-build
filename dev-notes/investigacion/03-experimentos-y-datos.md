@@ -606,3 +606,21 @@ command buffers, con un deslizamiento corto) y `metal-trace-2079-2.txt` (abrir T
 **Interpretación.** `c1` es la memoria de trabajo de la pasada (según el agente del driver, memoryless y sin carga
 ni almacenamiento: no mueve memoria, pero al ocupar sitio en GMEM deja bins de 128×128 y 78 tiles en vez de 42).
 El draw sin servir por frame y la causa del redibujado a 10 Hz en reposo están sin identificar.
+
+## M15 — Guion del home desde la primera página; listón de tiles y estado por bin (2026-11-14)
+
+`homeswipe.sh` pulsa dos veces el botón home tras desbloquear, para partir siempre de la primera página. Sin eso,
+entre ensayos con reinicio de backboardd la carga caía en pantallas distintas (33-135 draws por buffer en una tanda
+que se descarta). Con ello, 120-135 draws por buffer en todos los ensayos.
+
+Kernel 0352 a 820 MHz, `merge-3`, ensayos intercalados:
+
+| Opción del driver | n | Buffers/s | A tiempo / tarde / paradas | Commit→fin |
+|---|---|---|---|---|
+| (ninguna) | 3 | 46,3 · 46,1 · 38,7 | 965/270/60 · 907/328/64 · 468/527/17 | 27,9 · 30,4 · 22,8 ms |
+| `metal_gmem_draws=6` (a tiles toda pasada de más de 5 draws) | 2 | 44,2 · 48,2 | 755/357/57 · 836/320/33 | 29,3 · 27,5 ms |
+| `metal_gmem_off=64` (estado de los draws repetido en cada bin) | 1 | 35,3 | 260/603/56 | 43,8 ms |
+
+**Interpretación.** En el home el listón de tiles no cambia nada medible. Repetir el estado en cada bin (como
+hacía la base) cuesta una cuarta parte de los frames: el trabajo del procesador de comandos por bin pesa. La base
+varía entre 38,7 y 46,3 buffers/s con la misma configuración: las diferencias pequeñas no son concluyentes.
