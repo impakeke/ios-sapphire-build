@@ -35,16 +35,21 @@ búsquedas, lista de candidatos y cruce de hashes en `~/sapphire-angel/research/
      derivados; la misma receta sobre PanVK, NVK, RADV, ANV y pvr.
    - (C) GPU virtual: reims-vgpu y otras tres reimplementaciones del host de ParavirtualizedGraphics, DroidVM, x86sim.
    - CoreAnimation en modo OpenGL ES sobre Mesa freedreno (sin Metal): HackiOS, ios-topaz, ios-citrus.
-3. **Para Mali, PowerVR, Tegra, NVIDIA, AMD e Intel nadie escribe un driver Metal directo**: todos van por Vulkan.
-   Directo solo hay en Adreno.
-4. **En el Adreno 610** hay cinco ports hermanos (§3.5). Los dos con cifras usan GLES sobre freedreno: 25-35 fps
-   (ios-topaz) y ~50 fps a 1080×2340 limitado por relleno de GPU (ios-citrus). De la ruta Vulkan en a610 no hay
-   ninguna cifra publicada.
+3. **Fuera de Adreno casi todo va por Vulkan.** Las excepciones son `7ez/malachite` (NVIDIA, directo, sin licencia)
+   y los drivers sobre Gallium Panfrost para Mali (HackiOS rama `mtk`, viva-gpu). Con PM4 propio solo están
+   hakios-metal y Snapintosh.
+4. **En el Adreno 610** hay nueve ports hermanos (§3.5). Con GLES sobre freedreno: 25-35 fps (ios-topaz) y ~50 fps
+   a 1080×2340 limitado por relleno de GPU (ios-citrus). Con Metal sobre Turnip: 18-114 ms de GPU por envío,
+   limitado por memoria, y GMEM peor que sysmem por los ~800 bins por frame (ios-spes).
 5. **Veredicto provisional (§10):** hakios-metal sigue siendo la base. Snapintosh es el único driver directo ajeno,
    pero es de otra generación (a8xx), solo renderiza en sysmem y depende de la mitad de kernel de IOGPU de Apple,
-   que un XNU de fuente no tiene. Quedan tres candidatos sin abrir (§13).
+   que un XNU de fuente no tiene. `MC-XiaoXiao/ios_sagit` es otro driver directo independiente (a5xx), con la misma
+   dependencia y sin evidencia de ejecución. Lo más aprovechable de inmediato son los parches de rendimiento de
+   `mateusseiboth/darwin-lisa` sobre el propio hakios-metal (§9.27).
 6. **Blobs de Android desde Darwin (§8):** nadie lo hace ni lo propone. Es posible, pero cuesta lo mismo que la
    ruta Vulkan y no elimina la traducción desde Metal; el blob sirve como oráculo en Android.
+7. **Ausencias comprobadas (§11.2):** no hay nada sobre los drivers PowerVR de Apple, ni Metal sobre Direct3D o
+   Windows, ni virtio-gpu con Metal, ni un front end Metal en Mesa, ni Metal para Vivante, Xclipse o VideoCore.
 
 ## 2. Mapa de la escena
 
@@ -116,9 +121,11 @@ Fechas: creación del repo / último push (API de GitHub).
 | «libredwoodair» de HackiOS | https://github.com/oosexgang/hakios-xnu-kernel (rama `mtk`, `a962798`, `tools/mesa/air/air_metal.c`) | MIT | C | 2026-10-22 / 2026-11-10 | Mali-G52 (MT6768) vía panfrost | Metal sobre Gallium | AIR→NIR→driver Gallium | [README]; captura `docs/x6826b-metal-mali.png` | es HackiOS |
 | SapphireMetal, ios-miatoll | https://github.com/Angelpro09xd/ios-sapphire · https://github.com/samrat1games/ios-miatoll | sin SPDX | C / ObjC | 2026-10-19 … | Adreno 610 / 618 | `air_metal.c` de HackiOS en ports de ios-sweet | AIR→NIR→ir3 | [O] `air_metal.c` y `air_to_nir.c` modificados de HackiOS | comparte código |
 | fiio-jm21-xnu | https://github.com/soumarcelino/fiio-jm21-xnu (`6f8cb22`) | sin SPDX | C | 2026-11-01 / 2026-11-01 | Adreno 610 (SM6225), userland 16.5 | `HakiosMetal.m` + `tools/mesa/air/hakios_gallium.c` + driver de kernel a610 propio | AIR→NIR→Gallium | [README] acelerado; 2 commits | copia modificada (243 blobs) |
-| Stela | https://github.com/tylertms/Stela (`9840885`) | GPL-2.0 | Rust / C | 2026-10-12 / 2026-11-14 | NVIDIA, macOS Apple Silicon traducido en PC x86 | [S] bundle invitado `StelaGPUDevice : _MTLDevice` + driver NVIDIA propio | [S] AIR→NIR→NAK; `air_to_nir.c` (448 KB) con el mismo nombre que el de HackiOS | parentesco con HackiOS NO VERIFICADO | sin comprobar |
-| ios_sagit | https://github.com/MC-XiaoXiao/ios_sagit (`673f850`) | sin SPDX | ObjC++ / C++ | 2026-10-23 / 2026-11-04 | Adreno 540 (a5xx), Xiaomi 6 | NO VERIFICADO: `drivers/gpu/QcomMTL/QcomMTL.mm` (430 KB), `tools/gpu-compiler/AIR.cpp`, `AdrenoPipeline.h`; 2,6 MB de GPU propio | NO VERIFICADO | NO VERIFICADO | casi sin blobs comunes |
-| Veerhooda/iOS | https://github.com/Veerhooda/iOS (`5e6bafa`) | sin SPDX | ObjC / C++ | 2026-11-01 / 2026-11-13 | NO VERIFICADO | `userland/OP2Metal/OP2Metal.m` (118 KB), `OP2GPU.cpp`; `userland/op2gpu/` con nombres de archivo de hakios-metal | NO VERIFICADO | NO VERIFICADO | probable derivado |
+| Stela | https://github.com/tylertms/Stela (`9840885`) | GPL-2.0 | Rust / C | 2026-10-12 / 2026-11-14 | NVIDIA, macOS Apple Silicon traducido en PC x86 | [S] bundle invitado `StelaGPUDevice : _MTLDevice` + driver NVIDIA propio | [S] AIR→NIR→NAK con front end propio | [S] es clase C: traduce macOS arm64 en un PC con un SoC de Apple emulado; issues de terceros, la mayoría fallos de arranque | independiente: 8 líneas comunes de 11 529 con el `air_to_nir.c` de HackiOS |
+| malachite | https://github.com/7ez/malachite (`bc2cb49`) | sin licencia | C / ObjC++ | 2026-10-25 / 2026-11-14 | NVIDIA RTX 30, macOS en PC | [S] `MalachiteDevice : MTLIOAccelDevice` escribe sus propios registros en los command buffers de kernel; kext propio | [S] AIR→IR propio→SASS, con lector de bitcode propio | [README] WindowServer y Geekbench; solo el autor | independiente |
+| viva-gpu | https://github.com/Nik300/viva-gpu (`ae12bec`) | sin licencia | ObjC / C | 2026-11-03 / 2026-11-14 | Mali-G57 (Helio G96), **iOS 16.7.16**, XNU propio | [S] `VMDevice : _MTLDevice` → Gallium Panfrost dentro del bundle → user client de un servicio `IOAcceleratorES` | [S] AIR→NIR con el libLLVM del sistema | contradictorio: una lectura dice backboardd y SpringBoard a ~40 fps [docs del autor]; otra, que solo corre en un Mac con llvmpipe y falta el driver de kernel | independiente |
+| ios_sagit | https://github.com/MC-XiaoXiao/ios_sagit (`673f850`) | sin SPDX | ObjC++ / C++ | 2026-10-23 / 2026-11-04 | Adreno 540 (a5xx), Xiaomi 6 | [S] `QcomMTLDevice : _MTLDevice` envía descriptores de draw; el kext `QcomGPU`, que hereda de la clase IOGPU de Apple, los valida y codifica a PM4 a5xx (GMEM y bypass) | [S] AIR→NIR directo con el libLLVM del sistema, respaldo AIR→GLSL; ir3 de Mesa 24.3.4 | [S] 123 archivos, 39 300 líneas; ejecución solo [README], sin logs ni capturas | independiente: menos del 9 % de líneas comunes |
+| Veerhooda/iOS | https://github.com/Veerhooda/iOS (`5e6bafa`) | sin SPDX | ObjC / C++ | 2026-11-01 / 2026-11-13 | Adreno 430 (a4xx), OnePlus 2, iOS 12.5.7 | [S] `OP2MetalDevice` → `op2mtl.c` → Gallium fd4 (solo sysmem) → `OP2GPU` | [S] front end AIR de HackiOS parcheado para iOS 12 → NIR → ir3 | [S] tres capturas de framebuffer en `docs/` | reescritura sobre piezas de HackiOS (10-12 % común; transporte 77 %) |
 
 ### 3.2 Clase B — Metal sobre Vulkan
 
@@ -133,9 +140,10 @@ Fechas: creación del repo / último push (API de GitHub).
 | macos-pixel8a, hackios-pixel7pro, UniXNU-opi5plus, MaliMetal | https://github.com/Rubanoxd/macos-pixel8a · https://github.com/Kaydn913/hackios-pixel7pro · https://github.com/Hange777/UniXNU-opi5plus · https://github.com/Ken-u/MaliMetal | 2026-10 … 11 | Mali-G715, G710, G610 | metal2vulkan → PanVK (o panfrost) con kext Mali propio | [S] |
 | UniXNU-a04br3 | https://github.com/mouseos/UniXNU-a04br3 | 2026-10-22 / 2026-11-02 | PowerVR GE8300 (MT8167) | kext `NativePowerVR` + Mesa pvr con winsys Darwin + plug-in Metal, sin terminar | [S] |
 | ios-on-switch-lmao | https://github.com/brunostjohn/ios-on-switch-lmao | 2026-11-05 / 2026-11-14 | Tegra X1 (GM20B) | `drivers/TegraGM20BMetal/TegraGM20BMetalPlugin.mm`, frontend de UniXNU modificado, metal2vulkan, Mesa NVK | [O] archivos; ejecución NO VERIFICADA |
-| NullMoth y copias | https://github.com/nullmoth/nvidia-macos-driver (`87e524a`); copias: `OakRoller/SiliconWing`, `watchthelight-labs/WTLNvidiaGfx`, `WTLIntelGfx`, `zep245/IrisXe-macos-driver`, `leolivm/vermilion`, `Johncall20/GreenMetal`, `luuumi-dev/nullarc` | 2026-10-07 / 2026-11-14 | NVIDIA (y AMD, Intel en las copias), macOS en PC y eGPU | [S] `NVMTLDevice : MTLIOAccelDevice`, PolyForm-NC; plug-in `nvmtl_vk.c` sobre Vulkan, kext NVRM, metal2vulkan vendorizado | [S] genealogía; ejecución NO VERIFICADA |
+| NullMoth y copias | https://github.com/nullmoth/nvidia-macos-driver (`87e524a`); copias: `OakRoller/SiliconWing`, `watchthelight-labs/WTLNvidiaGfx`, `WTLIntelGfx`, `zep245/IrisXe-macos-driver`, `leolivm/vermilion`, `Johncall20/GreenMetal`, `luuumi-dev/nullarc` | 2026-10-07 / 2026-11-14 | NVIDIA (y AMD, Intel en las copias), macOS en PC y eGPU | [S] `NVMTLDevice : MTLIOAccelDevice`, PolyForm-NC; plug-in `nvmtl_vk.c` sobre NVK, kext NVRM (el módulo abierto de NVIDIA con capa XNU), fork muy modificado de metal2vulkan | [S] 82 releases, unas 270 000 descargas e issues de cientos de usuarios con hardware |
 | Cobalt64 | https://github.com/Almosst-DEV/Cobalt64 (`d1f7bad`); copia `Frame121/CherryRed` | 2026-10-02 / 2026-10-15 | AMD RDNA4, macOS en PC | [S] `Navi48Device : MTLIOAccelDevice`, MIT; metal2vulkan → RADV portado | [S] genealogía; ejecución NO VERIFICADA |
-| Otros de PC sin abrir | `RX4Darwin/AMDRadeonRDNA4.kext`, `VedCloud/Meteor-Lake-Xe-LPG-Metal-Graphics`, `Helemen7/RedNavi`, `imrasalghul/HackyNavi`, `pawan295/Appleinteltgldriver.kext`, `Asada8851/StrixArc`, `yusufklncc/intel-gpu-macos-driver` | 2026-07 … 11 | AMD, Intel | NO VERIFICADO | NO VERIFICADO |
+| Otros de PC | `RX4Darwin/AMDRadeonRDNA4.kext` (el kext hace de host del GPU paravirtual de Apple y ejecuta el flujo en PM4 de AMD: clase C), `Helemen7/RedNavi` (independiente, RADV), `kvarun-p/NVBringup` (MIT, AIR→NIR propio del 2026-10-02), `watchthelight-labs/WTLIntelGfx` y `zep245/IrisXe-macos-driver` (i915 de Linux sobre LinuxKPI + ANV + plug-in de NullMoth) | 2026-07 … 11 | AMD, NVIDIA, Intel | Metal → Vulkan con kext nativo o driver DRM de Linux portado | [S] |
+| Solo kext, sin Metal (clase D) | `pawan295/Appleinteltgldriver.kext`, `imrasalghul/HackyNavi`, `gabrielmaialva33/NVDAAL-Driver`, `pongpan-bk/First-Custom-iGPU-Driver-for-Intel-Core-5-120U-on-macOS` | 2025-07 … 2026-11 | Intel, AMD, NVIDIA | — | [S] |
 
 ### 3.3 Clase C — paravirtualizado o simulador
 
@@ -161,6 +169,13 @@ Fechas: creación del repo / último push (API de GitHub).
 | agx-re | https://github.com/ADevWithAnIdea/agx-re | E | ingeniería inversa de AGX G16/G17 | NO VERIFICADO |
 | LLAIR, lvslang, rosemetal, darling-metal, indium | https://github.com/gzorin/LLAIR · https://github.com/darlinghq/darling-metal | E / B | bibliotecas de AIR y reimplementaciones de Metal fuera de Darwin | [S] una línea |
 | Project-Cascadia | https://github.com/rzxvx/Project-Cascadia | E | Linux en iPhones A5-A13: driver DRM `apple-sgx` y trazas del GPU de iOS (sentido inverso) | NO VERIFICADO |
+| PureDarwin (ramas `upstream-xnu-12377`, `a690-experimental`) | https://github.com/PureDarwin/PureDarwin (`bfe761f`, `ba5c3ec`) | E / C | driver de kernel a6xx para XNU con licencia permisiva (`PDDRMmsm/pd_msm_a6xx.c`, GMU, SMMU-500) y uAPI msm para correr freedreno; `AppleParavirtGPU : PDAccelerator` se hace pasar por el GPU paravirtual de Apple y un demonio ejecuta su flujo. Sin Metal sobre Adreno; valores del A690 | [S]; ejecución sin confirmar |
+| TeraScale Metal Shim | https://github.com/Nik300/viva-gpu/tree/main/shim | B (OpenGL) | `TSMtlDevice : _MTLDevice` con AIR→GLSL 4.10 sobre OpenGL 4.1 y OpenCL, para GPU AMD sin Metal en macOS de PC | [S]; solo documentación propia |
+| QuartzCore de Apple en Windows | https://github.com/WebKit/WebKit (`Source/WebKitLegacy/win/WebKitQuartzCoreAdditions/CAD3DRenderer.cpp`, `5ca6816ffb`) | precedente | `Direct3DCreate9` → `CARenderOGLNew(&kCARenderDX9Callbacks, …)`: el renderer `CA::OGL` de Apple admite backends por tabla de callbacks; producto de 2009 a 2022 | [S], sobre el código de enlace |
+| Corellium | https://support.corellium.com/releases | D | el hipervisor emula el controlador de pantalla, iOS pinta por CPU y sale como vídeo; desde la 7.12.0 (2026-07-23), «Metal por software» | [S], notas de versión y documentos judiciales |
+| WinObjC, ipasim, touchHLE | https://github.com/microsoft/WinObjC | — | WinObjC solo tiene stubs de Metal; los otros dos no tienen Metal | [S] |
+| Ports de XNU a Raspberry Pi | https://github.com/anurodhp/xnu-iokit-pi3 | D | framebuffer; el más avanzado da OpenGL 2.1 con Mesa vc4, sin Metal | [S] |
+| WebMetal, AirWgsl | https://github.com/MovByte/WebMetal · https://github.com/MovByte/AirWgsl | C / E | `guest/SPI/clients/QuartzCore.tsv` (488 selectores que CoreAnimation pide al dispositivo) y `tables/intrinsics.toml` (384 nombres `air.*`); AGPL-3.0 | [S] |
 
 ### 3.5 Mismo SoC o misma GPU que sapphire (Adreno 610)
 
@@ -173,6 +188,37 @@ Fechas: creación del repo / último push (API de GitHub).
 | ios26-sapphire | https://github.com/HouseOfBalance/ios26-sapphire (`c5cbd52`) | SM6225 (este teléfono), iOS 26 | 2026-11-02 / 2026-11-11 | 844 blobs de HackiOS; parches de la pila Vulkan en `gpu2/` | — | el README describe un «Adreno 830»: texto copiado de otro port. Sin evidencia de GPU en el a610 |
 | ios-citrus | https://github.com/ezariago/ios-citrus (`d68733d`) | SM6115 | 2026-10-25 / 2026-10-30 | iOS 16.7.16, kernel de 4 KiB, driver de kernel propio | GLES sobre Mesa freedreno | [README] ~50 fps a 1080×2340 con la GPU a 950 MHz; en pausa |
 | willowios | https://github.com/FoxxoOwO/willowios (`ac55bd7`) | SM6125 | 2026-10-24 / 2026-11-14 | port de ios-topaz con Bergamota | GLES | NO VERIFICADO |
+| ios-spes | https://github.com/AdyaGMD/ios-spes (rama `spes`, `bdc2682`) | SM6225 (Redmi Note 11) | — / 2026-10-28 | pila de HackiOS | GLES y, opcional, Metal→metal2vulkan→Turnip | [S][README] `NOTES.md:33-58`: 18-114 ms de GPU por envío a 1125×2436, limitado por memoria; `:92-94`: el GMEM de 128 KB da unos 800 bins por frame y rinde peor que sysmem; subir a 1115 MHz no gana nada |
+| iOSPlus10, rama `laurel-sprout` | https://github.com/akshaynexus/iOSPlus10 (`b2ffcac`) | SM6125 (Mi A3) | 2026-10-24 / 2026-11-07 | pila de UniXNU sobre un kernel derivado de HackiOS | Metal→metal2vulkan→Turnip, iOS 26 | [S][README] `docs/laurel_sprout/gpu.md` compara el a610 de trinket con khaje; el 73 % del tiempo de GPU se va en cómputo |
+
+### 3.6 Ports a teléfonos con código de GPU propio (barrido de repos)
+
+Todo **[S]**: el subagente abrió el árbol y los archivos en el commit citado; la ejecución es siempre [README].
+Linajes: **GLES** = CoreAnimation en OpenGL ES sobre un shim EAGL y Mesa Gallium, sin Metal; **Gallium** = Metal
+con AIR→NIR sobre Mesa Gallium; **Vulkan** = metal2vulkan; **reenvío** = a la GPU que conserva Android.
+
+| Proyecto | URL | Creado / último | GPU | Linaje y clase | Qué hay |
+|---|---|---|---|---|---|
+| ios-sailfish | https://github.com/joranv1/ios-sailfish (`6f27e41f`) | 2026-10-21 / 10-22 | Adreno 530 | GLES (B) | driver de kernel propio, `tools/sweetgl/eagl.c`, freedreno dentro de backboardd; 20-40 fps |
+| ios-rebivincek | https://github.com/rebopawl-official/ios-rebivincek (`9e708994`) | 2026-11-13 / 11-14 | Adreno 506 | GLES (B) | deriva de ios-topaz; 3-18 fps |
+| sapphire-khanh | https://github.com/HouseOfBalance/sapphire-khanh (`a9b42fae`) | 2026-11-07 | Adreno 610, este teléfono | E | port de ios-topaz: `CP_ME_INIT` y un relleno 2D leído por CPU; la UI va por CPU |
+| ios-flame | https://github.com/NWylynko/ios-flame (`745c4341`) | 2026-10-22 | Adreno 640 | A y Vulkan | `phone/metal/SweetMetal.m` (79 KB), `a6draw.m`; `sweetmtl=2` usa metal2vulkan; 20-26 fps |
+| DC28088/ios-sweet | https://github.com/DC28088/ios-sweet (`1eeba8aa`) | 2026-10-18 / 11-14 | Adreno 618 | A | `userspace/native-metal` (AIR→NIR→ir3) sobre el kernel de UniXNU |
+| ios-sweet-gpu | https://github.com/limonetexd/ios-sweet-gpu (rama `gpu`, `411469df`) | 2026-10-31 / 11-14 | Adreno 618 | Gallium (A) | 16 parches sobre el driver Mesa de HackiOS |
+| hackios k90-port | https://github.com/iola1999/hackios-xnu-kernel (rama `k90-port`, `972ee4b9`) | 2026-10-23 / 11-14 | Adreno 830, iOS 26 | Gallium (A) | `annibalemetal*`: subclase de `_MTLDevice` sobre freedreno; documenta qué exige `MTLAddDevice`; ~92,5 fps |
+| viva-gpu | https://github.com/Nik300/viva-gpu (`ae12becb`) | 2026-11-03 / 11-14 | Mali-G57 | Gallium (A), sin correr | `VivaMTLDriver.bundle` sobre Panfrost; probado en un Mac con llvmpipe; falta el driver de kernel |
+| ios-a5xelte | https://github.com/orhunnx/ios-a5xelte (`003f32f0`) | 2026-10-19 / 11-03 | Mali-T720 | A, diseño propio | `A5MaliMetalAPI.m` (165 KB): adaptador Metal estrecho con los shaders de QuartzCore pretraducidos |
+| Mali + MaliMetal | https://github.com/Ken-u/Mali · https://github.com/Ken-u/MaliMetal | 2026-10-29 / 11-08 | Mali-G610 (RK3588) | Vulkan (B) | kext CSF de 178 KB + PanVK + frontend de UniXNU; ~50 fps |
+| scion-kernel | https://github.com/Scion-Project/scion-kernel (`2a79ef85`) | 2026-10-22 / 11-14 | Mali-G72 | GLES (B) y reenvío (C) | `hakios.mali.c` (92 KB) y panfrost; `vgpu3d` y gfxstream hacia el host Android |
+| ios-cubs | https://github.com/hesm4tt/ios-cubs (`f4b4b6df`) | 2026-10-30 / 11-10 | PowerVR (Pixel) | reenvío (C) | XNU en un núcleo junto a Android vivo; `pixel/gpusrv` en Rust; 10-15 fps |
+| Adrenoline | https://github.com/ilertnost/Adrenoline (`e9da6e76`) | 2026-10-28 / 11-09 | Adreno 540 | E | cabeceras de un frontend Metal a5xx e inventario de shaders de CoreAnimation; sin driver |
+
+Forks que llevan hakios-metal o su kernel a otro Adreno: `JosephMontfort/hakios-xnu-kernel-garnet` (Adreno 710,
+36 archivos de GPU), `kiwiiiii-eth/hakios-xnu-kernel` rama `fajita` (a630, `hakios.a630.c` de 185 KB),
+`printlndarling/hakios-thyme` (a650), `pixelpixys/hakios-malmo` (a619), `telegdyd/hakios-xnu-kernel` rama
+`negroni-dev` (IFPC y DCVS). De UniXNU/Adreno740: `RigoLigoRLC/unixnu-adreno6xx` (a642L con GMU, +14 686 líneas) e
+`IOS4Amethyst/NativeAdreno` (a810). Ningún fork de Chlorophyll diverge; sus cambios viven en forks de Bergamota
+para el a630. No aparece ningún driver Metal para teléfonos anterior al 2026-10-19.
 
 ## 4. Fichas
 
@@ -233,9 +279,11 @@ Ninguna medida aquí. Sirven para ordenar las rutas, no para comparar teléfonos
 | Metal → metal2vulkan → Turnip | UniXNU sheng, Adreno 740 | media 72,1 y 68,2 fps; mínimos 41,5 y 35,2 | `UniXNU/docs/devices/sheng.md:612` (`0c1bac3`) | README |
 | Metal → metal2vulkan → Turnip | data-a-live, Adreno 840, iOS 16 | «unos 110 fps de media» en swipes a 120 Hz | README (`d2c7089`) | README |
 | Metal → metal2vulkan → Turnip (invitado) | DroidVM, macOS 27 | arrastre de ventana 80-109 fps | `macOS-DroidVM/docs/k27-virtio-gpu-3d-plan.md` (2026-11-02) | README |
+| Metal → metal2vulkan → PanVK | macos-pixel8a, Mali-G715, macOS 26.5 | arrastre a ~55 fps; ~150 µs de CPU por draw en el puente | README (`58f2ce5`) | README, [S] |
 | Metal → Gallium freedreno | Chlorophyll, Adreno 630 | 20,8 → 28,4 fps en swipe | `Chlorophyll/docs/FIXES.md` | README |
 | Metal → Gallium panfrost | HackiOS `mtk`, Mali-G52, 720×1640 | 92-96 % de frames dentro de 18 ms | `docs/metal-x6826b-plan.md` (rama `mtk`) | README |
 | GLES de CoreAnimation → freedreno | HackiOS, Adreno 642L | scroll de Settings 107-114 fps | `metal-measurements.md` (2026-10-31) | HEREDADO |
+| Metal → metal2vulkan → Turnip | ios-spes, **Adreno 610** (SM6225), 1125×2436 | 18-114 ms de GPU por envío; limitado por memoria | `NOTES.md:33-58` (`bdc2682`) | README, [S] |
 | GLES de CoreAnimation → freedreno | ios-topaz, **Adreno 610** | 25-35 fps en animaciones | README (`e477291`) | README |
 | GLES de CoreAnimation → freedreno | ios-citrus, **Adreno 610** a 950 MHz, 1080×2340 | ~50 fps en scroll, limitado por GPU | README y `AGENTS.md` (`d68733d`) | README |
 | Metal → PM4 directo | Snapintosh, Adreno X2-90, 2880×1800 | 46-60 presentaciones por segundo | `docs/STATUS.md` (`940eeb9`) | README |
@@ -428,6 +476,63 @@ de macOS 26.7.1, misma base de código `ogl-metal.mm`, sin confirmar en iOS 16.7
     0BSD) es Metal sobre Vulkan con un traductor AIR→SPIR-V que cubre 44 intrínsecos: menos que el front end de
     HackiOS.
 
+De la escena de PC y de `viva-gpu` ([S]):
+
+23. **Lo que exige iOS 16.7, documentado por `Nik300/viva-gpu`**: registro del plug-in (`uapi/README.md:8-16`: Metal
+    busca `IOServiceMatching("IOAcceleratorES")` y carga el bundle de `/System/Library/Extensions`); rellenar
+    `_limits` por nombre de campo (`driver/metal/VMDevice.m:134-212`); anunciar el perfil Apple3 y no Apple4 para
+    que CoreAnimation no use tile shaders (`VMDevice.m:17-53`); reutilización de framebuffers con
+    `IOMobileFramebufferSwapWait` y contadores de uso de IOSurface en la página compartida
+    (`docs/ANALISI-SCANOUT-RE.md:13-30`); anatomía de un frame de la pantalla de inicio
+    (`docs/FINDINGS-2026-11-03.md`); ABI de IOSurfaceAccelerator (`docs/ABI-IOSURFACEACCELERATOR.md`).
+24. **SPI privada con la respuesta de cada selector**: `tylertms/Stela` `guest/stela-gpu/bundle/SPI.m:16-284` y
+    `Device.m:137-262`; `Helemen7/RedNavi` `docs/M6_WINDOWSERVER_STUDY.md:84-135` lista lo que pide QuartzCore en el
+    orden en que falla.
+25. **Cachés**: archivos con pie de verificación y escritura por rename (`nullmoth/nvidia-macos-driver`
+    `plugin/nvmtl_cache_file.h`), pretraducción en segundo plano (`nvmtl_pretranslate.h`), pipeline de reserva con
+    sustitución en caliente (`Almosst-DEV/Cobalt64` `tools/native/navi48metal/n48_hotswap.h`).
+26. **Front ends AIR→NIR independientes para pruebas cruzadas**: NVBringup (2026-10-02, MIT), HackiOS (2026-10-19,
+    MIT), Stela (2026-10-21, GPL-2.0+), viva-gpu (sin licencia) y `air2ir3` de Snapintosh (MIT). NullMoth y sus
+    copias son de uso no comercial; viva-gpu y malachite no tienen licencia y solo valen como referencia.
+
+De los ports a teléfonos ([S]):
+
+27. **Parches de rendimiento sobre hakios-metal**: `mateusseiboth/darwin-lisa` (`ba47366`, MIT), en
+    `kernel/drivers/gpu/userland/`. `hakios-metal-draw-cpu.patch` reutiliza los flujos y la clave del draw y hace
+    de la sombra de registros una tabla con generación (−15 % de CPU por draw en host);
+    `hakios-metal-x-pass-reuse.patch` reutiliza la sombra entre pases (un pase cuesta unos 4 draws de CPU);
+    `hakios-metal-spec-s2v.patch` usa `nir_lower_scratch_to_var` y baja el über-shader de 38 560 palabras a 32-768;
+    `hakios-metal-cache-fsync.patch` y una caché sembrada en la imagen; `kernel/patches/sched-prefer-*.patch` lleva
+    los draws de backboardd en núcleos pequeños del 21-45 % al 1 %. `docs/gpu-device-test.md:177-191` mide un draw a
+    pantalla completa: 0,93 ms opaco, 1,78 con fetch, 4,45 muestreando una textura lineal de pantalla; `:579-606`
+    elige GMEM o sysmem por tipo de pase; `:135-152` prueba UBWC en render targets y lo descarta por errores de
+    imagen. Sus cifras son [README]: los logs que cita no están en el repo.
+28. **Fusión de pases y barreras**: `bangprovn/ios-fuxi` `docs-lanes/gpu-barriers.md` (97 draws en 61 pases;
+    barrera solo en draws con fetch); `stormtroopxyz/y2sios` `README.md:284-286` (cola de completado en QoS
+    interactivo, `commit` asíncrono, buffers de constantes ligados in situ: la copia era el 48 % del window server).
+29. **Paquete de pipelines de CoreAnimation precompilados con respaldo completo**:
+    `brunostjohn/ios-on-switch-lmao` `drivers/TegraGM20BMetal/TegraGM20BMetalPlugin.mm:47-55`. Reconstrucción de las
+    especializaciones exactas desde los archivos de GPU de Apple: `MC-XiaoXiao/ios_sagit`
+    `tools/gpu-compiler/apple-shader-archive.py:2-7`.
+30. **Sin `IOAcceleratorES` en el registro, `CAMetalContextCreate` sondea 300 veces cada 100 ms**:
+    `edi194/ios-fajita` `xnu/patches/0087-fajita-empty-ioacceleratores.patch:8-13`. Arranque de un a6xx gen1 en XNU:
+    `chiba233/Trogdor-ipadOS` `platform/coachz-prelink/package/CoachzGpu.cpp`.
+
+De otras plataformas ([S]):
+
+31. **Driver de kernel a6xx para XNU con licencia permisiva**: PureDarwin `PDDRMmsm/pd_msm_a6xx.c`, `pd_msm_bo.c` y
+    `spec/a690-sc8280xp-bringup.md` (SQE, ring, `CP_ME_INIT`, fence por `CP_EVENT_WRITE CACHE_FLUSH_TS`). Su uAPI
+    msm permite correr Mesa freedreno sobre el mismo kernel como oráculo de PM4. Los valores son del A690, con GMU.
+32. **Selectores que CoreAnimation pide al dispositivo**: `MovByte/WebMetal` `guest/SPI/clients/QuartzCore.tsv`
+    (488 filas). La tabla de intrínsecos `air.*` más completa hallada: `MovByte/AirWgsl` `tables/intrinsics.toml`
+    (384 nombres). Ambos son AGPL-3.0: sirven como dato.
+33. **Versiones de AIR**: MTLCompilerService entrega AIR 2.2 al plug-in y los metallib del sistema son AIR 2.9, con
+    firmas distintas de `air.read_texture_2d`.
+34. **Ruta de carga del plug-in documentada de punta a punta**: cabecera de
+    `SnapMetal/AdrenoMetal/AdrenoMTLDevice.m` (macOS 27; los offsets hay que re-derivarlos en iOS 16.7). Las opciones
+    `CA_DISABLE_GENERIC_SHADERS` y `CA_DISABLE_APL_FILTER` evitan depender del framebuffer fetch y de dos kernels de
+    cómputo.
+
 ## 10. Veredicto (provisional)
 
 **¿Hay una base mejor que hakios-metal para empezar con reglas propias?** Con lo verificado, no.
@@ -440,16 +545,23 @@ de macOS 26.7.1, misma base de código `ogl-metal.mm`, sin confirmar en iOS 16.7
   frame.
 - **Metal sobre Vulkan** está descartado por el proyecto. La evidencia va en la misma dirección: en el mismo
   teléfono HackiOS mide la mitad de fps que con su driver directo [HEREDADO]; UniXNU publica ~70 fps de media en un
-  Adreno 740; nadie publica una cifra en a610; y el enlace estático de metal2vulkan arrastra GPL/LGPL.
-- Quedan sin abrir `MC-XiaoXiao/ios_sagit` (a5xx, 430 KB de driver propio), `Veerhooda/iOS` y `tylertms/Stela`.
+  Adreno 740; la única cifra en a610 (ios-spes) es de 18-114 ms de GPU por envío; y el enlace estático de
+  metal2vulkan arrastra GPL/LGPL.
+- `Nik300/viva-gpu` es el pariente más cercano en sistema (iOS 16.7, `_MTLDevice`, XNU propio), pero va sobre
+  Gallium y Panfrost para un Mali: sirve como documentación de lo que exige iOS 16.7 (§9.23), no como base.
+  `7ez/malachite` es el único driver directo de PC y no tiene licencia.
+- `MC-XiaoXiao/ios_sagit` es independiente y directo, pero para a5xx, con el PM4 codificado en un kext que hereda
+  de IOGPU de Apple y sin ninguna evidencia de ejecución. `Veerhooda/iOS` es Metal sobre Gallium fd4 para iOS 12.
+- `mateusseiboth/darwin-lisa` no es una base distinta sino 31 parches sobre hakios-metal y `HakiosMetalCA`
+  dirigidos al coste de CPU por draw: es el trabajo ajeno más directamente aplicable (§9.27).
 
 **Coste de CPU por draw.**
 
 | | Directo (hakios-metal) | Vulkan (metal2vulkan + Turnip) |
 |---|---|---|
 | Capas por draw | plug-in ObjC → C++ → PM4 | frontend ObjC → runtime Rust → API Vulkan → seguimiento de estado de Turnip → PM4 |
-| Dato disponible | en este teléfono: ~126 µs por draw, ~150 draws por frame, hilo de render al 84-90 % (INDICE, 03 M1-M2) | 24,6 asignaciones por draw en el runtime antes de parches de terceros, 13,5 después [O, lavapipe]; ~107 IB y 7 idas y vueltas al kernel por frame en DroidVM [README] |
-| Trabajo pendiente | bajar el coste por draw y el estado repetido por tile (informe 10) | portar y validar Turnip y el kext en a610 (sin precedente con cifras), afinar el runtime, resolver la licencia |
+| Dato disponible | en este teléfono: ~126 µs por draw, ~150 draws por frame, hilo de render al 84-90 % (INDICE, 03 M1-M2) | 24,6 asignaciones por draw en el runtime antes de parches de terceros, 13,5 después [O, lavapipe]; ~107 IB y 7 idas y vueltas al kernel por frame en DroidVM [README]; ~150 µs de CPU por draw en el puente de macos-pixel8a [README] |
+| Trabajo pendiente | bajar el coste por draw y el estado repetido por tile (informe 10) | portar y validar Turnip y el kext en a610 (el único precedente con cifras, ios-spes, queda limitado por memoria), afinar el runtime, resolver la licencia |
 
 **Advertencia para el a610.** El dato más directo de un port hermano dice que a resolución nativa el límite es el
 relleno de la GPU (8 ms de GPU por entrega a 950 MHz), no la CPU. Aquí la pasada principal tarda 20-24 ms de GPU
@@ -489,6 +601,43 @@ las demás entre una y cinco.
   Droid-VM, Snapintosh y data-a-live).
 - Sin resultado: GitLab **[S]**; Codeberg respondió 429 **[S]**; ninguna entrada de Chromium ni feature de ANGLE
   nombra el 610; ninguna cifra de UI en a610 bajo Linux.
+- **Repos de GitHub por nombre o descripción** (34 consultas, [S]). Con resultado: `hakios`, `hackios`, `unixnu`,
+  `bergamota`, `IOGPUFamily`, `IOMobileFramebuffer`, `IOAccelerator`, «xnu adreno», «xnu mali», «xnu exynos»,
+  «xnu rk3588», «xnu raspberry pi». Con 0 resultados: «xnu android phone», «iOS on Android xnu», «darwin
+  snapdragon», «metal adreno driver», «metal driver xnu», «metal freedreno», «metallib nir», «ir3 metal»,
+  «IOMobileFramebuffer qcom», «IOGPU driver», «panfrost metal», «powervr darwin», «xnu mediatek», «macOS
+  snapdragon», «arm64 hackintosh», «PureDarwin gpu», «virtio-gpu macOS kext», «chlorophyll metal».
+- **Repos con el término en el README** ([S], total entre corchetes): ios-sweet [925], «adreno metal» [219],
+  metal2vulkan [149], «Adreno 610» [139], SM6225 [137], SM6115 [57], SM6125 [42], xnu + freedreno [98], xnu +
+  mali [97], xnu + panfrost [33], xnu + powervr [16]. Topics: `unixnu` [153], `xnu` [77]; con 0: `metal-driver`,
+  `hackintosh-arm`, `ios-sweet`, `xnu-on-android`.
+- **Redes de forks con `compare` contra el origen** ([S]): HackiOS (106 con push propio), ios-sweet (la API
+  devuelve 514 de 972), AdrenoMetal (18), Adreno740 (16), Chlorophyll (4), Bergamota. Índices: `devices.toml` de
+  UniXNU y `Chromitsune/Portsmith-iOS` (92 ports, 4 con GPU «reported_working»).
+- **Canales** ([S]): `t.me/s/unixnu` (2026-11-11: «hardware-native paths on metal2vulkan for turnip»),
+  `t.me/s/oosexgangdevs` (2026-11-11: iOS 27.2 en redwood, «First frames rendered on GPU with metal»),
+  `t.me/s/hakios_devblog` (2026-11-07: Metal para MediaTek y Qualcomm «in this month»). Ninguno menciona otro
+  driver. Los chats no tienen vista pública. Bilibili con 13 palabras clave: solo vídeos de ports sin código de
+  GPU nuevo. Hacker News: el hilo de la escena no habla de drivers.
+- **Web en inglés, chino, ruso, ucraniano, vietnamita, indonesio y español** ([S]): solo prensa sobre HackiOS,
+  ios-sweet e ios-topaz. 4PDA, XDA y Reddit: solo prensa.
+- **Bloqueados** ([S]): Codeberg y GitLab responden 429 y Gitee 403; la ausencia ahí no queda comprobada.
+- **Cider/Cycada** ([S], leído de los PDF): Cider (ASPLOS 2014) corre apps de iOS en un Nexus 7 con «diplomats»,
+  stubs que cargan la biblioteca de Android, cambian de persona y llaman a las bibliotecas GLES del fabricante;
+  `IOSurfaceCreate` va a `libgralloc`. Es OpenGL ES, anterior a Metal, con el kernel de Android debajo; el 3D
+  rinde un 20-37 % menos. La continuación (Middleware 2017) no publica código.
+- **Otras plataformas** ([S]). Repos de GitHub con 0 resultados: `MetalPluginName`, `GPUBundles metal`,
+  `NVMTLDriver`, «Metal PowerVR», «Metal IMG Rogue iOS», «Metal Xclipse», «Metal v3d VideoCore», «Metal driver
+  virtio-gpu macOS», «virtio-gpu kext macOS», «IOGPU kext», «IOMobileFramebuffer driver», «macOS Steam Deck Metal»,
+  «macOS Exynos Xclipse», `topic:metal-driver`. Sin nada pertinente: «Metal Vivante», «macOS Ampere XNU», «XNU
+  Snapdragon X», «macOS Orange Pi», «macOS Radxa». Búsquedas web sin resultado: un front end Metal en Mesa
+  upstream; «Metal on Windows», «MetalVK», «OpenMetal», «libmetal»; drivers PowerVR de Apple reversados (IMGSGX,
+  AppleMBX); Metal para VideoCore, Vivante o Xclipse. arXiv: 10 consultas sin nada relevante; Google Patents con
+  Corellium: 0.
+- **Evidencia independiente de la escena de PC** ([S]): solo NullMoth la tiene (hilos 363320 de InsanelyMac y
+  48774 de Olarila, con usuarios ajenos al autor). Cobalt64 y Snapintosh no tienen réplica independiente.
+- **Sitios no consultados o bloqueados** ([S]): Gitee, GitCode, sourcehut, Zhihu, V2EX, pcbeta, 4PDA, XDA, Reddit,
+  lobste.rs, OSDev, tonymacx86, Semantic Scholar.
 - Pendientes: ver §13.
 
 ### 11.3 Cruce de hashes
@@ -507,9 +656,9 @@ con ellos salen de la lectura, no del cruce.
 ## 12. No verificado
 
 - Toda ejecución en hardware marcada [README] o [HEREDADO]: nada se ha corrido aquí.
-- Qué son de verdad `ios_sagit`, `Veerhooda/iOS`, `akshaynexus/iOSPlus10`, `ETCHDEV/IOS-LISA` y los ports a Exynos,
-  Helio y Tensor (`danstronics/ios-s9plus-exynos`, `squeeeezy/HelioDarwin`, `TheAndersMadsen/ios-on-pixel-10`).
-- Si el `air_to_nir.c` de Stela deriva del de HackiOS.
+- Que `ios_sagit` corra: su ejecución solo consta en su README. Ninguno de los 38 ports a teléfonos revisados tiene
+  issues de terceros que confirmen ejecución.
+- Si `Nik300/viva-gpu` corre en el teléfono: dos lecturas se contradicen (§3.1).
 - El estado real del Metal del a610 en `UniXNU-tb128fu` (sus dos fuentes se contradicen).
 - Que la SPI y los requisitos descritos para macOS 26/27 e iPadOS 17 valgan para iOS 16.7.
 - hbb real, speed bin y versión de `a630_sqe.fw` de este teléfono (§6).
@@ -524,13 +673,11 @@ Trabajo lanzado y sin resultado al interrumpir la búsqueda:
 2. **Confirmar en iOS 16.7 lo observado de CoreAnimation en macOS 26** (§9.17-18): contar selectores en el plug-in
    y enumerar las opciones `CA_*` con `CAGetDebugOptionEnvVariableName`. Los volcados de QuartzCore están en
    `_busqueda/ca-metal/`.
-3. **Verificación de la escena de PC** (familias NullMoth, Cobalt64, Intel; Stela; agx-re): solo consta la
-   genealogía de §3.2.
-4. **Verificación de los ports a teléfonos con código de GPU propio** (lista de §12).
-5. **Descubrimiento fuera de GitHub**: canales de Telegram y Discord, Bilibili, 4PDA, XDA, foros chinos y rusos,
-   Gitee/GitCode, búsquedas en chino, ruso, ucraniano, español, vietnamita e indonesio; Cider/Cycada; Corellium;
-   precedentes (QuartzCore de Apple en Windows, WinObjC, PureDarwin, ravynOS); evidencia independiente de que la
-   escena de PC funciona.
+3. **`Nik300/viva-gpu`**: resolver si corre en el teléfono abriendo su kernel (`Nik300/ios-viva`).
+4. **Leer de primera mano `AdyaGMD/ios-spes` y la rama `laurel-sprout` de iOSPlus10** (Adreno 610 con Turnip) y
+   contrastar los parches de `mateusseiboth/darwin-lisa` con la fuente propia de hakios-metal.
+5. **Descubrimiento fuera de GitHub**: Codeberg, GitLab, Gitee y los foros de §11.2 que bloquean la consulta
+   automática; chats de Telegram, Discord y QQ sin vista pública.
 6. **Búsquedas de código no hechas**: `AGXMetal`, `default.metallib` con QuartzCore, `IOGPUMetalDevice` y
    `MTLIOAccelDevice` sin los dos puntos, `ParavirtualizedGraphics`, `apple-gfx`, topics de GitHub, y las páginas
    no leídas de las consultas de §11.1.
