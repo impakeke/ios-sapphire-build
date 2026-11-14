@@ -406,3 +406,35 @@ en caliente, con el teléfono caliente y en un ambiente caluroso: orientativo.
 **Interpretación.** Con la cola, todo frame entregado llega al panel (flips = swaps). Con el seguimiento de
 suciedad, la limpieza de caché por submit desaparece. Los buffers por segundo no cambian porque el límite sigue
 siendo la CPU del driver (160 µs por draw).
+
+## M8 — Bundles de las ramas del driver, y lecturas de Android (2026-11-14)
+
+**Bundles en el teléfono** (kernel 0338 para G1-G3 y 0342 para el resto; GPU a 820 MHz). Pantalla de prueba: la
+Biblioteca de Apps, cuyo fondo es un blur del fondo de pantalla (`tools/perf/glshot.sh`; capturas en
+`medicion/shots/`: `hoja-blur.png`, `hoja-nuevos.png`, `hoja-cache.png`).
+
+| Bundle | Qué es | Fondo difuminado |
+|---|---|---|
+| `propio-args` | base: upstream `63fc2b4` + parches A610 + `metal.args` | bien, 4 de 4 (intercalado con los demás) |
+| `gpu-G1`, `gpu-G2`, `gpu-G3`, `gpu-G3b` | rama `gpu-pass` (grupos de estado por tile, tiles de turnip, fetch) | mal, 1 de 1 cada uno |
+| `cpu-A-wip` | rama `cpu-draw` (estado guardado por programa) | mal, 3 de 3; también con `metal_keep=0` y con la caché de stages llena |
+| binario heredado | el del port | mal, 1 de 1 (con este kernel) |
+
+"Mal": el fondo sale oscuro y verdoso con rayas verticales y bloques, y la barra de búsqueda translúcida sale
+blanca opaca; los iconos salen bien. Con los bundles de las dos ramas el arnés no recibe ninguna línea `fps:`
+por la consola (con `propio-args` sí). En una captura con `cpu-A-wip` la fecha y la hora del bloqueo salen en rojo.
+
+**Interpretación.** El defecto es común a las dos ramas y no está en la base; no depende del cambio propio de
+cada rama (la de CPU no debería alterar el stream). Candidatos sin confirmar: la corrección del word de overflow
+de los flujos de visibilidad en A610, presente en ambas, o el procedimiento de build.
+
+**Lecturas de Android en este teléfono** (Infinity-X, kernel 5.15.223, por adb sin root, ambiente caluroso;
+`research/metal/android/`): cpu0-3 son los núcleos pequeños (capacidad 433, hasta 1900,8 MHz) y cpu4-7 los A73
+(capacidad 1024, tabla hasta 2803,2 MHz, con el máximo en 2400 MHz en esta ROM). Zona térmica `gpu`: trips
+pasivos a 95 y 100 °C; CPU a 110-115 °C. En reposo: GPU 41-43 °C, CPU 42-48 °C; con 30 s de uso, hasta 55-56 °C,
+sin ningún cooling device activo. kgsl y devfreq no son legibles sin root.
+
+**Topología en XNU** (del agente de 16, por código y `ioreg`): las CPU lógicas 0-3 son los A73 (MPIDR 0x100-0x103,
+cluster P) y las 4-7 los pequeños, al revés que en Linux. Los draws que el driver contaba en "cpu0-3" corrían en
+los A73. Con `sweetsched=15`, los hilos de QoS por defecto (el hilo principal de backboardd y varios de
+SpringBoard) van al cluster pequeño.
