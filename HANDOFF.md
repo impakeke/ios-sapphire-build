@@ -9,9 +9,10 @@ This file covers what lives outside git and the original author's setup.
 ## What works on the phone
 
 The table in `README.md` ("What works on sapphire") is the reference, with its sources. In short:
-iOS boots to the home screen on 8 cores through our UEFI with touch, GPU (Adreno 610, Mesa/turnip +
-EAGL bridge), sound, battery, Wi-Fi, telephony and LTE data, and a USB network (`192.168.7.2`) that
-enumerates on a normal boot and holds under load (patches 0330-0333).
+iOS boots to the home screen on 8 cores through our UEFI with touch, GPU (Adreno 610: CoreAnimation
+through a Metal driver built from HackiOS's `hakios-metal`, `sweetmetal=2`; state in `GPU-ROADMAP.md`),
+sound, battery, Wi-Fi, telephony and LTE data, and a USB network (`192.168.7.2`) that enumerates on a
+normal boot and holds under load (patches 0330-0333).
 
 ## The pieces outside this repository
 
@@ -97,7 +98,8 @@ tools/sapphire-boot.sh --gpu-fw ../gpu-fw xnu/out-cm6/kernel.development.sweet o
 
 ## Open items
 
-Current priorities are in `dev-notes/investigacion/INDICE.md` ("Pendientes"). Open items from the
+Current priorities are in `dev-notes/investigacion/INDICE.md` ("Gráficos: siguiente trabajo" and
+"Pendientes"). Open items from the
 original author's log, not re-measured by the fork: the black panel between the Apple logo and the end
 of the boot, SMS and calls in the apps, and CommCenter's own data contexts (4G icon, per-app cellular
 policy).
