@@ -6,56 +6,70 @@ elección GMEM/sysmem. El coste de CPU por draw (cuello A) lo trabaja otro árbo
 
 Convención de evidencia: **[O]** observación propia (código con `archivo:línea`, medida de host reproducible o
 desensamblado); **[S]** fuente primaria citada; **[H]** hipótesis sin medir; **[M]** medida en el teléfono tomada por
-el coordinador. Ningún bundle `gpu-*` ha llegado a pintar en el teléfono: ver «Lo primero».
+el coordinador. Lo medido en el teléfono es de una sola tanda (n = 1 por bundle): ver «Medido en el teléfono».
 
-## Lo primero: en el teléfono los bundles `gpu-*` no se cargan; lo que se ve es CoreAnimation por software
+## Lo primero: cómo se instala un bundle, y qué pasó con `gpu-G1`…`gpu-G3b`
 
-Las capturas en las que `gpu-G1`, `gpu-G2` y `gpu-G3` pintan mal el blur de la Biblioteca de Apps
-(`medicion/shots/hoja-blur.png`, 03 M7) no son un defecto de los grupos de estado: en esos ensayos backboardd no tiene
-el driver cargado. `dyld` rechaza el binario al abrirlo, Metal no registra ningún dispositivo y CoreAnimation
-compone por software. El binario heredado da la misma imagen por la misma causa.
+Las capturas en las que `gpu-G1`, `gpu-G2`, `gpu-G3`, `gpu-G3b`, `cpu-A-wip` y el binario heredado pintan mal el blur
+de la Biblioteca de Apps (`medicion/shots/hoja-blur.png`) no son del driver: en esos ensayos backboardd no tenía el
+driver cargado y lo que se veía era CoreAnimation componiendo por software. [M] Instalados por renombrado, los bundles
+de esta rama cargan (backboardd es cliente de `SapphireGPU`) y pintan bien la Biblioteca de Apps (coordinador, 03 M8).
 
-**La causa es cómo se instala.** `medicion/bundle.sh` copia el binario nuevo **encima** del instalado
-(`cp … $B/HakiosMetal`: el mismo fichero, el mismo vnode). El kernel guarda en el vnode la firma de código del primer
-binario que se cargó desde él y, mientras algún proceso lo tenga mapeado, contesta al `fcntl(F_ADDFILESIGS_RETURN)` de
-`dyld` con la extensión que cubre **esa** firma. `dyld` compara y rechaza todo binario cuya firma empiece más allá:
-`code signature does not cover entire file up to signature`. En la práctica: en cada arranque solo cargan el primer
-binario cargado en ese arranque y los que no son más grandes que él.
+**La causa.** Copiar el binario nuevo **encima** del instalado (`cp … $B/HakiosMetal`) conserva el fichero y su vnode.
+El kernel guarda en el vnode la firma de código del primer binario que se cargó desde él y, mientras algún proceso lo
+tenga mapeado, contesta al `fcntl(F_ADDFILESIGS_RETURN)` de `dyld` con la extensión que cubre **esa** firma. `dyld`
+rechaza todo binario cuya firma empiece más allá (`code signature does not cover entire file up to signature`), Metal
+no registra ningún dispositivo y CoreAnimation va por software: materiales planos (dock y widgets opacos, el fondo de
+la Biblioteca oscuro y con rayas), ~10 fps, backboardd en 2,5-6 núcleos y ninguna línea `fps:`. En cada arranque
+solo cargan el primer binario cargado y los que no son mayores que él.
 
 | Evidencia | Qué dice |
 |---|---|
-| [O] Reproducción en la Mac (XNU + dyld, la misma lógica), `rebuild/gpu-tools/cs-test/run.sh`, n = 3 por orden | Bundle pequeño cargado, uno mayor copiado encima con `cp` mientras un proceso mapea el primero: `dlopen` falla 3 de 3 con `code signature does not cover entire file up to signature … (signed 0x2000, expected 0x11090)`. Copiado encima el pequeño otra vez: carga. El mayor puesto con `cp` a un fichero nuevo + `mv`: carga 3 de 3. Orden inverso (grande primero, pequeño encima): carga 3 de 3 |
-| [O] Dónde empieza la firma (`otool -l`, `LC_CODE_SIGNATURE dataoff`) | `propio` 8 493 120 · `propio-args` 8 493 280 · `gpu-G1` 8 517 424 · `gpu-G2` 8 518 032 · `gpu-G3` 8 518 192 · heredado (8 630 976 bytes de fichero) más allá de todos |
-| [M] Los tres arranques del día | 0334: primero el heredado (el mayor); después `propio` y `propio-args`, menores, cargan (03 M5). 0338 a 1260: primero `propio-args`; el heredado, mayor, sin líneas `fps:` y backboardd al 588 % (03 M6). 0338 a 820: primero `propio-args`; `gpu-G1/G2/G3` y el heredado, mayores, mal; `propio-args` otra vez, bien |
-| [M] `medicion/ab/ab-h820-G3-1.{cpu,fb,txt}` | Con `gpu-G3`: backboardd 439,8 % de un núcleo (97,7 % con `propio-args`), 51-59 flips cada 5 s y todos con 6 o más refrescos de retraso, consola de 0 bytes: ni una línea de `HakiosMetal` en 34 s |
-| [O] Comparación de capturas píxel a píxel (decodificador `rebuild/gpu-tools/img/pngio.py`) | El home con `gpu-G3` (`g3-0.png`) y con el heredado a 1260 (`fin-0.png`) son idénticos salvo el reloj. Frente a `propio1-0.png` difieren solo donde hay materiales con blur: el dock y los widgets salen planos y opacos. La Biblioteca de Apps con `gpu-G1` difiere de la del heredado en menos píxeles (96 830) que de la de `gpu-G2` (123 905) |
-| [O] `ioreg -c SapphireGPU -r -l` (solo lectura), leído mientras el coordinador probaba `cpu-A-wip` (8 643 152 bytes, firma en 8 558 048) | Con `cpu-A-wip` instalado: backboardd de 29 y de 46 s de vida al 250-285 % de CPU y **ningún cliente** en `SapphireGPU`. 17 s después, con `propio-args` reinstalado: backboardd nuevo de 15 s, 71 % de CPU y `IOUserClientCreator = "pid 1372, backboardd"`. Un tercer binario, de otro árbol, con el mismo resultado |
+| [S] El kernel del teléfono, `xnu-8796.141.3` (`~/sapphire-angel/research/metal/hilos/xnu-0342`) | `bsd/kern/kern_descrip.c:3890-3894`: «First check if we have something loaded a this offset» → `ubc_cs_blob_get(vp, …, fs.fs_file_start)`; si ya hay una firma no se lee la nueva (`:3909`). `:3992-4002`: lo que se devuelve a `dyld` es `blob->csb_end_offset` de la que **ya había**. `bsd/kern/ubc_subr.c:4019`: ese valor es el `codeLimit` de la firma redondeado a su página de hash (4 KiB aquí): para `propio-args`, 8 495 104 |
+| [O] Reproducción en la Mac (XNU + dyld, la misma lógica), `rebuild/gpu-tools/cs-test/run.sh`, n = 3 por orden | Bundle pequeño cargado y uno mayor copiado encima con `cp` mientras un proceso mapea el primero: `dlopen` falla 3 de 3 con `code signature does not cover entire file up to signature … (signed 0x2000, expected 0x11090)`. Copiado encima el pequeño otra vez: carga. El mayor puesto con `cp` a un fichero nuevo + `mv`: carga 3 de 3. Orden inverso (grande primero, pequeño encima): carga 3 de 3 |
+| [O] Dónde empieza la firma (`otool -l`, `LC_CODE_SIGNATURE dataoff`) | `propio` 8 493 120 · `propio-args` 8 493 280 · `gpu-G1` 8 517 424 · `gpu-G2` 8 518 032 · `gpu-G3` y `gpu-G3b` 8 518 192 · `gpu-G4` 8 535 216 · `cpu-A-wip` 8 558 048 · heredado (8 630 976 bytes de fichero) más allá de todos |
+| [M] Los arranques del día | 0334: primero el heredado (el mayor); después `propio` y `propio-args`, menores, cargan (03 M5). 0338 a 1260: primero `propio-args`; el heredado, mayor, sin líneas `fps:` y backboardd al 588 % (03 M6). 0338 a 820 y 0342: primero `propio-args`; todos los mayores, mal; `propio-args` otra vez, bien |
+| [O] `ioreg -c SapphireGPU -r -l` (solo lectura), leído mientras el coordinador probaba `cpu-A-wip` copiado encima | backboardd de 29 y de 46 s de vida al 250-285 % de CPU y **ningún cliente** en `SapphireGPU`. 17 s después, con `propio-args` reinstalado: backboardd nuevo de 15 s, 71 % de CPU y `IOUserClientCreator = "pid 1372, backboardd"` |
+| [O] Capturas píxel a píxel (decodificador `rebuild/gpu-tools/img/pngio.py`) | El home con `gpu-G3` copiado encima (`g3-0.png`) y con el heredado a 1260 (`fin-0.png`) son idénticos salvo el reloj; frente a `propio1-0.png` difieren solo donde hay materiales con blur |
+| [M] `medicion/ab/ab-h820-G3-1.{cpu,fb,txt}` (copiado encima) | backboardd 439,8 % de un núcleo, 51-59 flips cada 5 s con 6 o más refrescos de retraso, consola de 0 bytes |
 
-**Qué hacer para probar un bundle** (lo hace quien instala; este trabajo no instala nada). Las dos cosas están
-escritas en `rebuild/gpu-tools/instalar-por-renombrado.sh NOMBRE|angel` y `rebuild/gpu-tools/driver-en-uso.sh` (este
-último es de solo lectura):
+**Para probar un bundle:** instalar por renombrado (`cp` a un temporal en la misma carpeta y `mv -f` sobre
+`HakiosMetal`: `medicion/bundle.sh` ya lo hace; `rebuild/gpu-tools/instalar-por-renombrado.sh` es lo mismo) y, antes
+de mirar una captura o una medida, comprobar que el driver está dentro: `rebuild/gpu-tools/driver-en-uso.sh` (solo
+lectura) debe nombrar a backboardd como cliente de `SapphireGPU`, y con `metal_fps=1` deben llegar líneas `fps:`.
 
-1. Instalar por renombrado, que da un fichero nuevo sin firma previa:
-   `cp /var/tmp/HakiosMetal.new $B/HakiosMetal.tmp && mv -f $B/HakiosMetal.tmp $B/HakiosMetal` (y lo mismo al restaurar
-   `HakiosMetal.angel`).
-2. Tras reiniciar backboardd, comprobar que el driver está dentro antes de mirar nada:
-   `ioreg -c SapphireGPU -r -l | grep IOUserClientCreator` debe nombrar a backboardd, y con `metal_fps=1` deben llegar
-   líneas `fps:`. Sin cliente y sin líneas, lo que pinta es CoreAnimation por software (materiales planos, ~10 fps,
-   backboardd en 4-6 núcleos) y la captura no dice nada del driver.
+Las medidas tomadas con un binario copiado encima de otro menor son de la ruta por software: los `ab-v1260-angel-*`
+de 03 M6, `ab-h820-G3-1` y `ab-k342-*` de `cpu-A-wip`/`gpu-G3b`.
 
-Lo que no está comprobado en el teléfono es el mensaje de `dyld` (la ruta por software no dice nada por consola); lo
-está el efecto (sin cliente de GPU) y, en la Mac, el mecanismo.
+## Medido en el teléfono
 
-Consecuencias: las medidas tomadas con un binario mayor que el primero cargado en su arranque son de la ruta por
-software (los `ab-v1260-angel-*` de 03 M6 y `ab-h820-G3-1`), y eso vale igual para los bundles de `cpu-draw`. Y
-**nada de `gpu-pass` ha corrido todavía en la GPU del teléfono**: los riesgos de §7 siguen sin mirar.
+[M] Ensayos del coordinador, instalación por renombrado, kernel 0342 a 820 MHz, `homeswipe.sh 8`, **n = 1 por
+bundle** (`medicion/ab/ab-real-{propio-args,gpu-G3b,gpu-G4}.txt`; las cifras de abajo salen de sus líneas `fps:` y de
+las cuatro pasadas más lentas de cada periodo; orientativo hasta repetir con n ≥ 3):
+
+| | `propio-args` (base) | `gpu-G3b` | `gpu-G4` |
+|---|---|---|---|
+| Pasada principal (≥ 90 draws, 750 × 1624): mín-mediana-máx | 102 tiles: 17,1-18,4-21,2 ms (31) | 78 tiles: 12,3-13,3-14,0 ms (14) | 78 tiles: 11,6-13,6-16,0 ms (44) |
+| Pasadas de 28-55 draws a 750 × 1624 entre las más lentas | sysmem 18,4-21,4-40,0 ms (9) | sysmem 17,4-19,8-24,2 ms (30) | ninguna |
+| Pasadas de 28-55 draws a 752 × 1626 | sysmem 32,1-35,9 ms (2) | sysmem 35,5-35,8 ms (2) | 78 tiles: 16,2-17,0 ms (2) |
+| Tiempo de GPU por command buffer | 22,7 ms | 16,8 ms | 16,5 ms |
+| Commit → fin, media | 23,0 ms | 17,1 ms | 16,8 ms |
+| El peor buffer de cada periodo (commit → fin): mín-mediana-máx | 28,5-34,1-48,1 ms | 25,4-29,3-51,7 ms | 19,6-24,4-30,2 ms |
+| Pasadas en tiles por buffer; tiles por buffer | 1,04; 105,7 | 0,99; 72,6 | 1,69; 96,9 |
+
+Lecturas: la pasada principal toca los dos attachments en el teléfono (78 tiles de 128 × 128, no 42) y baja de 18,4 a
+13,3 ms; el tiempo de GPU por buffer baja un 26 %. `gpu-G4` no cambia la media, pero manda a tiles las pasadas de
+28-55 draws que en sysmem costaban 17-24 ms (0,7 pasadas más en tiles por buffer) y el peor buffer de cada periodo
+baja de 29 a 24 ms de mediana. Queda una pasada de 71 draws en sysmem a 41 ms en los dos bundles (una vez cada uno):
+«its like had 10 draws at most lately», la que `draw()` graba solo para sysmem (§3.5). El coste de CPU por draw no
+cambia (171 µs, coordinador).
 
 ## 0. Dónde está cada cosa
 
 | Cosa | Dónde |
 |---|---|
-| Árbol de trabajo | `~/sapphire-angel/research/metal/rebuild/wt-gpu`, rama `gpu-pass`, sobre `opcional-puerto` (`620950c`: upstream HackiOS `63fc2b4` + `patches/a610` + `patches/opcional`). Ocho commits, `08f0ccf`…`92ed3e7` |
-| Herramientas de host | `rebuild/gpu-tools/`: `host.mk` (build por objetos), `t.sh [fc]` (suite con las constantes de los dos chips), `verify.sh REV` (suite de un commit exportado aparte), `stage.py`, `bundle.sh NOMBRE [REV]`, `framecount.cpp` (`framecount P Q …` elige escenas; `FC_GMEM_OFF=N` aplica los bits de `metal_gmem_off`; el de la auditoría 10 es `framecount-base.cpp`), `base-a610.fails` |
+| Árbol de trabajo | `~/sapphire-angel/research/metal/rebuild/wt-gpu`, rama `gpu-pass`, sobre `opcional-puerto` (`620950c`: upstream HackiOS `63fc2b4` + `patches/a610` + `patches/opcional`). Nueve commits, `08f0ccf`…`fa8d36c`, cada uno encima del anterior (la historia no se reescribe) |
+| Herramientas de host | `rebuild/gpu-tools/`: `host.mk` (build por objetos), `t.sh [fc]` (suite con las constantes de los dos chips), `verify.sh REV` (suite de un commit exportado aparte), `stage.py`, `bundle.sh NOMBRE [REV]`, `framecount.cpp` (`framecount P Q …` elige escenas; `FC_GMEM_OFF=N` aplica los bits de `metal_gmem_off`; `FC_DUMP`, `FC_LOG` y `FC_LOG_STATE` vuelcan los paquetes y el estado de cada draw de las escenas X y X7; el de la auditoría 10 es `framecount-base.cpp`), `streams.sh` (§4.1), `base-a610.fails` |
 | Para el teléfono | `rebuild/gpu-tools/instalar-por-renombrado.sh`, `driver-en-uso.sh` (solo lectura), `cs-test/` (la reproducción de «Lo primero») |
 | Microcódigo del CP del teléfono | `rebuild/gpu-tools/sqe/a630_sqe.phone.fw` (leído de `/chosen/gpu-sqe-firmware` del árbol de dispositivos, 32 504 bytes, sha256 `413dbae6…0129`, versión `016ee206`) |
 | Su desensamblado | `rebuild/gpu-tools/sqe/a630_sqe.phone.dis` (9 020 líneas; `qrisc-disasm` de Mesa `767fbf7c`; reensamblado da los mismos 32 504 bytes), `handlers.txt`, `build/` |
@@ -68,14 +82,17 @@ software (los `ab-v1260-angel-*` de 03 M6 y `ab-h820-G3-1`), y eso vale igual pa
 | `gpu-G3` | `a2eabbb` | `6debba05…387a` | + barrera del fetch como grupo |
 | `gpu-G3b` | `0a65a5b` | `d5a40d11…c449` | + todos los grupos `DIRTY` (§3.1). **El que conviene probar primero** |
 | `gpu-G4` | `92ed3e7` | `a4ceeb93…f4e7` | + elección GMEM/sysmem por contenido (§3.5) |
+| `gpu-G4b` | `fa8d36c` | `fd358406…39b2` | + el perfil de una pasada en tiles dice por qué fue a tiles (`touched`, §6). **El último** |
 
 Todos llevan el parche opcional de `metal.args` (`strings` da `/var/tmp/metal.args` y el formato de la línea `fps:`
 en los cinco; el plug-in es byte a byte el de `620950c`) y la clave de caché de stages de `propio-args`
 (`24ed84207640dc54c2b865f7`): `bundle.sh` comprueba que `compiler.cpp`, `metallib.cpp`, `link.cpp`, `kernel.hpp`,
 `compiler.hpp`, `metallib.hpp`, `compute.hpp` y la declaración de `Stage` son los de `620950c` y solo entonces la
 fija, de modo que un bundle `gpu-*` encuentra los stages que dejó `propio-args`. `gpu-G1`, `gpu-G2` y `gpu-G3` no
-tienen ningún defecto conocido: son los que el teléfono rechazó al cargar. Con un solo bundle instalado (`gpu-G3b` o
-`gpu-G4`) cada hito se aísla por `metal_gmem_off` en `/var/tmp/metal.args`, sin reinstalar (§6).
+tienen ningún defecto conocido y no se han probado instalados por renombrado. Con un solo bundle instalado
+(`gpu-G3b`, `gpu-G4` o `gpu-G4b`) cada hito se aísla por `metal_gmem_off` en `/var/tmp/metal.args`, sin reinstalar
+(§6). `out/gpu-bis-base` (`620950c` con este build) y `out/gpu-bis-vsc` (`c7fa1d6`) son los de la bisección que se
+pidió antes de conocerse la causa; el primero sirve de control del build (§4.1).
 
 ## 1. Estado de la suite
 
@@ -85,7 +102,7 @@ del teléfono (`src/c_api.cpp:218`). `host.mk` compila con `-Wno-unused-function
 | Árbol | Constantes A635 (las de `make test`) | Constantes A610 (`-DHAKIOS_CHIP_A610`, las del teléfono) |
 |---|---|---|
 | Base `620950c` | 261 tests, 0 comprobaciones fallidas | 261 tests, 42 fallidas en 19 tests |
-| `gpu-pass` `92ed3e7` | 272 tests, 0 fallidas | 272 tests, 29 fallidas en 14 tests |
+| `gpu-pass` `fa8d36c` | 272 tests, 0 fallidas | 272 tests, 29 fallidas en 14 tests |
 
 Los 19 tests que fallan en la base con las constantes del A610 esperan valores del A635 escritos a mano (lista:
 `rebuild/gpu-tools/base-a610.fails`). Cinco eran de GMEM y pasan con los dos juegos de constantes, por dos arreglos
@@ -154,8 +171,8 @@ GROUP_ID, since any of your previous state changes in a previous draw state comm
 (`mesa:docs/drivers/freedreno.rst:158-176`; emisión en `tu6_draw_common`, `tu_cmd_buffer.cc:8870-8919`, y
 `fd6_state_emit`, `fd6_emit.h:108-141`).
 
-[O] Los draws de un pase GMEM ya se grababan una vez y cada tile los llamaba con `CP_INDIRECT_BUFFER`; lo que se
-repetía era su **ejecución**: el cuerpo era un stream plano (registros deduplicados, cargas y el paquete de draw), y
+[O] En la base los draws de un pase GMEM se graban una vez y cada tile los llama con `CP_INDIRECT_BUFFER`; lo que se
+repite es su **ejecución**: el cuerpo es un stream plano (registros deduplicados, cargas y el paquete de draw), y
 el stream de visibilidad solo salta el paquete de draw. `render::drawStates` (`src/gmem.cpp`) convierte ese stream al
 cerrar el pase, sin tocar cómo se codifica un draw: lo recorre draw a draw llevando lo que vale cada registro escrito,
 y por cada grupo que un draw toca escribe un fragmento con **todos** los registros del grupo tal como están en ese
@@ -180,39 +197,40 @@ siguiente suele caer en la dirección del frame anterior, con otras palabras o c
 por los pases que se dibujan desde el stream principal (un pase sysmem escribe `RB_MRT`, el viewport y el programa
 directamente). `DIRTY` hace que el grupo se ejecute recuerde el CP lo que recuerde; un draw solo pone un grupo
 cuando su fragmento cambió, así que nada se ejecuta dos veces por ello. [S] Es el bit que turnip pone en los
-estados que `PROGRAM_CONFIG` invalida (`tu_cmd_buffer.cc:1275-1313`). [H] Lo probable es que un `DISABLE_ALL_GROUPS`
-sí borre esa memoria (turnip reemite todos sus grupos tras `tu_disable_draw_states`, a menudo con las mismas
-direcciones, y funciona); el diseño no depende de ello.
+estados que `PROGRAM_CONFIG` invalida (`tu_cmd_buffer.cc:1275-1313`). [H] Lo probable es que deshabilitar un grupo
+sí borre esa memoria: turnip deshabilita su grupo de constantes tras el paso de binning precisamente para que se
+reemita («so make sure these states are re-emitted», Mesa 25.0.7 `tu_cmd_buffer.cc:1792-1804`) y reemite todos tras
+`tu_disable_draw_states`, a menudo con las mismas direcciones. El diseño no depende de ello.
 
-Además: las copias de constantes ligadas fuera de múltiplo de 16 (`CP_MEMCPY` + dos esperas antes de cada carga, en
-cada tile) se hacen una vez antes del paso de binning (`DrawStates::prologue`); cada pase empieza sin grupos (la
+Además: las copias de constantes ligadas fuera de múltiplo de 16 (en la base, `CP_MEMCPY` + dos esperas antes de cada
+carga, en cada tile) se hacen una vez antes del paso de binning (`DrawStates::prologue`); cada pase empieza sin grupos (la
 cabecera de todo pase, `encodeBegin`, lleva un `DISABLE_ALL_GROUPS`) y `encodeGmem` los suelta tras el paso de binning
 y tras los draws de cada tile, como fd6 (`fd6_gmem.cc:1133-1135`, `:2194-2203`); y escribe
 `CP_SKIP_IB2_ENABLE_LOCAL 1` en cada tile **después** de su `CP_SET_BIN_DATA5` (§2.6), con lo que el tile deja el
 cuerpo en el primer draw posterior al último visible. Un stream con algo que `drawStates` no sabe mover, o un pase
-sin binning, se dibuja del stream plano como antes.
+sin binning, se dibuja del stream plano, como en la base.
 
 ### 3.2 Rejilla de bins donde binnea el VSC (G1)
 
-[O, del código] Un pase cuyos draws tocan parte de la ventana se tileaba desde la esquina de esa parte, y a su paso
-de binning se le decía una rejilla de ese tamaño con el offset de ventana en (0, 0). El VSC no tiene registro de
+[O, del código] En la base, un pase cuyos draws tocan parte de la ventana se tilea desde la esquina de esa parte, y a
+su paso de binning se le dice una rejilla de ese tamaño con el offset de ventana en (0, 0). El VSC no tiene registro de
 origen (`VSC_BIN_SIZE`, `VSC_BIN_COUNT` y el sitio de cada pipe en bins es todo lo que recibe): binnea por la
 posición en la ventana, y un tile en (288, 992) recibiría la visibilidad del bin (0, 0). [S] Los dos drivers de Mesa
 ponen la rejilla sobre el framebuffer entero en esta familia (`mesa:src/gallium/drivers/freedreno/freedreno_gmem.c:552-559`;
-`tu_cmd_buffer.cc:1662-1667`). `gmemTiles` toma los bins de la rejilla de la ventana que toca el área, y el paso de
+`tu_cmd_buffer.cc:1662-1667`). En la rama `gmemTiles` toma los bins de la rejilla de la ventana que toca el área, y el paso de
 binning binnea la rejilla entera (`GmemPlan::gridCols/gridRows`, scissor de ventana desde el origen). [H] Que la base
 pintara mal esos pases en el teléfono no está observado: es lo que dice el modelo. La forma nueva es coherente tanto
 si el VSC cuenta desde el origen como si contara desde la esquina del scissor de ventana.
 
 ### 3.3 Geometría de tiles (G2)
 
-[O] Por qué salían 102 tiles de 768 × 16: dos attachments de 4 bytes se repartían los 128 KiB bajo la caché de color,
-cada parte recortada a múltiplo de 16 KiB, y los bins iban en una sola columna del ancho de la ventana:
-65 536 / (768 × 4) = 21 filas, 16 al alinear. No había `cpp` mal contado. El kernel programa `0x21000` de GMEM y el
+[O] Por qué salen 102 tiles de 768 × 16 en la base: dos attachments de 4 bytes se reparten los 128 KiB bajo la caché
+de color, cada parte recortada a múltiplo de 16 KiB, y los bins van en una sola columna del ancho de la ventana:
+65 536 / (768 × 4) = 21 filas, 16 al alinear. No hay `cpp` mal contado. El kernel programa `0x21000` de GMEM y el
 driver usa `0x20000` para bins y deja los 4 KiB finales a la caché de color de la CCU, como turnip
 (`mesa:src/freedreno/common/fd6_gmem_cache.h:113-121`).
 
-`gmemPlan` reparte y tilea como turnip: partes en bloques de 4 KiB con la fórmula de
+En la rama `gmemPlan` reparte y tilea como turnip: partes en bloques de 4 KiB con la fórmula de
 `tu_render_pass_gmem_config` (`mesa:src/freedreno/vulkan/tu_pass.cc:848-877`) y búsqueda de
 `tu_tiling_config_update_tile_layout` (`mesa:src/freedreno/vulkan/tu_util.cc:286-343`: todos los anchos, el menor
 número de bins y, a igualdad, el más cuadrado). Y al cerrar el pase da bins solo a los attachments que sus draws
@@ -222,7 +240,7 @@ lleva como pitch). El `RB_MRT_BASE_GMEM` grabado del attachment sin tocar se ree
 `RB_MRT` de un attachment que el subpase no usa. Una rejilla cuyos pipes tendrían más de 32 bins no se binnea
 (`gmemPipes`; `use_hw_binning` de fd6, `is_hw_binning_possible` de turnip, `tu_util.cc:345-354`).
 
-| 750 × 1624, attachments de 4 bytes | Base | Ahora |
+| 750 × 1624, attachments de 4 bytes | Base | Rama |
 |---|---|---|
 | 1 | 51 tiles de 768 × 32 | 39 de 256 × 128 |
 | 2, los dos tocados | 102 de 768 × 16 | 78 de 128 × 128 |
@@ -242,21 +260,21 @@ rasterizador ordena el fetch respecto de los draws anteriores que también leen,
 el primer draw que lee tras uno que no leía lleva una barrera (`CP_WAIT_FOR_IDLE`, `CACHE_INVALIDATE`,
 `CP_WAIT_FOR_IDLE`); sin ella HackiOS vio el texto de un widget cortado por una banda y el blur en bloques.
 
-[O] En el stream plano esa barrera eran tres paquetes que cada tile ejecutaba al pasar, dibujara o no alguno de los
+[O] En el stream plano esa barrera son tres paquetes que cada tile ejecuta al pasar, dibuje o no alguno de los
 draws que leen, más otra barrera al empezar cada tile: la escena Q (27 transiciones) son 5 568 `CP_WAIT_FOR_IDLE`
-por frame en la base. La barrera es ahora un grupo propio (id 0, solo para tiles): lo pone `DIRTY` el draw que se
+por frame en la base. En la rama la barrera es un grupo propio (id 0, solo para tiles): lo pone `DIRTY` el draw que se
 grabó con ella y lo suelta el primer draw posterior que ya no va en orden de rasterización. Pendiente de uno a otro,
 se ejecuta en el primer draw de esa racha que el tile dibuja —donde hace falta— y en ningún tile que no dibuje
 ninguno. La barrera de comienzo de tile desaparece cuando el pase lleva sus barreras así. El microcódigo ejecuta los
 paquetes de un grupo por su tabla de paquetes y espera los `CP_WAIT_FOR_IDLE` pendientes antes del draw (`fxn3601`).
 Ninguno de los dos drivers de Mesa mete un `CP_WAIT_FOR_IDLE` en un grupo: es lo menos respaldado del diseño, y por
-eso tiene dos alternativas por interruptor (§6): la barrera en el stream como antes (`1024`) y sin barreras entre
+eso tiene dos alternativas por interruptor (§6): la barrera en el stream, como en la base (`1024`) y sin barreras entre
 draws con todo el pase en `FLUSH_PER_OVERLAP` (`2048`).
 
 ### 3.5 GMEM o sysmem según lo que lleva el pase (G4)
 
-[O] Un pase grabado de las dos formas iba a tiles con los draws del listón (`metal_gmem_draws`, 56 por defecto en el
-plug-in) y a sysmem con menos, fueran lo que fueran sus draws. `render::gmemWorth` decide al cerrar el pase con los
+[O] En la base, un pase grabado de las dos formas va a tiles con los draws del listón (`metal_gmem_draws`, 56 por
+defecto en el plug-in) y a sysmem con menos, sean lo que sean sus draws. En la rama, `render::gmemWorth` decide al cerrar el pase con los
 criterios de turnip (`mesa:src/freedreno/vulkan/tu_autotune.cc`, `get_optimal_mode`), sobre lo que el pase sabe de
 sí mismo:
 
@@ -268,29 +286,45 @@ sí mismo:
 
 La tercera fila es la desigualdad de turnip con `D` proporcional al número de draws, calibrada por el listón: el
 listón es donde empiezan a compensar los tiles en un pase que carga y almacena todo lo que toca (`L + S = 2T`,
-`C = 0`). Así un pase así necesita los 56 draws de antes; uno que no hace falta cargar (load action DontCare, o un
+`C = 0`). Un pase así necesita los 56 draws del listón; uno que no hace falta cargar (load action DontCare, o un
 Clear que hacen los tiles), 28; uno cuyo Clear en sysmem ya cuesta lo que el store de los tiles, 5. Las cargas y
-almacenamientos evitables ya los evitaba el driver (no carga con DontCare ni con Clear en tile; no almacena lo no
-escrito ni con store DontCare): ahora además cuentan en la elección. No hay muestras medidas como en turnip
+almacenamientos evitables los evita el driver desde la base (no carga con DontCare ni con Clear en tile; no almacena
+lo no escrito ni con store DontCare); en la rama cuentan además en la elección. No hay muestras medidas como en turnip
 (`ZPASS_DONE` alrededor del pase): es lo que falta para usar su estimación tal cual (§8).
 
 Un pase que va a tiles por su contenido se anota como pesado en el historial de su clase (`noteDraws`), para que
 `draw()` siga grabando de las dos formas el siguiente de su clase. Lo que `draw()` graba solo para sysmem (su clase
 tuvo menos de la mitad del listón últimamente) no pasa por aquí: se decide antes del primer draw.
 
-**Por qué una pasada sysmem de 39 draws cuesta 20 ms.** Lo medido [M, 03 M2/M6 y `medicion/ab/`]: a 750 × 1624 y
-1260 MHz, pasadas de 39 draws en sysmem 18,4-22,1 ms (19 en `ab-v1260-base-1.txt`), de 19 draws 19,4 ms, de 17
-draws 24,6-24,9 ms (3 en `ab-propio-args-1.txt`); en el mismo fichero una de 20 draws 1,5 ms y, a 138 × 306, una de
-18 draws 19,5 ms. El coste no sigue ni al número de draws ni al área: depende de qué draws son. Lo que hace el
-stream [O]: en sysmem **cada** draw que lee su target lleva `CP_WAIT_FOR_IDLE`, `PC_CCU_FLUSH_COLOR_TS` con
-`CP_WAIT_REG_MEM` sobre su palabra, `CACHE_INVALIDATE` y otro `CP_WAIT_FOR_IDLE` (`encodeDraw`; el orden por
-rasterización solo se usa en tiles), y después lee el target desde memoria con un descriptor de textura. No hay
-resolve; sí un vaciado del pipeline y de la caché de color por draw que lee. En host: escena B, 5 draws que leen →
-14 `CP_WAIT_FOR_IDLE` frente a 4; escena S en sysmem, 9 → 22. Los draws que no leen no llevan ninguna espera.
-[H] Los 20 ms son esas barreras y las lecturas del target por memoria. No está comprobado que las pasadas de 39
-draws lean su target: lo dirían `metal_fps=draws` (tiempo por draw y por programa en las pasadas sysmem) o,
-directamente, `gpu-G4` frente a `gpu-G4` con `metal_gmem_off=4096`. El informe 11 §9 descarta el ancho de banda del
-DDR por sí solo.
+**Por qué una pasada sysmem de 30-39 draws cuesta 20 ms.** Lo medido [M, `medicion/ab/ab-real-gpu-G3b.txt`, 820 MHz,
+n = 1]: a 750 × 1624, pasadas en sysmem de 21 draws 16,0 ms, de 30 draws 22,9-23,5, de 39 draws 18,8-19,5, de 48-53
+draws 18,5-20,6; a 752 × 1626, de 35 draws 35,5 ms; y una de 71 draws 41,0 ms. En tandas anteriores, una de 20 draws
+1,5 ms y, a 138 × 306, una de 18 draws 19,5 ms (`ab-propio-args-1.txt`). El coste no sigue al número de draws (de 21
+a 53 draws, 16-23 ms) ni solo al área: depende de qué draws son.
+
+Lo que hace el stream [O]: en sysmem **cada** draw que lee su target lleva `CP_WAIT_FOR_IDLE`,
+`PC_CCU_FLUSH_COLOR_TS` con `CP_WAIT_REG_MEM` sobre su palabra, `CACHE_INVALIDATE` y otro `CP_WAIT_FOR_IDLE`
+(`encodeDraw`; el orden por rasterización solo se usa en tiles), y después lee el target desde memoria con un
+descriptor de textura. No hay resolve. En host: escena B, 5 draws que leen → 14 `CP_WAIT_FOR_IDLE` frente a 4; escena S
+en sysmem, 9 → 22. Los draws que no leen no llevan ninguna espera ni relleno, pero cada píxel que escriben o mezclan
+pasa por la caché de color hacia y desde memoria: una capa a pantalla completa con blending son 4,9 MB leídos y 4,9
+escritos. [M, informe 11 §9] En esas pasadas la GPU mueve 1,0-1,4 GB/s: 7-10 ms por capa a pantalla completa.
+
+Lo que añade `gpu-G4` [M + O]: todas esas pasadas de 28-55 draws van a tiles con su regla, que solo manda a tiles una
+pasada bajo el listón por dos motivos: algún draw lee su target, o sus tiles no necesitan cargar (DontCare o Clear) y
+tiene 28 draws o más. En tiles dejan de estar entre las cuatro más lentas de cada periodo; la de 752 × 1626 pasa de
+35,5 a 16,2-17,0 ms, y en los periodos sin pasada grande lo más lento son pasadas de 78 draws en 78 tiles a 6,5-6,7
+ms, donde con `gpu-G3b` eran las de 39 draws en sysmem a 19 ms. [H] Los 20 ms son, por tanto, lo que cuesta en
+sysmem lo que esas pasadas llevan: capas grandes mezcladas a través de memoria y, si leen su target, una barrera por
+draw. Cuál de los dos motivos mandó cada una a tiles lo dice `gpu-G4b` con `metal_fps=timeline` o `metal_fps=passes`
+(`touched 0x1xx`: lee su target; `0x4xx`: no carga nada; §6); cuánto cuesta cada draw en sysmem, `metal_fps=draws`
+con `gpu-G3b`.
+
+**Lo que queda en sysmem y cuesta.** [M] La pasada de 71 draws a 41 ms (una vez con cada bundle) lleva el motivo «its
+like had 10 draws at most lately»: `draw()` graba solo para sysmem la pasada cuya clase tuvo menos de medio listón de
+draws en sus 16 últimas veces, antes de saber qué trae, y `closePass` no puede mandar a tiles lo que no se grabó para
+tiles. Es un tirón de un frame cada vez que una pasada ligera se vuelve pesada. Desaparece cuando la elección se hace
+al cerrar para toda pasada, que es lo que permite grabar los hechos de un draw y codificar después (`cpu-draw`, §9).
 
 ## 4. Antes y después en host
 
@@ -333,6 +367,25 @@ palabras, sysmem «gana» 20 a 1, cuando lo que se mide en el teléfono es que e
 la pasada grande en tiles. Las palabras leídas dicen cuánto trabaja el CP, no cuánto esperan el pipeline ni la
 memoria.
 
+### 4.1 La escena del blur en host: streams palabra por palabra, estado por draw, VSC y build
+
+Hecho cuando la causa de «Lo primero» aún se discutía; vale como comprobación de que la rama no cambia nada fuera de
+lo que dice cambiar. Escena X de `framecount` con las constantes del A610: cinco pasadas pequeñas de un draw (el fondo
+a 375 × 812 BGRA8, 187 × 406 RGBA16Float y 93 × 203 BGRA8, y de vuelta), la pasada principal de 750 × 1624 con dos
+attachments y 64 draws (el segundo muestrea el resultado de la cadena a pantalla completa; uno de cada cuatro iconos
+lee su target) y una pasada pequeña más que muestrea el target principal. X: todo en un command buffer; X7: un
+command buffer por pasada. `rebuild/gpu-tools/streams.sh` lo repite entero.
+
+| Comprobación | Resultado [O] |
+|---|---|
+| Stream de cada commit con los interruptores de la rama apagados (`FC_GMEM_OFF=4416`: cuerpo plano, bins de antes, elección por draws) frente al de la base `620950c`, paquete a paquete | Idéntico en los siete commits que tocan el driver (`c7fa1d6`, `f647bb5`, `27eabea`, `a2eabbb`, `0a65a5b`, `92ed3e7`, `fa8d36c`): X, 176 286 paquetes; X7, los 8 submits |
+| Lo mismo con la rama como es | `c7fa1d6`: idéntico a la base (la rejilla desde el origen solo cambia pases de área parcial). Desde `f647bb5`: solo cambia el submit de la pasada en tiles (174 852 paquetes → 45 276 con G1, 18 994 con G2, 17 534 desde G3). Las pasadas sysmem de antes y de después son las mismas palabras; en X, seis paquetes de la última llevan la dirección de la tabla del pase desplazada 0xe000 (la pieza de fragmentos y lista ocupa más que el cuerpo plano) |
+| Estado con el que corre cada draw (registros, programa, constantes, tablas de texturas, samplers y UBO cargadas: el resumen del fake, `FC_LOG`) con grupos, con barreras en línea (`1024`) y sin retorno anticipado (`128`), frente al cuerpo plano (`64`) | X7: los 298 draws del paso de binning y de los tiles (64 + 234), con el mismo estado que les da el stream plano en ese tile; las 6 pasadas sysmem, igual; 0 fallos del fake. X: los 298 iguales dejando fuera los tres registros que dicen dónde está el buffer de visibilidad (cambia de sitio) |
+| Dos ejecuciones del mismo binario | Idénticas (3 de 3) una vez que cada command buffer se ejecuta antes de confirmar el siguiente; confirmados todos a la vez, la dirección del buffer de visibilidad depende de qué buffer ha devuelto ya el suyo |
+| El VSC frente a Mesa 25.0.7 (`rebuild/mesa/mesa-25.0.7/src/freedreno`), fila del A610 (`common/freedreno_devices.py:445-478`, `:140-141`): `tile_align` 32 × 16, `tile_max` 1024 × 1008, `num_vsc_pipes` 16 | Las constantes del driver son esas. `VSC_BIN_SIZE`, `VSC_BIN_COUNT` de la rejilla entera, scissor de ventana desde (0, 0) y offsets de ventana a 0 en el binning: `tu6_emit_binning_pass` (`vulkan/tu_cmd_buffer.cc:1750-1783`) y `update_vsc_pipe` (`:1661-1688`). Pipes en orden de filas con el último recortado y `VSC_SIZE` = bins del pipe: `tu_tiling_config_update_pipes` (`vulkan/tu_util.cc:336-385`); no más de 32 bins por pipe (`:372-380`). Por tile, `CP_SET_BIN_DATA5_OFFSET` con `pipe × pitch` de draw, `pipe × 4` y `pipe × pitch` de primitivas, y el hueco contado por filas con el ancho real del pipe: `tu6_emit_tile_select` (`tu_cmd_buffer.cc:1094-1100`). Límites `pitch − 64` y prueba de overflow por pipe usado sobre `VSC_DRAW_STRM_SIZE_REG`/`VSC_PRIM_STRM_SIZE_REG` con `WRITE_GE`: `emit_vsc_overflow_test` (`:1690-1720`). Diferencias: pitches fijos (16 KiB y 128 KiB; turnip empieza en 4 KiB y 16 KiB y dobla), agrupación de pipes por la regla de fd, y el scissor del binning hasta el borde de la rejilla en vez del framebuffer |
+| La palabra de overflow | La base la **lee** a 32 pipes fijos (`CommandQueue::checkVsc`); con los 16 del A610 eso es el byte 0x1F7F0 del stream de primitivas del pipe 1: un overflow real pasa sin verse y solo apagaría el binning con ese stream al 98 %. No descarta draws. `gpu-pass` no lo toca; lo arregla `b935418` de `cpu-draw` |
+| El build: `out/gpu-bis-base` (`620950c` compilado con `gpu-tools/bundle.sh`) frente a `out/propio-args` | 31 de 33 secciones idénticas en tamaño y bytes, entre ellas todo `__TEXT` y todo `__DATA`, en las mismas direcciones; difieren `__LINKEDIT` (las rutas del directorio de build en la tabla de símbolos y la firma) y el `LC_UUID`. Es el mismo código |
+
 [O] Coste de CPU de `drawStates` en host (sonda temporal, n = 6 por escena): 97-192 µs para el pase de P (4 674
 palabras de cuerpo → 5 557 de fragmentos + 1 203 de lista), 212-366 µs para el de Q (15 753 + 1 827), 114-270 µs
 para uno de 140 draws. Corre una vez por pase tileado, en el hilo que cierra el pase. En el teléfono está sin medir;
@@ -356,7 +409,7 @@ va contra el otro cuello (CPU del hilo de render): hay que mirarlo en `CPU/draw`
 | `render::encodeDraw`, `encodeInPass`, `encodeBegin`, `encodeEnd` | Sin tocar |
 | `render::Options` | `gmemTwin` (un byte; la estructura sigue sin relleno) |
 | `GmemPlan` | `gridCols`, `gridRows` |
-| `CommandBuffer` (`command.hpp`) | Bits de `setGmemOff`: 64, 128, 256, 512, 1024, 2048, 4096 |
+| `CommandBuffer` (`command.hpp`) | Bits de `setGmemOff`: 64, 128, 256, 512, 1024, 2048, 4096. `PassTime::touched` pasa a 16 bits: la máscara de attachments abajo y, encima, `kPassReads`, `kPassBelowBar`, `kPassNoLoad` |
 | `FakeGpu` (`fake_gpu.hpp/.cpp`) | Estado del CP (§2), contadores «as run», registro de draws con resumen de estado, reglas de §1 |
 | `Makefile` | `CORE` += `src/gmem.cpp` |
 | `tests/render_test.cpp` | 11 tests nuevos y los gemelos; tres tests de reparto con literales por chip |
@@ -376,13 +429,21 @@ que ya había). Los bits se suman.
 | 2048 | Sin barreras entre draws; todo draw de un pase con fetch en `FLUSH_PER_OVERLAP` | alternativa de §3.4 |
 | 4096 | Tiles o sysmem por draws contra el listón, sin `gmemWorth` (solo en `gpu-G4`) | ¿en la elección? |
 
-Con `gpu-G3b` o `gpu-G4` instalado: `1344` (+`4096` en G4) reproduce el stream de la base salvo la rejilla desde el
-origen; `1280` es G1; `1024` es G2; sin bits, G3. Así un A/B entre hitos no cambia de binario ni de caché de stages.
+Con `gpu-G3b`, `gpu-G4` o `gpu-G4b` instalado: `1344` (+`4096` desde G4) reproduce el stream de la base palabra por
+palabra (§4.1); `1280` es G1; `1024` es G2; sin bits, G3. Así un A/B entre hitos no cambia de binario ni de caché de
+stages.
+
+En `gpu-G4b`, las líneas `passes:` y `timeline:` del plug-in (`metal_fps=passes`, `metal_fps=timeline`) dicen de cada
+pasada en tiles por qué lo está, en el valor `touched`: el byte bajo es la máscara de attachments escritos o leídos;
+`0x100`, algún draw lee su target; `0x200`, fue a tiles con menos draws que el listón; `0x400`, sus tiles no cargan
+nada.
 
 ## 7. Riesgos a mirar en el teléfono
 
-Nada de la rama ha corrido en la GPU (ver «Lo primero»); el fake comprueba estado, no píxeles ni tiempos. Antes de
-mirar una captura: `driver-en-uso.sh` debe decir que backboardd tiene el cliente y deben llegar líneas `fps:`.
+[M] Con `gpu-G3b` y `gpu-G4` la Biblioteca de Apps y el home pintan bien (coordinador, una captura cada uno). El fake
+comprueba estado, no píxeles ni tiempos: lo de abajo es qué seguir mirando en otras pantallas (multitarea, bloqueo,
+Centro de Control, apps), y con qué acotar si algo aparece. Antes de mirar una captura: `driver-en-uso.sh` debe decir
+que backboardd tiene el cliente y deben llegar líneas `fps:`.
 
 | Qué mirar | Qué significaría | Interruptor para acotar |
 |---|---|---|
@@ -392,7 +453,7 @@ mirar una captura: `driver-en-uso.sh` debe decir que backboardd tiene el cliente
 | Contenido desplazado o basura junto a las líneas x = 128·n, y = 240·n, o en la franja inferior (los bins pasan del borde: 7 × 240 = 1680 > 1624) | Geometría de bins o `RB_MRT_BASE_GMEM` del segundo attachment | `256`, `512` |
 | Texto de un widget cortado por una banda, blur en bloques, materiales translúcidos con rectángulos de otro tono | La firma conocida de un fetch sin barrera: la barrera como grupo no corre donde debe | `1024`; después `2048` |
 | Draws que faltan en pases que tocan solo parte de la pantalla (un cambio pequeño con el resto quieto) | La rejilla desde el origen no es la del VSC en el hardware | `1` (tilear la ventana entera) |
-| En `gpu-G4`: transiciones y pantallas de pocos draws (bloqueo, multitarea) más lentas o con las pasadas de 17-52 draws ahora «in N tiles» | La elección por contenido manda a tiles lo que iba mejor en sysmem, o al revés | `4096` |
+| En `gpu-G4`: transiciones y pantallas de pocos draws (bloqueo, multitarea) más lentas, con las pasadas de 17-52 draws «in N tiles» | La elección por contenido manda a tiles lo que iba mejor en sysmem, o al revés | `4096` |
 | Con `kern.sweet_gpu_flush=1` (kernel 0342, limpieza de caché por suciedad): basura o cuelgues que desaparecen con `=0` | La pieza de fragmentos y lista se escribe al cerrar el pase; si el seguimiento de suciedad no la ve, la GPU lee memoria vieja | `kern.sweet_gpu_flush=0` |
 
 Medidas que deciden, con `ab.sh` y n ≥ 3: tiempo de GPU de la pasada principal (`draws N in 42 tiles`), `CPU/draw` y
@@ -400,7 +461,10 @@ Medidas que deciden, con `ab.sh` y n ≥ 3: tiempo de GPU de la pasada principal
 
 ## 8. Qué falta
 
-- **Todo en el teléfono**: que el driver cargue (instalación por renombrado), corrección visual y los A/B de §7.
+- **En el teléfono**: repetir con n ≥ 3 lo de «Medido en el teléfono»; capturas de más pantallas (§7); `gpu-G4b` con
+  `metal_fps=timeline` para ver por qué va a tiles cada pasada de 28-55 draws; `CPU/draw` y «hecho→commit» con y sin
+  `64` para el coste de `drawStates`.
+- **La pasada que `draw()` graba solo para sysmem** (71 draws, 41 ms): §3.5. No se arregla en `closePass`.
 - **La meta de 30 000 palabras en P.** Quedan 76 413. Dos caminos: listas por tile hechas en CPU a partir del área de
   cada draw (sirve si CoreAnimation da viewports o scissors ajustados; en P los da, en el teléfono está sin mirar), o
   la cuarta palabra de `CP_INDIRECT_BUFFER` (§2.7) partiendo la lista en trozos que el SQE salta enteros; Mesa no la
@@ -408,7 +472,8 @@ Medidas que deciden, con `ab.sh` y n ≥ 3: tiempo de GPU de la pasada principal
 - **Coste de CPU de `drawStates`** en el teléfono, y bajarlo: hoy reconstruye cada fragmento con vectores ordenados
   por draw. Con los objetos de estado precalculados de `cpu-draw` (10 §2.6) los fragmentos salen hechos de la
   grabación y `drawStates` sobra.
-- **Elección GMEM/sysmem**: `D` medido como en turnip (`ZPASS_DONE` alrededor del pase y lectura al completar) en
+- **Elección GMEM/sysmem**: con 78 tiles la pasada principal toca los dos attachments: mirar con `metal_fps=passes`
+  si el segundo se escribe de verdad o solo lo nombra el FS (con uno serían 42 tiles). `D` medido como en turnip (`ZPASS_DONE` alrededor del pase y lectura al completar) en
   lugar de proporcional a los draws; ver el contenido de los pases que `draw()` graba solo para sysmem (hace falta
   acumular `fbRead` en `OpenPass` para todo pase: una línea en `draw()`, no hecha por ser territorio de `cpu-draw`);
   comparar con el selector por tiempo medido que ya existe (`metal_gmem=1 metal_gmem_draws=0`, 10 §3.9).
@@ -423,6 +488,13 @@ Medidas que deciden, con `ab.sh` y n ≥ 3: tiempo de GPU de la pasada principal
 - `OpenPass`, `RegShadow`, `Piece`: sin cambios. `closePass` usa `OpenPass::read`, `written`, `clears`, `area`,
   `bodies`, `dual`, `kind` y `ordinal` como estaban.
 - `render::Options` gana un byte (`gmemTwin`); la comparación por bytes de `draw()` para unir draws sigue valiendo.
+- `CommandBuffer::PassTime::touched` es de 16 bits (la interfaz C lo devuelve como `unsigned`: sin cambios en
+  `c_api.cpp` ni en el plug-in).
+- La elección de §3.5 está en `closePass` y solo ve los pases grabados de las dos formas. Si `cpu-draw` deja de
+  grabar doble y codifica al cerrar, `render::gmemWorth` vale tal cual para toda pasada (necesita `draws`, el listón,
+  si algún draw lee su target y los bytes que los tiles cargarían, almacenarían y limpiarían: lo que `closePass` ya
+  calcula con `loadStore`), y el tirón de la pasada «its like had N draws» desaparece.
+- El arreglo de la palabra de overflow del VSC (`b935418` de `cpu-draw`) no está en `gpu-pass`: entra con la fusión.
 - `render.hpp`: `gmemPlan`, `gmemTiles` y `encodeGmem` ganan parámetros con valor por defecto; `GmemPlan` dos campos.
 - `drawStates` lee el cuerpo grabado tal como lo deja `appendDeduped`: si `cpu-draw` cambia qué paquetes lleva el
   cuerpo de un pase GMEM (otro orden, paquetes nuevos), `drawStates` devuelve falso y el pase se dibuja del stream
