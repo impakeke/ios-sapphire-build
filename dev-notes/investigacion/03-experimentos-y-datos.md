@@ -194,3 +194,20 @@ Datos crudos: `~/sapphire-angel/research/logs-telefono/E2-R1-usbdiag.txt` y `E2-
 - **Acciones:**
   - El bucle lee ahora el ring por el dispositivo **de bloques** `/dev/ufsroot0`, que usa buffers del kernel.
   - Arreglo pendiente en el driver: E/S cruda con búfer intermedio del kernel y `uiomove`, sin tocar memoria de usuario desde `strategy`.
+
+## E6 — kernel 0333 (UTMI y dp=2 por defecto, sin boot-args extra salvo `sweet_reboot=2`), 2026-11-14 02:14
+
+| Ensayo | Ruta | Resultado | dp |
+|---|---|---|---|
+| 1 | R | ENUMERA en 44 s | 2 |
+| 2 | R | ENUMERA en 44 s | 2 |
+| 3 | R | ENUMERA en 44 s | 2 |
+| 4 | C | ENUMERA en 40 s | 2 |
+
+- Sin panics: el bucle lee el ring por `/dev/ufsroot0` (dispositivo de bloques), no por `rufsroot0`.
+- **Acumulado de arranques normales que enumeran con la corrección UTMI: 8/8** (E3 ×2, E4 ×3, E6 ×3). Sin ella: 0/3 (13 nov, R1, E2-R1).
+- **SSH persistente:**
+  - El job `com.sapphire.sshd-usb` (`/redwood/launchd`, lo carga `/redwood/boot.d/70-sshd-usb.sh`) arranca solo y escucha en `192.168.7.2:22`.
+  - `ssh_auto=NO` en el CSV era un artefacto de tiempos: `firstboot` ejecuta `boot.d` unos segundos después de que el bucle lo comprobara. Verificado con `ssh sapphire` después.
+  - El bucle ahora reintenta durante 60 s.
+- Cmdline de 562 caracteres: el shim vuelve a pasar `sweet_splash`. Pendiente: el usuario confirmará si reaparece la imagen de arranque.
