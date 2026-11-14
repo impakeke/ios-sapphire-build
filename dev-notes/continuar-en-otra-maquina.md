@@ -47,6 +47,7 @@ mínimo `backups/boot_a-expG-20261113-223928.img`.
 - Todo el ciclo de pruebas está en OPERACION.md.
 
 ## 5) Qué sigue
-[investigacion/INDICE.md](investigacion/INDICE.md), sección "Pendientes", y el plan
-[investigacion/07](investigacion/07-plan-cpu-stutter.md). Más adelante: GPS
+[investigacion/INDICE.md](investigacion/INDICE.md), secciones "Gráficos: siguiente trabajo" y "Pendientes".
+El driver Metal y sus herramientas viven fuera de git, en `~/sapphire-angel/research/metal/` (receta en
+[investigacion/08](investigacion/08-hakiosmetal-binario-vs-fuente.md) §6). Más adelante: GPS
 ([gps-plan.md](gps-plan.md)) y QEMU ([qemu-findings.md](qemu-findings.md)).

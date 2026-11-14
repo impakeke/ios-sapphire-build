@@ -7,8 +7,9 @@ primaria. Las reglas para agentes están en [../AGENTS.md](../AGENTS.md).
 
 | Doc | Qué cubre |
 |---|---|
-| [OPERACION.md](OPERACION.md) | **Empieza aquí.** El ciclo completo: herramientas USB de la Mac, particiones y respaldos, acceso a iOS (red USB, SSH, 2323), kernel de CI → empaquetado → flasheo → ensayos → ring, diagnóstico USB y fallos. |
-| [investigacion/INDICE.md](investigacion/INDICE.md) | Estado actual, mediciones (03), auditorías (01, 04), fuentes primarias (02), parches 0330 y 0334 (05, 06) y el plan siguiente (07). |
+| [OPERACION.md](OPERACION.md) | **Empieza aquí.** El ciclo completo: herramientas USB de la Mac, particiones y respaldos, acceso a iOS (red USB, SSH, 2323), kernel de CI → empaquetado → flasheo → ensayos → ring, diagnóstico USB, fallos, y gráficos (driver Metal, mediciones, boot-args y sysctls de la GPU y la pantalla). |
+| [investigacion/INDICE.md](investigacion/INDICE.md) | Estado actual, mediciones (03), auditorías (01, 04, 09), fuentes primarias (02), parches del USB y del UFS (05, 06), gráficos (07-19) y el trabajo siguiente. |
+| [../GPU-ROADMAP.md](../GPU-ROADMAP.md) | Gráficos: cómo llega un frame al panel, lo medido y el plan (en inglés). |
 | [continuar-en-otra-maquina.md](continuar-en-otra-maquina.md) | Montar el entorno en otra máquina: qué instalar y qué descargar (IPSW, KDK, zig, DXB). |
 | [build-recipes.md](build-recipes.md) | Compilar en local: kernel XNU (DXB), shim (zig), ADT y payload, imagen de arranque. |
 | [seguridad.md](seguridad.md) | Amenazas (`.supdate` sin firma, shell 2323, `wifi_pass`, datos en logs, descargas del instalador) y mitigaciones propuestas. |
@@ -33,6 +34,17 @@ imagen), `read-ring.py` (parsea el ring del log), `shim-build-mac.sh` (shim con 
 | 0331 | UTMI como reloj PIPE (`sweetusb_utmipipe=1`, como `dwc3_qcom_select_utmi_clk` de Linux). |
 | 0332, 0333 | 0331 y 0330 activos por defecto, desactivables por boot-arg; el valor `dp=2` se elige en `gadget_start`. |
 | 0334 | E/S cruda de `sweet_ufs` sin `memcpy` del kernel a memoria de usuario (investigacion/06). |
+| 0335 | Solo comentarios: lo que dicen el código y las mediciones. |
+| 0336 | Diagnóstico de solo lectura de la GPU y de la presentación (`kern.sweet_fb_diag`, `kern.sweet_gpu_diag`) (investigacion/09). |
+| 0337 | `gpu_vco2=1`: el PLL de la GPU como Android, `gpu_mhz` pasa a ser la frecuencia del núcleo (investigacion/11). |
+| 0338 | Experimento de retener `SwapEnd` (`kern.sweet_fb_hold_ms`); sin efecto en este teléfono (investigacion/15 §0.1). |
+| 0339-0342 | Limpieza de caché de superficies por cuenta, cola de presentación, TLB del SMMU sin invalidar al mapear, caché de buffers (investigacion/15). |
+| 0343, 0345-0347 | Relojes, DDR y temperaturas (solo lectura), cambio de nivel de la GPU en caliente, gobernador, voto del DDR (investigacion/17). |
+| 0344 | Mantenimiento de caché antes de WFI conmutable (`kern.sweet_idle_cache`): XNU vaciaba la L2 del cluster A73 en cada reposo (investigacion/16). |
+| 0348 | Clock gating por hardware de la GPU (investigacion/17). |
+| 0349, 0350 | Diagnóstico del DPU y scanout directo con el escalador del VIG0 (investigacion/18). |
+
+Los conmutadores de 0336-0350 y su valor por defecto están en OPERACION.md §9.6. Los parches siguientes empiezan en 0351.
 
 ## Estado
 
@@ -43,4 +55,6 @@ Medido en el teléfono del fork (datos en [investigacion/03](investigacion/03-ex
 - Bajo carga, la ruta 0330 pasa 20 × 30 MB con SHA-256 iguales, sin rechazos de Start Transfer
   (n=1 arranque).
 - La E/S cruda de `sweet_ufs` funciona con 0334 (30/30 lecturas del ring, EINVAL en offsets desalineados).
-- Siguiente: [investigacion/07](investigacion/07-plan-cpu-stutter.md) (CPU y stutter), después Metal.
+- CoreAnimation dibuja en la GPU por el driver Metal compilado desde fuente (bundle `merge-1`): 44-48 command buffers
+  por segundo en el home, con la GPU como límite (23-27 ms por frame), n=1-2 (investigacion/03 M10).
+- Siguiente: [investigacion/INDICE.md](investigacion/INDICE.md), "Gráficos: siguiente trabajo".
