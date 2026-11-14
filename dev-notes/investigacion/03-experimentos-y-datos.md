@@ -679,3 +679,24 @@ launchd): CoreAnimation dibuja entero cada frame. Se quita la variable en el tel
 parciales vuelven a su comportamiento de origen: menos draws por frame y casi ningún trabajo en reposo. Con todo
 junto (scanout directo, parciales, `merge-5`) un frame del home tarda 7,6 ms de commit a fin, por debajo de un
 intervalo de 120 Hz, y salen 55-58 buffers por segundo con el 43-46 % de la GPU a 820 MHz.
+
+## M18 — Trazas de las pantallas con blur: Centro de Control, widgets y búsqueda (2026-11-14)
+
+Kernel 0353 a 820 MHz, scanout directo, actualizaciones parciales activas, `merge-5` con `metal_trace=frame`.
+Capturas en `research/metal/ios-graficos/trace/capturas-blur/`: `metal-trace-800-1.txt` (abrir el Centro de Control
+desde el home, 43 command buffers), `-2.txt` (deslizar a la vista de widgets, 60), `-3.txt` (bajar la búsqueda, 60);
+informes `informe-{1,2,3}.md`. n=1 por pantalla.
+
+- **Home quieto** (con actualizaciones parciales): frames de 24 draws en una pasada, 1,8-2,1 ms de GPU.
+- **Abrir el Centro de Control:** 17 frames seguidos de 11-20 pasadas y 113-277 draws, con 18,4-42,2 ms de GPU cada
+  uno. Dos de ellos tardan 1 318 ms y 540 ms en codificarse; el resto, 19-54 ms (con la traza activa).
+- **Vista de widgets:** frames de 8 pasadas y ~209 draws, 22,4-23,2 ms de GPU; ninguno por encima de 100 ms de codificación.
+- **Búsqueda:** frames de 16-31 pasadas, 21,1-28,7 ms de GPU; uno con 508 ms de codificación.
+- En un frame del Centro de Control (cb 11) la superficie de pantalla se dibuja en cinco pasadas (97 draws, 10,48 ms;
+  1 draw, 1,33 ms; 58 draws, 2,48 ms; 23 draws, 0,70 ms; 3 draws, 2,06 ms), intercaladas con pasadas a texturas de
+  752×1626 (4 draws, 3,93 ms), 756×1630, 138×306, 99×209 (2 draws, 2,13 ms), 64×64 y 270×12.
+
+**Interpretación.** El lag al desplegar estas pantallas tiene dos partes: tirones de 0,5-1,3 s la primera vez, de
+compilar en el hilo de render los shaders que se usan por primera vez; y, durante la animación, 18-42 ms de GPU por
+frame repartidos en muchas pasadas, varias de ellas sobre la propia superficie de pantalla. El análisis del blur
+está en 22.
