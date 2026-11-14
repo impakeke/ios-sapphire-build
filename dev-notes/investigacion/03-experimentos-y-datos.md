@@ -312,3 +312,15 @@ Otras líneas del driver en la condición sin opciones: la pasada principal es `
   El contador "GPU ocupada" supera el 100 % en esa condición, así que no mide solo GPU (sin verificar qué suma).
 - El binning por hardware reduce el trabajo de GPU (74 % → 97 % al quitarlo).
 - `metal_gmem=0` no cambia nada: GMEM está activo sin esa opción y la opción no lo apaga.
+
+## M3 — Frecuencia real del núcleo de la GPU (2026-11-14, tarde)
+
+Kernel 0334, boot-args con `gpu_mhz=1260 gpu_div=1`. Herramienta `tools/perf/gxfreq.c`: por el cliente `SGPU`
+del kernel hace que el procesador de comandos de la GPU copie a memoria dos contadores de ciclos del reloj
+de núcleo (`PERF_CP_ALWAYS_COUNT`, `PERF_RBBM_ALWAYS_COUNT`) y el contador del cristal de 19,2 MHz
+(`CP_ALWAYS_ON_COUNTER`), dos veces separadas 200-300 ms; la frecuencia es el cociente.
+
+**Observado.** 3 ejecuciones de `gxfreq 200 5` (15 muestras): los dos contadores dan **630,00 MHz** en las 15.
+
+**Interpretación.** `gpu_mhz=1260` deja el VCO de `gpu_cc_pll0` a 1260 MHz y el núcleo de la GPU a la mitad.
+La comparación con los niveles de Android está en [11](11-gpu-relojes-bus-vs-android.md).
