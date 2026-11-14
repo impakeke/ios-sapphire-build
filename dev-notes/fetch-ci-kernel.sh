@@ -21,7 +21,7 @@ REPO=${REPO:-giovannipodesta/ios-sapphire}
 WORKFLOW=xnu-4k
 ARTIFACT=xnu-kernel-4k
 KERNEL=kernel.development.sweet
-PATCH=${PATCH:-0353-sapphire-fb-swapwait-from-queue.patch}
+PATCH=${PATCH:-0370-sapphire-gpu-ubwc-config.patch}
 INTERVAL=${INTERVAL:-30}
 
 fail() { printf '\n\033[1;31m*** FALLO: %s ***\033[0m\n' "$*" >&2; exit 1; }

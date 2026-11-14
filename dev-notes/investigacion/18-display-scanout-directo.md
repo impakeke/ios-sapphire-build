@@ -1,16 +1,18 @@
 # 18 — Display: scanout directo de la superficie de iOS con el escalador del DPU (2026-11-14)
 
 - **Autor:** agente Claude Opus 5.5, esfuerzo máximo.
-- **Alcance:** la presentación del kernel frente al DPU (MDSS) del SM6225: qué hace hoy el port con el plano, diseño
-  del scanout directo de la superficie de 750×1624 por el VIG0 con su escalador QSEED3LITE, lo que CoreAnimation lee del
-  framebuffer para no dibujar en la superficie que está en el panel, y cuatro parches de la serie: **0349**
-  (diagnóstico del DPU, solo lectura), **0350** (scanout directo, apagado por defecto), **0352** (arreglos de 0350 que
-  encontró la simulación y flip tomado por `CTL_FLUSH`, apagado por defecto) y **0353** (`SwapWait` con el estado real
-  de la cola, apagado por defecto; el scanout lo exige).
-- **Estado:** 0349, 0350 y 0352 en `xnu/patches/` y en el kernel del teléfono (CI 43635044868, imagen
-  `boot_a-0352-vco2-820.img`); 0349 leído en el teléfono (§1.4). El scanout encendido en el teléfono funciona pero no
-  rinde: CoreAnimation se queda con dos superficies y vuelve a dibujar en la del panel (03 M12; §3.10). 0353 en
-  `parches-nuevos/`, sin compilar en CI ni probar en el teléfono.
+- **Alcance:** la presentación del kernel frente al DPU (MDSS) del SM6225: qué hace el port con el plano, diseño del
+  scanout directo de la superficie de 750×1624 por el VIG0 con su escalador QSEED3LITE, lo que CoreAnimation lee del
+  framebuffer para no dibujar en la superficie que está en el panel, cómo nacen y mueren sus superficies de pantalla,
+  dónde pone cada camino la ventana del panel, y cinco parches de la serie: **0349** (diagnóstico del DPU, solo
+  lectura), **0350** (scanout directo, apagado por defecto), **0352** (arreglos de 0350 que encontró la simulación y
+  flip tomado por `CTL_FLUSH`), **0353** (`SwapWait` con el estado real de la cola) y **0354** (pool para la vida
+  entera del anillo de CoreAnimation, un solo modo del plano mientras una superficie del anillo no puede escanearse, y
+  la ventana recortada por la dirección de la fuente en los dos caminos).
+- **Estado:** 0349-0353 en `xnu/patches/` y en el kernel del teléfono (CI 43640189709, imagen
+  `boot_a-0353-vco2-820.img`; 03 M16). Con 0353 el scanout directo rinde (03 M16-M17), pero tras horas de uso con
+  reinicios de backboardd el pool se llena y la pantalla salta (03 M22; §3.13, §3.14); el teléfono queda con
+  `kern.sweet_fb_scanout=2`. 0354 en `parches-nuevos/`, sin compilar en CI ni probar en el teléfono.
 
 ## Convenciones
 
@@ -38,20 +40,22 @@ las ramas que se han mirado.
    PP0, LM0, CTL0 y el plano VIG0 sobre 0x5c000000). Del DPU el port solo escribe, en cada flip, `SSPP_SRC0_ADDR`,
    `SSPP_SRC_YSTRIDE0` y `CTL_FLUSH = 0x20001` (F1375-1378), y una vez `INTF_FRAME_LINE_COUNT_EN` (F754). Usa un solo
    plano (VIG0); el escalador no se había tocado nunca.
-2. **La copia de hoy no estira: recorta y escala ×1,5 uniforme** la ventana de 720×1600 en (13,33; 12) de la
-   superficie de 750×1624 (F2032-2047): la ventana del panel en el lienzo 3x de 1125×2436, a 2/3. Las razones 1,44 y
-   1,478 serían las de estirar la superficie entera, que nadie hace. El scanout repite la misma ventana y el mismo
-   factor; el táctil no cambia. Esa copia cuesta 4,15 ms de GPU por frame de media (03 M11): un tercio del tiempo de GPU
-   del frame, en el mismo ring que el render, con la GPU como límite.
+2. **La copia de hoy no estira: recorta y escala ×1,5 uniforme** la ventana de 720×1600 en (13,33; 12) de la superficie
+   de 750×1624 (F2032-2047): la ventana del panel en el lienzo 3x de 1125×2436, a 2/3. Las razones 1,44 y 1,478 serían
+   las de estirar la superficie entera, que nadie hace. El scanout repite la misma ventana y el mismo factor; con 0354
+   la ventana empieza en (16, 12) en los dos caminos y el táctil la sigue (§3.14). Esa copia cuesta 4,15 ms de GPU por
+   frame de media (03 M11): un tercio del tiempo de GPU del frame, en el mismo ring que el render, con la GPU como
+   límite.
 3. **El plano recibe direcciones físicas de 32 bits y el stream del display (SID 0x420) no se traduce** (inferido: el
    port nunca programa ese SID y el panel enseña 0x5c000000 y el pool bajo 0xe2000000). El pool del scanout va por
    debajo de 4 GiB, junto a los flip buffers.
-4. **Diseño:** las superficies de pantalla de backboardd salen de un pool físico propio (4 huecos de 5 MiB en
-   0xe5000000), mapeadas *write-combined* en todas partes (ni la GPU ni el DPU necesitan mantenimiento de caché), y el
-   VIG0 las escanea con el QSEED3LITE configurado como Linux (bilineal, sin tablas): 27 registros idénticos a los de
-   Linux y del driver de stock para los mismos tamaños (§6.2). Los frames entran en la cola de 0340 junto a las copias;
-   uno que no encaja va por la copia, en orden. La superficie queda en uso hasta que el DPU ha tomado el flip
-   siguiente, y CoreAnimation lo sabe por `SwapWait` (0353): entonces crea una tercera superficie (§3.10).
+4. **Diseño:** las superficies de pantalla de backboardd salen de un pool físico propio (ocho huecos de 5 MiB desde
+   0xe5000000 con 0354; cuatro con 0350-0353, que se llenan: §3.13), mapeadas *write-combined* en todas partes (ni la
+   GPU ni el DPU necesitan mantenimiento de caché), y el VIG0 las escanea con el QSEED3LITE configurado como Linux
+   (bilineal, sin tablas): 27 registros idénticos a los de Linux y del driver de stock para los mismos tamaños (§6.2).
+   Los frames entran en la cola de 0340 junto a las copias; uno que no encaja va por la copia, en orden. La superficie
+   queda en uso hasta que el DPU ha tomado el flip siguiente, y CoreAnimation lo sabe por `SwapWait` (0353): entonces
+   crea una tercera superficie (§3.10).
 5. **Las tablas (LUT) del QSEED3LITE no salen del kernel en el driver de stock:** las da el HAL de userspace como
    propiedad de plano (`lut_sep`), desde una extensión cerrada; sin ellas, SDE y Linux programan bilineal sin tabla.
 6. **Medido en el teléfono con 0349** (n = 1 arranque, 16 932 flips): el ABL deja el VIG0 como 0350 espera (ARGB8888,
@@ -77,15 +81,38 @@ las ramas que se han mirado.
    sin 0353, `kern.sweet_fb_scanout=1` no sirve ni para mirar la imagen.**
 10. **0353 responde `SwapWait` con el estado de la cola:** ocupado mientras un frame de esa superficie espera, está en el
     panel o lo está dejando; en pantalla cuando el DPU ha tomado su flip; una espera bloqueante (`idle()`) hasta que el
-    último frame está en el panel y, si ese frame es de una superficie, el `SwapEnd` siguiente espera a su frame (tras
-    `idle()` CoreAnimation deja de preguntar por la página del panel). Con la copia el ritmo no cambia: sus superficies
-    quedan libres en el `SwapEnd`, como siempre. `kern.sweet_fb_swapwait` está a 0 por defecto hasta medirlo; el
-    scanout lo exige (con 0 copia sus frames).
+    último frame está en el panel, y el `SwapEnd` siguiente espera a su frame (tras `idle()` CoreAnimation deja de
+    preguntar por la página del panel). Con la copia el ritmo no cambia: sus superficies quedan libres en el `SwapEnd`,
+    como siempre. `kern.sweet_fb_swapwait` vale 1 por defecto. Con 0354 el scanout lo exige (con 0 copia sus frames) y
+    el `SwapEnd` tras `idle()` solo espera si en el panel puede haber un frame de superficie, hasta 250 ms.
 11. **Con dos superficies no hay diseño que no serialice** dibujo y presentación: retener el `SwapEnd` hasta que el frame
     está en el panel da 33,6 frames/s en el modelo del teléfono, frente a 55,4 de la copia. Con 0353 CoreAnimation crea
     la tercera y el modelo da 54,2 frames/s, 4,9 ms menos del tick al panel, la GPU ocupada un 43 % en vez de un 69 %,
     ninguna copia y ningún cambio del plano en régimen (§3.11, §6.4). Con la GPU como límite, 49,6 frente a 41,8
     frames/s y 36,6 frente a 66,8 ms.
+12. **Con cuatro huecos el pool se llena** (03 M22: `4 of 4 slots in use, 31 surfaces made in it, 14 refused`, tras
+    horas de uso con reinicios de backboardd). CoreAnimation tiene tres superficies en uso, hace otras cuando cambia lo
+    que necesita una página mientras las viejas viven hasta quedarse sin uso, y un backboardd reiniciado hace las suyas
+    mientras el kernel aún retiene la del panel (QuartzCore 20H392, §3.13). Una superficie rechazada queda fuera del
+    pool toda su vida: sus frames van por la copia, los de las otras se escanean, y el plano cambia de modo en cada uno
+    de los suyos (5,2 frames/s en el teléfono y en el modelo con el texto de 0353). **0354:** ocho huecos y **un solo
+    modo mientras el anillo sea el mismo:** si una superficie que el window server presenta no puede escanearse, todos
+    los frames van por la copia mientras esa superficie viva; el plano cambia de modo cuando cambia el anillo, no frame
+    a frame. En el modelo, con la vida del anillo: con ocho huecos se escanean todos los frames (cinco huecos usados
+    como mucho); con cuatro o tres, el 80 % o el 53 %, sin ningún cambio de modo en régimen.
+13. **Con 0353 los dos caminos no ponen la ventana en el mismo sitio** (§3.14). La copia aplica el origen de la ventana
+    (13,33; 12 de la superficie 2x) con el origen de la fuente del blitter, el scanout con `SRC_XY` del plano; los
+    registros leídos en el teléfono son los calculados. Si los dos motores aplican su origen, los dos caminos coinciden
+    a 0,35 píxeles del panel; si el plano no aplica `SRC_XY`, los frames copiados quedan 19,75 y 17,75 píxeles (1,3 y
+    1,1 mm) arriba y a la izquierda de los escaneados: lo que vio el usuario mientras el plano alternaba [H, una
+    observación]. **0354** pone la ventana en (16, 12) (`fOffX` 24, el múltiplo de 24 más cercano al centro: a 1,5
+    píxeles del panel del centro en vez de 2,5; el táctil sigue la misma regla) y los dos caminos la recortan por la
+    dirección de la fuente: `SRC_XY` queda a 0, y el origen del blitter, sin columnas. Coinciden a 1,27 píxeles como
+    mucho sea cual sea la lectura del hardware (`encuadre.cpp`, §6.2).
+14. **Frames 2x de varias capas.** El camino 2x solo enseña una capa a pantalla completa. Con 0353, un frame de varias
+    capas voltea el buffer trasero tal cual (un frame más viejo, durante un refresco) y con el scanout cambia el plano
+    dos veces. 0354 lo enseña por su capa 0 si esta es la superficie de pantalla del window server, y si no, no lo
+    enseña (el panel conserva su frame).
 
 ## 1. Auditoría: qué hace hoy el port con el DPU
 
@@ -187,7 +214,10 @@ movimiento; escritos en el último dieciseisavo del refresco (líneas ≥ 2280),
 - Hueco bajo en uso, según el código: cámara 0xd7000000-0xe0000000, módem 0xe0000000 (16 MB), GPU 0xe1000000-0xe1500000,
   framebuffer 0xe2000000-0xe5000000, QSEE 0xe8000000-0xe9000000 (`SweetQsee.cpp:80-85`, `sweet_cam.c:802-803`,
   `SapphireGpu.cpp:96-101, 1421-1427`). **0xe5000000-0xe8000000 no lo usa ningún código del port**, y el DT no tiene
-  ninguna región fija por encima de 0x66000000 (`reserved-memory`). El pool del scanout va ahí (20 MiB).
+  ninguna región fija por encima de 0x66000000 (`reserved-memory`). El pool del scanout va ahí: 20 MiB
+  (0xe5000000-0xe6400000) con 0350-0353, 40 MiB (0xe5000000-0xe7800000) con 0354. En el árbol a 0353 sigue sin usarlo
+  otro código (búsqueda de 0xe5…-0xe7… en `iokit/Kernel/arm`, `osfmk/arm*` y `bsd/dev/arm64`: solo constantes de
+  instrucciones de trampa).
 
 ### 1.6 La copia por GPU de hoy
 
@@ -240,10 +270,11 @@ movimiento; escritos en el último dieciseisavo del refresco (líneas ≥ 2280),
 | (b) | Las superficies de pantalla de backboardd salen de un pool físico por debajo de 4 GiB | el mecanismo de los flip buffers (memoria fija, WC, bypass); contigua; sin tocar el SMMU | 5 MiB por superficie de memoria fija; solo las superficies creadas con el pool activo | **elegida** |
 | (c) | El driver Metal dibuja en un buffer del pool del panel | ninguna superficie especial | cambia el driver, y CoreAnimation sigue presentando IOSurfaces: otra cadena en paralelo | descartada |
 
-Cuenta del pool: 750×1624 con filas de 3072 bytes son 4 988 928 bytes (4 997 120 redondeados a página de 16 KiB);
-huecos de 5 MiB. Cuatro huecos (dos superficies, la tercera que CoreAnimation crea si las dos están en uso, y una de
-margen) son 20 MiB en 0xe5000000-0xe6400000. El pool de los flip buffers (48 MB) está casi lleno (página del DSI, dos
-flip buffers, la sombra de consola y el tercer flip buffer de 0340: 41,7 MB).
+Cuenta del pool: 750×1624 con filas de 3072 bytes son 4 988 928 bytes (4 997 120 redondeados a página de 16 KiB); huecos
+de 5 MiB. 0350 pone cuatro (dos superficies, la tercera que CoreAnimation crea si las dos están en uso, y una de
+margen): 20 MiB en 0xe5000000-0xe6400000. No bastan para la vida del anillo (§3.13): 0354 pone ocho, 40 MiB en
+0xe5000000-0xe7800000, por debajo del pool de QSEE (0xe8000000). El pool de los flip buffers (48 MB) está casi lleno
+(página del DSI, dos flip buffers, la sombra de consola y el tercer flip buffer de 0340: 41,7 MB).
 
 ### 3.2 Requisitos de la superficie y cómo los cumple 0350
 
@@ -268,11 +299,13 @@ para el op mode del escalador, como Linux (`dpu_hw_setup_scaler3`, l. 369-379).
 
 ### 3.4 Geometría: igual que la copia
 
-No se estira ni se ponen bandas: se escanea la misma ventana que copia la GPU, `SRC_XY = (13, 12)`,
-`SRC_SIZE = 720×1600`, salida 1080×2400 en (0, 0), ×1,5 en los dos ejes. La única diferencia es 1/3 de píxel 2x (media
-columna del panel) en el origen horizontal: `SRC_XY` es entero y la fase inicial se deja a 0, como Linux. Con
-`kern.sweet_fb_rscale` (0321) la ventana se recalcula igual que en la copia (`sweet_scan_window`) y el factor sube
-(400 ‰: ×3,75; el QSEED3 admite hasta ×20).
+No se estira ni se ponen bandas: se escanea la misma ventana que copia la GPU, 720×1600 de la superficie, salida
+1080×2400 en (0, 0), ×1,5 en los dos ejes. La ventana es la del panel en el lienzo 3x de 1125×2436, en (`fOffX`, 18),
+a 2/3: su origen en la superficie es (13,33; 12) con `fOffX` 20 (0350-0353) y (16, 12) con `fOffX` 24 (0354). Con
+0350-0353 el scanout lo pone en `SRC_XY = (13, 12)` (1/3 de píxel 2x menos que la copia, que lo da en 1/256 de píxel
+con el origen de la fuente del blitter; fase inicial 0, como Linux); con 0354 los dos caminos lo ponen en la dirección
+de la fuente y `SRC_XY` queda a (0, 0) (§3.14). Con `kern.sweet_fb_rscale` (0321) la ventana se recalcula igual que en
+la copia (`sweet_scan_window`) y el factor sube (400 ‰: ×3,75; el QSEED3 admite hasta ×20).
 
 ### 3.5 QSEED3LITE: registros y valores
 
@@ -281,7 +314,7 @@ Para 720×1600 → 1080×2400 (`sweet_plane_scaled_regs`; idéntico a Linux y al
 | Registro (VIG0 +) | Valor | Origen |
 |---|---|---|
 | `SRC_SIZE` 0x000 | 0x064002d0 (1600<<16 \| 720) | `setup_rects` |
-| `SRC_XY` 0x008 | 0x000c000d (12<<16 \| 13) | `setup_rects` |
+| `SRC_XY` 0x008 | 0 con 0354 (el origen va en `SRC0_ADDR`: superficie + 12·3072 + 16·4 = +0x9040); 0x000c000d (12<<16 \| 13) con 0350-0353 | `setup_rects` |
 | `OUT_SIZE` 0x00c, `OUT_XY` 0x010 | 0x09600438, 0 (los del ABL) | `setup_rects` |
 | `SW_PIX_EXT_C0/C1C2/C3` LR, TB, REQ 0x100-0x128 | 0, 0, 0x064002d0 | `setup_pe_config` |
 | `PHASE_INIT_Y_H/Y_V/UV_H/UV_V` 0xa90-0xa9c | 0 | `dpu_hw_setup_scaler3` |
@@ -289,7 +322,7 @@ Para 720×1600 → 1080×2400 (`sweet_plane_scaled_regs`; idéntico a Linux y al
 | `PRELOAD` 0xa20 | 0x02040204 (H 4, V 2) | versión ≥ 3.0 |
 | `SRC_SIZE_Y_RGB_A` 0xa40, `SRC_SIZE_UV` 0xa44 | 0x064002d0 | |
 | `DST_SIZE` 0xa48 | 0x09600438 | |
-| `OP_MODE` 0xa04 | 0xa0034401 (con el alfa del formato del ABL) | enable, BIL, blend, 8 bits, alfa bilineal |
+| `OP_MODE` 0xa04 | 0xa0034401 (con el alfa del formato del ABL); se lee 0x20034401: el bit 31 (`blend_cfg`) no se conserva (`telefono/regs-scan.txt`) | enable, BIL, blend, 8 bits, alfa bilineal |
 | `SSPP_SRC_OP_MODE` 0x038 | 0x80000000 (el del ABL \| PE override) | `setup_format` |
 
 Para estirar la superficie entera (razones 1,44 y 1,478) los pasos serían 0x1638e3 y 0x15a740; 0350 no estira. Sin
@@ -321,9 +354,10 @@ escalar es el del ABL, leído en `start()`, y vuelve en el primer flip de un fli
 - **Vida de la superficie:** en uso desde su `SwapEnd` hasta que el DPU ha tomado el flip de un frame posterior;
   entonces se suelta (`sweet_hold` y `release`). CoreAnimation no mira ese contador de uso en sus superficies de
   pantalla: lo sabe por `SwapWait`, que 0353 responde con este mismo estado (§3.10).
-- **Frames mezclados:** uno que no encaja (varias capas, superficie fuera del pool, una superficie que el panel aún
+- **Frames mezclados:** uno que no encaja (superficie fuera del pool o de otro tamaño, una superficie que el panel aún
   puede leer) va por la copia, a la misma cola, en orden. El flip de un flip buffer vuelve a poner el plano del ABL con
-  la misma regla de §3.6.
+  la misma regla de §3.6. Con 0354, mientras viva una superficie del anillo que no puede escanearse van por la copia
+  todos los frames, y uno 2x de varias capas se enseña por su capa 0 o no se enseña (§3.12).
 - **Profundidad y contrapresión:** la de CoreAnimation, por `SwapWait` (0353, que el scanout exige): como mucho dos
   frames por delante del panel, lo que cabe en la cola de 0340 (`kern.sweet_fb_queue_depth` 2) sin que el `SwapEnd`
   espere. Las esperas de 0340 en `SwapEnd` (`_hold_ms`) quedan para lo que no respeta esa contrapresión.
@@ -336,7 +370,7 @@ escalar es el del ABL, leído en `start()`, y vuelve en el primer flip de un fli
   el render del frame siguiente empieza ese tiempo antes.
 - CPU: desaparecen los `dc cvac` de 5 MB en `SwapEnd` (§1.6) y los `dc civac` del submit en el modo 0 de 0339.
 - Ancho de banda de scanout: el DPU lee 720×1600×4 = 4,6 MB por refresco en vez de 10,4 MB (0,55 frente a 1,24 GB/s).
-- Memoria: 20 MiB de pool fijo; los flip buffers se quedan (son la ruta de vuelta).
+- Memoria: 40 MiB de pool fijo con 0354 (20 con 0350-0353); los flip buffers se quedan (son la ruta de vuelta).
 
 ### 3.9 El camino completo, la latencia y lo que necesita CoreAnimation
 
@@ -443,16 +477,19 @@ retenidas por el scanout), y `SwapWait` responde con ese estado, el mismo que us
 
 Antes de responder, la llamada mira la cola (`queueFlip()`): un flip tomado desde la última mirada del hilo cuenta ya.
 La misma pregunta ocupada más de 1 s se responde 0 y se cuenta (ninguna espera de un frame dura eso; una GPU colgada se
-reinicia a los 2 s). Si una espera de todos (`SwapWait(0, 2)` bloqueante) encuentra en el panel un frame de superficie,
-el `SwapEnd` siguiente vuelve cuando su propio frame está en el panel (50 ms como mucho): después de `idle()`
-CoreAnimation ya no pregunta por la página del frame en pantalla, y sin esa espera el frame siguiente al siguiente
-podía dibujarse en esa superficie mientras se escanea (lo encontró el modelo, §6.4). Con un frame copiado en el panel no
-hace falta (está en un flip buffer y su superficie ya está libre) y no se espera.
+reinicia a los 2 s). Tras una espera de todos (`SwapWait(0, 2)` bloqueante), el `SwapEnd` siguiente vuelve cuando su
+propio frame está en el panel: después de `idle()` CoreAnimation ya no pregunta por la página del frame en pantalla, y
+sin esa espera el frame siguiente al siguiente podía dibujarse en esa superficie mientras se escanea (lo encontró el
+modelo, §6.4). 0353 espera siempre, 50 ms como mucho. Con 0354, solo si en el panel puede haber un frame de superficie
+(uno copiado está en un flip buffer y su superficie ya está libre), y hasta 250 ms: con 0353, en el teléfono, 14 de 78
+esperas llegaron a los 50 ms (`SwapEnds held after a wait for every swap 78, 1433117 us in all, max 50122, timed out
+14`, `telefono/diag-scan.txt`), y una espera que vence deja dibujar en la superficie del panel.
 `kern.sweet_fb_swapwait=2` retiene también las superficies de los frames copiados hasta un flip posterior, como un
-IOMobileFramebuffer que las retuviera; 0 (el valor por defecto mientras no se mida en el teléfono) responde 0 al
-instante, como hasta 0352. **El scanout exige 1 o 2:** con 0 sus frames se copian (`kern.sweet_fb_swapwait 0` en las
+IOMobileFramebuffer que las retuviera; 0 responde 0 al instante, como hasta 0352. El valor por defecto es 1 (§3.11;
+medido en 03 M16). **Con 0354 el scanout exige 1 o 2:** con 0 sus frames se copian (`kern.sweet_fb_swapwait 0` en las
 causas de `kern.sweet_fb_scanout_diag`), y poner 0 con el scanout activo re-presenta el frame en pantalla por la copia,
-como `kern.sweet_fb_scanout=0`.
+como `kern.sweet_fb_scanout=0`. Con 0353 solo, `swapwait=0` con `scanout=1` desgarra (en el modelo, 277 dibujos sobre
+la superficie escaneada por ejecución).
 
 ### 3.11 Con dos superficies, y las opciones medidas en el modelo
 
@@ -489,24 +526,152 @@ Con la GPU como límite (dibujo de 14-24 ms, CPU 6-10 ms): copia 41,8 frames/s y
 
 ### 3.12 El plano en régimen
 
-El plano cambia de modo (escalado ↔ sin escalar: 27 registros, y un frame por la copia) solo cuando un frame necesita
-la copia: varias capas, una superficie fuera del pool, el sysctl cambiado, o una superficie aún en uso. Con 0353 lo
-último no pasa, y en régimen (una capa a pantalla completa, las tres superficies en el pool) el plano queda escalado:
-en el modelo, como mucho un cambio por ejecución (el primero), comprobado en cada una (§6.4). Lo que puede devolver los
-cambios:
+El plano cambia de modo (escalado ↔ sin escalar: 27 registros) cuando un frame va por la copia después de uno
+escaneado, o al revés. Con 0353 eso pasa en cada frame que no encaja: varias capas, una superficie fuera del pool o de
+otro tamaño, el sysctl cambiado, o una superficie aún en uso (esto último, con `SwapWait` fiel, casi no pasa: 6 de
+19 058 frames en el teléfono). En régimen
+(una capa a pantalla completa, las tres superficies en el pool) el plano queda escalado: en el modelo, como mucho un
+cambio por ejecución (el primero). Pero con una superficie del anillo fuera del pool, sus frames van por la copia (5,2
+por segundo en 03 M22) y el plano cambia dos veces por cada uno (77 veces en 10 s en cada sentido), y cada
+frame de varias capas lo cambia dos veces (3,6 por segundo con uno de cada 30 en el modelo).
 
-- **una tercera superficie fuera del pool** (el pool lleno de otras superficies elegibles de backboardd): un frame de
-  cada tres por la copia, 52 cambios por segundo en el modelo. El pool tiene cuatro huecos para tres superficies;
-  `kern.sweet_fb_scanout_diag` lo dice (`pool: 3 of 4 slots in use`, `not from the pool`);
-- **frames de varias capas** (capas que CoreAnimation separa, como un vídeo): dos cambios por frame así (3,6 por segundo con uno cada 30 en el modelo).
-  Para que ni eso cambie el plano haría falta que la copia de esos frames fuera a un hueco del pool a 750×1624 en vez
-  de a un flip buffer; no se ha hecho.
+0354 quita las dos causas de cambios en régimen:
+
+- **Un solo modo mientras el anillo sea el mismo.** Una superficie que el window server presenta y no puede escanearse
+  (fuera del pool, otro tamaño o formato) se anota por su id y su puntero (`fScanBlock[]`, sin retenerla); mientras
+  alguna anotada siga viva (`sweet_surface_alive()`: la tabla de ids aún tiene esa superficie con ese id; ni liberada
+  ni soltada por todos sus usuarios), todos los frames van por la copia (`frames copied for them`). Cuando se va, vuelve
+  el scanout: un cambio de modo cuando cambia el anillo, no uno por frame. Con ocho huecos no debería anotarse ninguna
+  (§3.13); si se anota, `kern.sweet_fb_scanout_diag` dice cuántas, y la línea de cada hueco dice qué superficies lo
+  llenan.
+- **Frames 2x de varias capas.** `shownRecord()` los enseña por su capa 0 si esta es la superficie a pantalla completa
+  del window server (con una copia del registro que solo tiene la capa 0 en la máscara), y si no, no los enseña (el
+  panel conserva su frame; su swap queda hecho para `SwapWait`). Los ocho primeros van al log con lo que trae cada capa.
+  Las otras capas no se ven en ese frame; con la copia 2x de 0353 tampoco (`present()` solo copia una capa en 2x), y
+  además voltea el buffer trasero tal cual: un frame más viejo durante un refresco. Si el log muestra capas con
+  contenido que importa, componerlas es el paso siguiente.
+
+En el modelo, con 0354: ningún cambio de modo en régimen en ningún escenario, también con frames de dos capas cada 30
+(1,8 por segundo enseñados por su capa 0) y con la vida del anillo (§3.13, §6.4).
+
+### 3.13 La vida del anillo de CoreAnimation y el tamaño del pool
+
+**Lo que se vio** (03 M22, kernel 0353, scanout encendido varias horas con reinicios de backboardd):
+`pool: 4 of 4 slots in use, 31 surfaces made in it, 14 refused (full)`; en 10 s, `not from the pool` +52 y los cambios
+del plano +77 en cada sentido; la pantalla entera saltaba. Más tarde, con el scanout aún encendido
+(`telefono/diag-scan.txt`): `pool: 3 of 4 slots in use, 40 surfaces made in it, 14 refused`, y en todo el arranque
+19 058 frames, de ellos 4 766 copiados por `not from the pool`, 57 por `not one layer` y 6 por `swapped again`, y 4 799
+cambios a escalado. Casi todos los cambios del plano vienen de frames de una superficie fuera del pool. El pool no
+pierde huecos (bajó de 4 a 3 en uso y siguió creando superficies en él): se queda corto en los momentos de más
+superficies.
+
+**Cómo hace y suelta CoreAnimation sus superficies de pantalla** [O, QuartzCore 20H392, desensamblado con nombres]:
+
+- Cada página del anillo (§3.10) apunta a un `Buffer`, y cada `Buffer` a su superficie.
+  `IOMFBDisplay::current_page_surface` (0x18853c4cc) mira la del `Buffer` de la página siguiente: si su ancho, su alto,
+  su formato, un bit de sus banderas (bit 24 de `[superficie+0x38]`, frente a lo que da el método virtual `+0x5c8` del
+  display) o un valor de 64 bits (el método `+0xc8` de la superficie, frente al argumento de 64 bits de la función) no
+  coinciden con lo que pide el display (0x18853c650-0x18853c6a4), crea otra con `Display::allocate_surface`
+  (0x18853c6fc) con el nombre `"CA Framebuffer"` (`"CA Assembly Buffer"` en el otro caso, 0x18853c594-0x18853c5dc) y
+  suelta la vieja de ese `Buffer` (0x18853c724). La página que la enseñó la retiene hasta que se recupera
+  (0x1882beb84-0x1882bebf4), y el kernel mientras el panel pueda leerla.
+- `CA::SurfaceUtil::CAIOSurfaceCreate` llama a `IOSurfaceCreate` (0x18832468c) y después pone el nombre con
+  `IOSurfaceSetValue` (0x1883246b8): el kernel no lo ve al crearla; por eso el criterio del pool es el proceso, el
+  tamaño y el formato (§3.2), y coge también otras superficies de backboardd del tamaño de la pantalla.
+- `IOMFBDisplay::collect_buffers` (0x188305288) libera los `Buffer` sin uso cuya superficie ya no corresponde al valor
+  de 64 bits actual (0x1883052d8-0x18830530c), con su superficie.
+- Qué cambia ese valor o ese bit en el teléfono no está leído [H]. Que pasa lo dicen los contadores: 40 superficies
+  hechas en el pool en un arranque de unas horas, con un puñado de reinicios de backboardd.
+
+**Cuántas a la vez:** tres en uso (las páginas). Cuando cambia lo que pide el display, hasta tres nuevas mientras viven
+las viejas que aún no ha liberado `collect_buffers` (hasta tres); un backboardd reiniciado hace las suyas mientras el
+kernel aún retiene la superficie del panel del anterior (hasta que el DPU toma un flip posterior); y backboardd hace a
+veces superficies del tamaño de la pantalla que no presenta, que también cogen hueco. En el peor caso, tres viejas +
+tres nuevas + una sin presentar: siete; ocho deja uno de margen. Con cuatro huecos, la nueva que no cabe queda fuera
+del pool **toda su vida**, y es una de las tres del anillo: sus frames van por la copia.
+
+**0354:** ocho huecos de 5 MiB (0xe5000000-0xe7800000; §1.5) y el modo único de §3.12, que hace que una superficie
+fuera del pool no cambie el plano frame a frame aunque el pool vuelva a quedarse corto. Para verlo,
+`kern.sweet_fb_scanout_diag` lista cada hueco en uso con la superficie, su `IOSurfaceName`, el proceso que la hizo, su
+edad, cuántas veces se presentó y cuándo por última vez (`SweetSurface` guarda creador, hora de creación, swaps y
+último swap; `presentNow()` cuenta los swaps).
+
+En el modelo (§6.4) la vida del anillo es: un cambio de lo que pide el display cada 3-8 s (las viejas se sueltan en
+cuanto quedan sin uso, más deprisa que `collect_buffers`: por eso usa menos huecos que la cuenta del peor caso), un
+reinicio de backboardd cada 10-30 s y una superficie del tamaño de la pantalla, sin presentar, durante 4-6 s de cada
+5-20 s. Con el texto de 0353 de la serie y cuatro huecos (cambio cada 8 s, reinicio cada 30 s, superficie suelta 6 s
+de cada 20): el 90 % de los frames escaneados, 5,2 frames/s copiados por una superficie fuera del pool (en el teléfono,
+5,2/s), 10,4 cambios del plano por segundo (6,9 en régimen); con tres huecos, 24,6 cambios por segundo en régimen. Con
+0354:
+
+| Pool | Frames escaneados | Copiados por la superficie fuera del pool / por las demás del anillo | Cambios del plano en régimen | Huecos usados como mucho |
+|---|---|---|---|---|
+| ocho huecos, en los cinco escenarios de la vida del anillo | 100 % | 0 / 0 | 0 | 5 |
+| cuatro (cambio cada 8 s, reinicio cada 30 s, superficie suelta 6 s de cada 20) | 80 % | 5,5/s / 5,5/s | 0 | 4 |
+| tres (ídem) | 53 % | 12,9/s / 12,9/s | 0 | 3 |
+
+Con cuatro o tres huecos el plano se queda en la copia mientras dura la superficie de fuera, y vuelve al scanout cuando
+muere: dos cambios por cada vez que el pool se queda corto (0,07 y 0,13 por segundo en total).
+
+### 3.14 El encuadre de los dos caminos
+
+**Qué rectángulo usa cada uno** con `fOffX` 20, de 0350 a 0353 (superficie 2x de 750×1624, panel de 1080×2400):
+
+- **Ventana:** la del panel en el lienzo 3x de 1125×2436 (los puntos de iOS a escala 3), en (`fOffX`, `fOffY`) =
+  (20, 18), a 2/3: origen (13,33; 12) y tamaño 720×1600 en la superficie (§1.6); de ahí, ×1,5 a todo el panel. El
+  panel enseña 1080×2400 de los 1125×2436 del lienzo: 45 columnas y 36 filas fuera.
+- **Copia** (`present()` → `sapphire_gpu_copy_scaled()` → `blit_scale()`): dos pasadas bilineales del blitter 2D,
+  intercaladas (filas pares e impares del panel, con pitch 8640 porque 4320 no es múltiplo de 64); el origen en 1/256
+  de píxel, (3413, 3072), va en `GRAS_A2D_SRC_XMIN`/`YMIN`, con la base de la textura en la superficie.
+- **Scanout** (`presentScanout()`): `SRC0_ADDR` = la superficie, `SRC_XY` = (13, 12), `SRC_SIZE` 720×1600,
+  `OUT_SIZE` 1080×2400 en `OUT_XY` (0, 0), escalador con fase inicial 0 y paso 2/3.
+- **Leído en el teléfono** (kernel 0353, `kern.sweet_fb_regs`, `telefono/regs-scan.txt` y `regs-copia.txt`, con el
+  home quieto): con el scanout, VIG0 +000 = 064002d0, +008 = 000c000d, +00c = 09600438, +010 = 0, +014 = e5a00000,
+  +024 = 00000c00, +038 = 80000000; escalador +010-+01c = 00155555, +040/+044 = 064002d0, +048 = 09600438, fases 0:
+  lo calculado (§3.5). Con la copia, el plano del ABL (+000 y +00c = 09600438, +008 = 0, +014 = un flip buffer, +024 =
+  000010e0). Los dos caminos están programados como dice el código; la diferencia, si la hay, está en cómo aplica cada
+  motor su origen.
+
+**Dónde cae cada píxel** (`encuadre.cpp`, §6.2). Para cada píxel del panel, la coordenada de la superficie que enseña
+cada camino; la diferencia copia − scanout es positiva cuando la copia enseña en ese píxel algo más a la derecha o más
+abajo de la superficie, es decir, cuando su imagen está desplazada arriba y a la izquierda:
+
+| Ventana y scanout | Lectura del hardware | Copia − scanout (media, píxeles del panel) | Máximo |
+|---|---|---|---|
+| `fOffX` 20, 0353 | los dos motores aplican su origen | +0,25, −0,25 | 0,35 |
+| | el blitter ignora su origen | −19,75, −18,25 | 27,2 |
+| | **el plano ignora `SRC_XY`** | **+19,75, +17,75** | 26,6 |
+| `fOffX` 24, 0354 | los dos motores aplican su origen | −0,25, −0,25 | 0,35 |
+| | el blitter ignora su origen | −0,25, −1,00 | 1,27 |
+| | el plano ignora `SRC_XY` | −0,25, −0,25 | 0,35 |
+
+**Qué casa con lo visto.** Con el pool lleno, la mayoría de los frames se escaneaban y unos cinco por segundo iban por
+la copia; el usuario vio la imagen entera saltar en diagonal hacia arriba y a la izquierda unos milímetros, una y otra
+vez. Con el píxel del panel de 0,064 mm (6,67", 1080×2400), +19,75 y +17,75 píxeles son 1,3 mm a la izquierda y 1,1 mm
+hacia arriba en los frames copiados: es la lectura «el plano ignora `SRC_XY`» [H: una observación, sin foto]. Con los
+dos orígenes aplicados no se vería nada, y con el del blitter ignorado el salto iría hacia abajo y a la derecha. Ni los
+registros ni el código dicen por qué el plano no recortaría por `SRC_XY`, que Linux usa así; con 0354 no hace falta
+saberlo.
+
+**0354 recorta por la dirección en los dos caminos.** `fOffX` pasa al múltiplo de 24 más cercano al centro, 24
+((1125 − 1080) / 2 = 22,5): en el lienzo 3x la ventana empieza en la columna 24 (96 bytes, múltiplo de los 16 que pide
+el DPU) y en la superficie 2x en (16, 12): 64 bytes justos, lo que pide la base de la textura del blitter. El scanout
+pone en `SRC0_ADDR` las filas enteras y los grupos de 16 bytes de columnas del origen (superficie + 12·3072 + 16·4 =
++0x9040) y en `SRC_XY` el resto, (0, 0); la copia pone en la base de la textura las filas enteras de cada pasada y los
+grupos de 16 píxeles de columnas, y en `GRAS_A2D_SRC_XMIN`/`YMIN` el resto: ninguna columna y una fracción de fila
+(el centrado de las filas de cada pasada). Con eso los dos caminos coinciden a 1,27 píxeles del panel como mucho sea
+cual sea la lectura, y la ventana queda a 1,5 píxeles del panel del centro (16 columnas de la superficie fuera a la
+izquierda y 14 a la derecha) en vez de 2,5. El táctil (`SweetHID.cpp`) usa la misma regla para su `fOffX`: lo que se ve
+y lo que se toca se mueven juntos unos 4 píxeles del panel (0,26 mm) a la izquierda respecto a 0353, en los dos modos.
 
 ## 4. Los parches
 
-En `xnu/patches/`, numerados por el coordinador: 0349 y 0350 (escritos como 0347 y 0348, integrados tal cual) y 0352
-(incremental, sobre la serie con 0343-0351). 0353 está en `~/sapphire-angel/research/metal/display/parches-nuevos/`,
-sobre la serie con 0343-0352, junto a la copia de trabajo de 0352; las versiones descartadas, en `work/obsoletos/`.
+En `xnu/patches/`, numerados por el coordinador: 0349 y 0350 (escritos como 0347 y 0348, integrados tal cual), 0352
+(incremental, sobre la serie con 0343-0351) y 0353. 0354 está en
+`~/sapphire-angel/research/metal/display/parches-nuevos/`, sobre la serie con 0343-0353. Las versiones descartadas, en
+`work/obsoletos/`, entre ellas una revisión de 0353 posterior a la integrada (valor por defecto 0, el scanout exigiendo
+`SwapWait`, la retención solo con un frame de superficie en el panel): lo que tiene de más lo lleva 0354 (punto 6), con
+el valor por defecto de la serie, 1.
 
 ### 4.1 `0349-sapphire-fb-dpu-regs-latch-diag.patch` (diagnóstico; solo lectura)
 
@@ -556,28 +721,66 @@ Solo `SweetFramebuffer.cpp`; nada cambia mientras `kern.sweet_fb_scanout` y `ker
    (boot-arg `sweetfb_flush_taken`), defecto 0: 1 = todos los flips, copias incluidas, se dan por tomados por los bits.
 5. `kern.sweet_fb_scanout_diag`: la primera línea da cuántos flips devolvieron los bits y qué regla toma los flips.
 
-### 4.4 `0353-sapphire-fb-swapwait-from-queue.patch` (`SwapWait` con el estado de la cola; apagado por defecto)
+### 4.4 `0353-sapphire-fb-swapwait-from-queue.patch` (`SwapWait` con el estado de la cola)
 
-Solo `SweetFramebuffer.cpp`. Necesita 0340, 0350 y 0352. Con `kern.sweet_fb_swapwait=0` (defecto) no cambia nada salvo
-que el scanout copia sus frames (lo exige); con la cola apagada (`kern.sweet_fb_queue=0`), tampoco. Con 1 y la copia,
-CoreAnimation sigue con dos superficies y el mismo ritmo (§3.11): lo que cambia es que `SwapWait` dice la verdad sobre
-el panel, y que las esperas bloqueantes esperan. Queda en 0 por defecto hasta medirlo en el teléfono (§7 pasos 3 y 5);
-si el A/B lo confirma, el valor por defecto puede pasar a 1.
+Solo `SweetFramebuffer.cpp`. Necesita 0340, 0350 y 0352. Con la cola apagada (`kern.sweet_fb_queue=0`) no cambia nada.
+Con la copia, CoreAnimation sigue con dos superficies y el mismo ritmo (§3.11): lo que cambia es que `SwapWait` dice la
+verdad sobre el panel, que las esperas bloqueantes esperan, y que el `SwapEnd` tras una espera de todos espera a su
+frame (50 ms como mucho). Con el scanout, CoreAnimation hace la tercera superficie y el plano queda escalado en régimen
+(03 M16).
 
 | Interruptor | Valores | Efecto |
 |---|---|---|
-| `kern.sweet_fb_swapwait` (boot-arg `sweetfb_swapwait`) | **0** (defecto) | `SwapWait` responde 0 al instante, como hasta 0352; el scanout copia sus frames |
-| | 1 | `SwapWait` responde con el estado de la cola (§3.10); el scanout puede escanear |
+| `kern.sweet_fb_swapwait` (boot-arg `sweetfb_swapwait`) | 0 | `SwapWait` responde 0 al instante, como hasta 0352 (con 0354 el scanout copia entonces sus frames) |
+| | **1** (defecto) | `SwapWait` responde con el estado de la cola (§3.10) |
 | | 2 | además, las superficies de un frame copiado quedan en uso hasta un flip posterior tomado |
 | `kern.sweet_fb_swapwait_diag` | lectura | preguntas por superficies libres, por un frame en pantalla y por todos (y cuántas ocupado); esperas, su tiempo y las vencidas; la pregunta ocupada más larga y las respondidas 0 al pasar 1 s; `SwapEnd` retenidos tras una espera de todos; los ids de swap del último flip, del panel y de las superficies retenidas |
 
 Piezas: `SweetQFrame.swap` y los ids de swap de `AppleCLCD` (`fSwapShow`, `fFlipSwap`, `fPanelSwap`, `fScanShowSwap`,
 `fScanLeaveSwap[]`), anotados en `presentQueued`/`presentScanout` (frame en cola), `frameShow` y `flipNote` (flip
 escrito), `flipTaken` (flip tomado), `scanoutLeave`/`scanoutRetire` (superficies retenidas); `swapShown`, `swapFree` y
-`swapWait` (la respuesta), `swapEndHold` (el `SwapEnd` tras una espera de todos que encontró un frame de superficie en
-el panel, desde `swap()`); el selector 6 del user client llama a `swapWait`. `scanoutBusy()` no cuenta las copias en
-cola de la superficie (la copia va antes en el ring), para que diga lo mismo que `swapFree()`. El comentario de 0350
-sobre la vida de la superficie dice que CoreAnimation lo sabe por `SwapWait`, no por el contador de uso.
+`swapWait` (la respuesta), `swapEndHold` (el `SwapEnd` tras una espera de todos, desde `swap()`); el selector 6 del
+user client llama a `swapWait`. `scanoutBusy()` no cuenta las copias en cola de la superficie (la copia va antes en el
+ring), para que diga lo mismo que `swapFree()`. El comentario de 0350 sobre la vida de la superficie dice que
+CoreAnimation lo sabe por `SwapWait`, no por el contador de uso.
+
+### 4.5 `0354-sapphire-fb-scanout-pool-stable-framing.patch` (pool, modo único y encuadre)
+
+`SweetFramebuffer.cpp`, `SweetSurface.cpp`, `SweetSurface.h`, `SapphireGpu.cpp` y `hid/SweetHID.cpp`. Necesita 0350,
+0352 y 0353. Con `kern.sweet_fb_scanout=0` cambian la ventana (punto 4: la imagen y el táctil, 4 píxeles del panel a la
+izquierda), los frames 2x de varias capas (punto 3) y que el `SwapEnd` de un frame copiado ya no espera tras `idle()`
+(punto 6).
+
+1. **Pool de ocho huecos** (`SWEET_FB_SCAN_SLOTS` 8: 0xe5000000-0xe7800000), por la cuenta de §3.13.
+2. **Un solo modo mientras el anillo sea el mismo** (§3.12): `scanoutBlock()` anota (id y puntero, sin retener) la
+   superficie que `presentScanout()` rechaza por no ser del pool o por tamaño o formato; `scanoutBlocked()` quita las
+   que ya no están vivas (`sweet_surface_alive()`, en `SweetSurface.cpp`) y dice si queda alguna; mientras quede,
+   `presentScanout()` manda el frame a la copia (`held_off`). Ocho anotaciones como mucho; si hicieran falta más, la
+   nueva reemplaza a la más antigua.
+3. **Frames 2x de varias capas:** `shownRecord()` (§3.12), desde `presentNow()` y `scanoutStop()`; `present()` no
+   voltea el buffer trasero por un frame 2x del que no copió nada (`not_shown`).
+4. **Ventana recortada por la dirección** (§3.14): `fOffX` es el múltiplo de 24 más cercano a (1125 − 1080) / 2, 24,
+   en `AppleCLCD::start()` y en `SweetHIDTouch::start()`; `presentScanout()` pone el origen en `SRC0_ADDR` (filas y
+   grupos de 16 bytes) y el resto en `SRC_XY`; `blit_scale()` pone filas y grupos de 16 píxeles en la base de la textura
+   y el resto en `GRAS_A2D_SRC_XMIN`/`YMIN`. `SweetQFrame` lleva el origen (`ox`, `oy`) y el plano recuerda el que
+   enseña (`fPlaneOX`, `fPlaneOY`) para el diagnóstico.
+5. **Censo del pool** en `kern.sweet_fb_scanout_diag`: una línea por hueco en uso (`slot N: surface S "CA Framebuffer"
+   by backboardd, made T s ago, swapped K times, last M ms ago`; `sweet_scanout_pool_describe()`), la línea `0354:`
+   (superficies anotadas vistas y anotadas ahora, frames copiados por ellas, frames enseñados por su capa 0, frames no
+   enseñados) y `showing X,Y WxH of a surface (rows of B bytes) from 0x…: X,Y of it through the address, SRC_XY 0,0`.
+   `SweetSurface` guarda el proceso creador y la hora (`create()`), y `presentNow()` cuenta sus swaps y el último;
+   `SweetSurface::free()` quita los valores con el candado de la tabla (el censo lee de ahí el nombre). El texto del
+   diagnóstico pasa de 2 a 3 KB.
+6. **De la revisión de 0353:** `scanoutOn()` exige `kern.sweet_fb_swapwait` 1 o 2 (con 0 los frames del scanout se
+   copian y se cuentan como `kern.sweet_fb_swapwait 0`); poner 0 con el scanout activo llama a `scanoutStop()`; la
+   retención del `SwapEnd` tras una espera de todos solo se da si en el panel puede haber un frame de superficie
+   (`fScanShowSwap`, `fScanLeaveSwap[]`, frames de scanout en cola), y dura hasta 250 ms (§3.10).
+
+| Interruptor | Valores | Efecto |
+|---|---|---|
+| `kern.sweet_fb_scanout` | 0, 1, 2 | como en 0350; con 1, el modo único |
+| `kern.sweet_fb_swapwait` | **1** (defecto), 2, 0 | como en 0353; el scanout exige 1 o 2 |
+| `kern.sweet_fb_scanout_diag` | lectura | además, el censo de huecos, la línea `0354:` y el origen de la ventana repartido entre la dirección y `SRC_XY` |
 
 ## 5. Candados
 
@@ -599,6 +802,16 @@ sobre la vida de la superficie dice que CoreAnimation lo sabe por `SwapWait`, no
   evento que a los `SwapEnd` que esperan) o su propio plazo de 1 ms. `swapEndHold()` se llama desde `swap()` después de
   `presentNow()`, sin candados, y espera igual; nunca desde el temporizador. Ningún orden de candados nuevo.
   `kern.sweet_fb_swapwait_diag` lee los ids sin candado (palabras; diagnóstico).
+- **0354:** `fScanBlock[]`, `fPlaneOX`/`fPlaneOY`, los swaps de cada superficie y el registro reducido de
+  `shownRecord()` van con `fPresentLock`. `sweet_surface_alive()` y `sweet_surface_copy()` (en `shownRecord()`) toman
+  `sweet_surface_lock` con `fPresentLock` tomado: el orden `fPresentLock` → `sweet_surface_lock` que ya existía. El
+  censo (`sweet_scanout_pool_describe()`) recorre los huecos con `sweet_surface_lock`; el puntero de cada hueco se pone
+  tras publicar la superficie y se borra cuando el hueco vuelve, en `free()`, los dos con ese candado. Los valores de
+  una superficie (de donde el censo lee el nombre) se cambian siempre con él, y `free()` los quita de la superficie con
+  él antes de devolver el hueco (los suelta después): el censo nunca lee un diccionario liberado. Ninguna superficie se
+  suelta con `sweet_surface_lock` tomado (comprobado en los tres archivos), así que `free()` puede tomarlo. Los swaps y
+  su hora se escriben con `fPresentLock` y el censo los lee sin él (palabras; diagnóstico). `shownRecord()` reserva el
+  registro reducido con `IOMallocData` con `fPresentLock` tomado (un mutex).
 
 ## 6. Verificación
 
@@ -612,8 +825,12 @@ Herramientas en `~/sapphire-angel/research/metal/display/work/verif/`.
 - `check-0353.sh`: la serie oficial 0343-0352 de `xnu/patches/` sobre el árbol a 0342 y después 0353: **los 11
   aplican en orden**; **0 errores** de sintaxis en los tres archivos; el `SweetFramebuffer.cpp` resultante es igual al
   del árbol de trabajo (`check-0353.log`).
+- `check-0354.sh`: la serie oficial 0343-0353 de `xnu/patches/` sobre el árbol a 0342 y después 0354: **los 12
+  aplican en orden**; **0 errores** de sintaxis en los cuatro archivos (`hid/SweetHID.cpp` incluido); los cinco
+  archivos resultantes son iguales a los del árbol de trabajo (`work/xnu-0354`); `warn-0354.sh`: **ningún aviso** de
+  `-Weverything` en las 336 líneas añadidas (`check-0354.log`).
 - `inject.py`: un identificador sin declarar al principio de cada función nueva o cambiada: **31 de 31** (0349/0350),
-  **11 de 11** (0352) y **20 de 20** (0353) señalados: todo el código nuevo se compila de verdad.
+  **11 de 11** (0352), **20 de 20** (0353) y **21 de 21** (0354) señalados: todo el código nuevo se compila de verdad.
 - `warn.sh` (`-Weverything` con la lista `-Wno` del kernel): en las líneas añadidas solo salen los avisos de las macros
   `SYSCTL_*` que ya da el código vecino (también en las 329 de 0353).
 
@@ -636,6 +853,13 @@ estructuras y los offsets, y del kernel `sweet_plane_off[]`, `sweet_plane_scaled
 como lo hace su catálogo con el DT del teléfono (`sde_init_scaler_blk`, 0x3000): **100 001 casos, 0 diferencias** en los
 registros del escalador.
 
+`encuadre/encuadre.cpp`: `blit_scale()` (de `SapphireGpu.cpp`) y `sweet_scan_window()` extraídos tal cual (y el
+`blit_scale()` de 0353, para comparar), las escrituras de registros de la copia capturadas y el muestreo bilineal del
+blitter modelado (centros de texel, `XMIN`…`XMAX` repartidos sobre el ancho de destino, las dos pasadas intercaladas);
+el scanout con su dirección, su `SRC_XY` y el paso del escalador. Para cada píxel del panel compara la coordenada de la
+superficie que enseña cada camino, con `fOffX` 20 y 24, el scanout como 0353 y como 0354, y tres lecturas del
+hardware: la tabla de §3.14 (`encuadre-0354.log`).
+
 ### 6.3 Simulación de la cola con frames de superficie (`sim-scanout/`)
 
 `extract.py` corta del `SweetFramebuffer.cpp`, tal cual (solo las barreras `dsb` pasan a comentario), los globales del
@@ -656,15 +880,16 @@ que el panel escanea ni se suelta una superficie que el panel aún puede leer; q
 terminar su dibujo; el orden; que todo frame se enseña o se cuenta como descartado; y las de 0340 (ninguna copia sobre
 lo que el panel lee o sobre un frame en cola).
 
-22 escenarios (dos, tres y cuatro superficies, y CoreAnimation que crea la tercera; régimen del teléfono, GPU
-saturada, ligero, ráfagas; frames de CPU y de superficies fuera del pool mezclados; envíos después del `SwapEnd`;
-`CTL_FLUSH` sin lectura; apagado y encendido en caliente; GPU colgada; flips tomados por los bits; copias solas para
-comparar) × 30 semillas × 600 frames: **todas las ejecuciones pasan**, con 0352 (`run-0352.log`) y con 0353
-(`run-0353-old.log`, 400 frames). Mutaciones del texto del kernel (`mutate.py`): sin limpiar el hueco de la cola, flip
-anotado antes de esperar, superficies soltadas sin flip tomado, valla de superficie ignorada, `CTL_FLUSH` ignorado al
-escribir el plano, superficie en pantalla no retenida, ventana ignorada sin lectura: **las siete se detectan**, también
-con 0353 (`mutate-0353-old.log`). Quitar la comprobación de plano escribible de `queueFlip` no se detecta y es correcto:
-`planeScaled`/`planeUnscaled` esperan igual (cambia dónde se espera, no lo que se escribe).
+22 escenarios (dos, tres y cuatro superficies, y CoreAnimation que crea la tercera; régimen del teléfono, GPU saturada,
+ligero, ráfagas; frames de CPU y de superficies fuera del pool mezclados; envíos después del `SwapEnd`; `CTL_FLUSH` sin
+lectura; apagado y encendido en caliente; GPU colgada; flips tomados por los bits; copias solas para comparar) × 30
+semillas × 600 frames: **todas las ejecuciones pasan**, con 0352 (`run-0352.log`) y con 0353 (`run-0353-old.log`, 400
+frames). Mutaciones del texto del kernel (`mutate.py`): sin limpiar el hueco de la cola, flip anotado antes de esperar,
+superficies soltadas sin flip tomado, valla de superficie ignorada, `CTL_FLUSH` ignorado al escribir el plano,
+superficie en pantalla no retenida, ventana ignorada sin lectura: **las siete se detectan**, también con 0353
+(`mutate-0353-old.log`) y con 0354 (`run-0354-old.log`: todas las ejecuciones pasan; `mutate-0354-old.log`). Quitar la
+comprobación de plano escribible de `queueFlip` no se detecta y es correcto: `planeScaled`/`planeUnscaled` esperan igual
+(cambia dónde se espera, no lo que se escribe).
 
 Dos defectos de 0350 que encontró la simulación (corregidos en 0352):
 
@@ -710,6 +935,34 @@ que responde siempre 0, `swapShown` sin la cola, scanout sin exigir `SwapWait`: 
 90 ejecuciones fallidas cada una). La decimocuarta, sin `queueFlip()` antes de responder, no cambia nada medible: con
 el hilo de la cola mirando cada 500 µs, solo hace la respuesta hasta una mirada más vieja.
 
+**La vida del anillo (0354).** `sim-ca.cpp` modela además el pool de N huecos (las superficies del window server del
+tamaño de la pantalla cogen hueco al crearse si lo hay; un hueco vuelve al liberarse la superficie: soltada por su
+creador y por todo lo que la retenga en el kernel), los cambios de lo que pide el display (cada pocos segundos
+CoreAnimation necesita superficies nuevas; las viejas se sueltan en cuanto quedan sin uso), los reinicios de
+backboardd (todas sus superficies soltadas a la vez, sus páginas vacías, uno nuevo un segundo después) y superficies
+del tamaño de la pantalla que no se presentan, retenidas unos segundos. La elección de `presentNow()` es la de 0354:
+llama al `shownRecord()` extraído. Comprueba además, en cada frame, que el kernel manda un frame a la copia por una
+superficie anotada solo si hay una superficie fuera del pool que el window server ha presentado y sigue viva, y que no
+escanea ninguno mientras la haya; que en régimen (desde un segundo después de cada evento) el plano no cambia de modo;
+que con ocho huecos se escanea al menos el 90 %; que todo frame de varias capas se enseña; y, con
+`SIM_SRCXY_IGNORED=1`, que la ventana que toma el plano es la de la copia también en la lectura «el plano ignora
+`SRC_XY`».
+
+46 escenarios × 30 semillas × 30 s: **todas las ejecuciones pasan** con 0354 (`run-ca-0354.log`), también en la lectura
+«el plano ignora `SRC_XY`» (`run-ca-0354-srcxy-ignored.log`, 20 semillas). Con el texto de 0353 de la serie (`v0353/`,
+`fOffX` 20; `run-ca-official.log`): la vida del anillo reproduce lo del teléfono (§3.13); con «el plano ignora
+`SRC_XY`», cada frame escaneado toma otra ventana que la copia (1 602 frames en una ejecución de 30 s,
+`run-official-srcxy-ignored.log`); y `swapwait=0` con el scanout desgarra (277 dibujos sobre la superficie escaneada por
+ejecución: lo que cierra el punto 6 de 0354).
+
+Mutaciones de 0354 (`mutate-0354.py`: 6 semillas × 15 s, 45 s en los escenarios de la vida del anillo, en las dos
+lecturas del hardware; `mutate-0354.log`): sin modo único, sin anotar la superficie rechazada, anotaciones que no
+caducan, solo la primera anotación, recorte por `SRC_XY` como 0353, columnas por `SRC_XY`, filas dos veces (dirección
+y `SRC_XY`), columnas dos veces, frames de varias capas tal cual, capa 0 nunca a pantalla completa, registro sin
+reducir a la capa 0: **las once se detectan** (entre 5 y 12 ejecuciones fallidas cada una; las de columnas por
+`SRC_XY` y las de dos veces, solo en la lectura en la que cambian algo). Las trece de 0353 se siguen detectando con
+el texto de 0354.
+
 Lo que el modelo no tiene: el coste de CPU de cambiar el plano y de la copia en el hilo de render (por eso, con 0352 y
 scanout, da 55,4 frames/s y el teléfono 47,0 y 38,5), un límite de trabajo de GPU en vuelo en el driver (con la GPU
 colgada, CoreAnimation llena la cola de la GPU sin freno salvo con 0353 y scanout, que lo frena a 4 frames/s), y la
@@ -720,79 +973,91 @@ frente a 53 %), en el mismo sentido.
 
 Todo por SSH (`PATH=/var/jb/usr/bin:/var/jb/usr/sbin:$PATH`); el USB y SSH no dependen del display, así que una
 pantalla negra o congelada se arregla por SSH. **Con 0350 sin 0352, no encender `kern.sweet_fb_scanout=1`** (§6.3,
-defecto 1); **con 0352 sin 0353 tampoco**: CoreAnimation dibuja en la superficie que se escanea (§3.10). Probar siempre
-por sysctl antes que con boot-arg (el cmdline del teléfono ya tiene 572 caracteres; por encima de 575 el shim pierde
-`sweet_splash`).
+defecto 1); **con 0352 sin 0353 tampoco**: CoreAnimation dibuja en la superficie que se escanea (§3.10); **con 0353
+sin 0354, el scanout funciona hasta que el pool se llena** (horas de uso con reinicios de backboardd: la pantalla salta,
+03 M22). Probar siempre por sysctl antes que con boot-arg (el cmdline del teléfono ya tiene 572 caracteres; por encima
+de 575 el shim pierde `sweet_splash`). No reiniciar backboardd varias veces seguidas: deja SpringBoard en el modo seguro
+del cargador de tweaks (barra roja; se sale tocando «Exit Safe Mode»).
 
-1. **Diagnóstico (0349; ya disponible con 0350):**
-   `sysctl -n kern.sweet_fb_scanout_diag kern.sweet_fb_latch kern.sweet_fb_regs`. Esperado y visto: «ready», `CTL_FLUSH`
-   con los bits puestos tras casi cada escritura, VIG0 como en §1.4.
-2. **Kernel con 0352, sin tocar nada:** `kern.sweet_fb_scanout_diag` dice «CTL_FLUSH read its bits back right after N
-   of M flips: flips are taken by the frame counter (kern.sweet_fb_flush_taken 0)». Opcional e independiente:
-   `sysctl -w kern.sweet_fb_flush_taken=1` con la copia de siempre; en `kern.sweet_fb_queue_diag`, `flips taken by
-   time` sigue a 0, y en `kern.sweet_fb_diag` el cubo 0 de `flip interval` no crece.
-3. **Kernel con 0353, con la copia:** sin tocar nada (`kern.sweet_fb_swapwait=0`) todo es como con 0352. Después,
-   `sysctl -w kern.sweet_fb_swapwait=1` con `kern.sweet_fb_scanout=0`, y `sysctl -n kern.sweet_fb_swapwait_diag`
+1. **Diagnóstico (0349):** `sysctl -n kern.sweet_fb_scanout_diag kern.sweet_fb_latch kern.sweet_fb_regs`. Esperado y
+   visto: «ready», `CTL_FLUSH` con los bits puestos tras casi cada escritura, VIG0 como en §1.4.
+2. **0352:** `kern.sweet_fb_scanout_diag` dice «CTL_FLUSH read its bits back right after N of M flips: flips are taken
+   by it» (visto con 0353: 34 987 de 34 992). Opcional e independiente: `sysctl -w kern.sweet_fb_flush_taken=1` con la
+   copia de siempre; en `kern.sweet_fb_queue_diag`, `flips taken by time` sigue a 0, y en `kern.sweet_fb_diag` el cubo
+   0 de `flip interval` no crece.
+3. **`SwapWait` con la copia** (`kern.sweet_fb_swapwait` 1 al arrancar): `sysctl -n kern.sweet_fb_swapwait_diag`
    durante un deslizamiento. Esperado: `asked if the surfaces are free` crece uno o dos por frame con `busy` casi a 0
-   (las copias liberan en el `SwapEnd`); `if the frame is on the panel` e `if every frame is`, si aparecen, con parte
-   `busy` (el último frame aún sin tomar); `waited` pocas veces (`idle()`), con `max` de unos pocos refrescos; `timed
-   out 0`, `answered 0 after 1 s busy 0`; `SwapEnds held … 0` (con la copia no se retiene). El modelo no espera cambio
-   de ritmo con la copia: A/B intercalado de `kern.sweet_fb_swapwait` 1 y 0 con `homeswipe.sh`, n ≥ 3; si 1 rinde
-   menos, es una desviación del modelo que hay que entender antes de seguir.
-4. **Solo el pool:** `sysctl -w kern.sweet_fb_scanout=2; killall -9 backboardd` (una vez: reinicios seguidos dejan
-   SpringBoard en el modo seguro del cargador de tweaks, barra roja, del que se sale tocando «Exit Safe Mode»).
-   Mirar: `pool: 2 (o 3) of 4 slots in use, N surfaces made in it` y, en el log, `SWEET SURF: scanout pool: surface …
-   in a slot`; la pantalla igual que antes; en `kern.sweet_fb_diag`, `surface cleans` deja de crecer.
-5. **Scanout, con 0353:** `sysctl -w kern.sweet_fb_swapwait=1; sysctl -w kern.sweet_fb_scanout=1` (en ese orden y sin
-   reiniciar nada: las superficies ya están en el pool; con `swapwait` a 0 el scanout copia sus frames y lo cuenta).
-   Mirar en `kern.sweet_fb_scanout_diag`: «plane now scaled», `showing 13,12 720x1600 of a surface (rows of 3072 bytes)
-   at 0xe5…`, `frames` ≈ `flips` creciendo juntos, `copied instead` pequeño (frames de varias capas), **`swapped again
-   while on the panel or waiting` sin crecer**, `flushes not taken 0`, **`pool: 3 of 4 slots in use`** (CoreAnimation
-   crea la tercera la primera vez que la necesita) y **`plane to scaled`/`to unscaled` sin crecer en régimen** (uno al
-   encender; dos por cada frame de varias capas). En `kern.sweet_fb_swapwait_diag`: `asked if the surfaces are free`
-   con una parte `busy` (CoreAnimation espera a veces: en el modelo, 2,3 ticks por segundo), `longest busy` de
-   milisegundos, `answered 0 after 1 s busy 0`, `timed out 0`; tras un reposo, `SwapEnds held after a wait for every
-   swap` con `max` de unos 10-30 ms. En `kern.sweet_fb_regs`, VIG0 +000=064002d0, +008=000c000d, +00c=09600438,
-   +010=0, +014 entre 0xe5000000 y 0xe63fffff, +024=00000c00, +038=80000000, +108/+118/+128=064002d0; escalador
-   +004=a0034401, +010 a +01c=00155555, +020=02040204, +040/+044=064002d0, +048=09600438, +090 a +09c=0. Que la copia
-   desaparece: el contador de copias de `kern.sweet_gpu_diag` deja de crecer, y con `kern.sweet_gpu_marks=1`
-   desaparecen los ~4,15 ms por frame.
-6. **Encuadre en el cristal:** ningún registro dice si el hardware respeta `SRC_XY` como Linux espera, y las capturas
-   leen la IOSurface, no el panel. Una mirada (o una foto) basta: en una pantalla quieta, alternar
-   `kern.sweet_fb_scanout` entre 1 y 0 cada pocos segundos; la imagen no debe moverse ni cambiar de tamaño (solo media
-   columna de diferencia y el filtro bilineal del DPU en vez del de la GPU).
-7. **Medir** (n ≥ 3, `tools/perf/homeswipe.sh`) con `kern.sweet_fb_scanout` 1 y 0 intercalados, cambiando el sysctl
-   en caliente: buffers/s, commit→fin, ocupación de la GPU, `swap interval`, `flip interval`, `arrival to flip`,
-   temperatura. Lo que da el modelo (§3.11): buffers/s iguales o un 2 % menos con 1, 4,9 ms menos de latencia y la GPU
-   26 puntos menos ocupada; con la GPU como límite, más buffers/s con 1.
-8. **Volver:** `sysctl -w kern.sweet_fb_scanout=0` (al momento: el frame en pantalla se re-presenta por la copia y el
-   plano vuelve al del ABL), `kern.sweet_fb_flush_taken=0` y, si hiciera falta, `kern.sweet_fb_swapwait=0` (al
-   momento: `SwapWait` responde 0 como antes). Las superficies siguen en el pool hasta el siguiente reinicio de
-   backboardd, y la copia funciona con ellas.
+   (las copias liberan en el `SwapEnd`); `waited` pocas veces (`idle()`), `timed out 0`, `answered 0 after 1 s busy 0`.
+   Con 0354, `SwapEnds held after a wait for every swap` no crece mientras se copia (con 0353 sí: en el teléfono, 78
+   retenciones, 14 hasta los 50 ms).
+4. **Solo el pool:** `sysctl -w kern.sweet_fb_scanout=2; killall -9 backboardd` (una vez). Mirar: `pool: 2 (o 3) of 8
+   slots in use` y, con 0354, una línea por hueco, `slot N: surface S "CA Framebuffer" by backboardd, made … s ago,
+   swapped K times, last … ms ago`; la pantalla igual que antes; en `kern.sweet_fb_diag`, `surface cleans` deja de
+   crecer.
+5. **Scanout:** `sysctl -w kern.sweet_fb_scanout=1` (con `kern.sweet_fb_swapwait` a 1 y las superficies ya en el
+   pool). Mirar en `kern.sweet_fb_scanout_diag`: «plane now scaled»; con 0354, `showing 16,12 720x1600 of a surface
+   (rows of 3072 bytes) from 0xe5…9040: 16,12 of it through the address, SRC_XY 0,0` (con 0353, `showing 13,12 … at
+   0xe5…00000`); `frames` ≈ `flips` creciendo juntos; **`swapped again while on the panel or waiting` sin crecer**;
+   `flushes not taken 0`; **`pool: 3 of 8 slots in use`**, con los tres huecos de `CA Framebuffer` presentándose
+   (`last` de pocos ms); en la línea `0354:`, `kept now 0` y `frames copied for them` sin crecer; **`plane to scaled` y
+   `to unscaled` sin crecer en régimen**. En `kern.sweet_fb_swapwait_diag`: `asked if the surfaces are free` con una
+   parte `busy`, `longest busy` de milisegundos, `answered 0 after 1 s busy 0`; tras un reposo, `SwapEnds held after a
+   wait for every swap` con `max` de decenas de ms y `timed out` sin crecer. En `kern.sweet_fb_regs` con 0354: VIG0
+   +000=064002d0, **+008=00000000**, +00c=09600438, +010=0, **+014 = la base de un hueco + 0x9040** (0xe5009040,
+   0xe5509040, 0xe5a09040…), +024=00000c00, +038=80000000, +108/+118/+128=064002d0; escalador +004 se lee 20034401 (se
+   escribe a0034401: el bit 31 no se conserva), +010 a +01c=00155555, +020=02040204, +040/+044=064002d0,
+   +048=09600438, +090 a +09c=0. Que la copia desaparece: el contador de copias de `kern.sweet_gpu_diag` deja de
+   crecer, y con `kern.sweet_gpu_marks=1` desaparecen los ~4,15 ms por frame.
+6. **El encuadre en el cristal (lo que tiene que ver el usuario):** con una pantalla quieta (la de bloqueo, con el
+   reloj), alternar `kern.sweet_fb_scanout` entre 1 y 2 cada pocos segundos: **la imagen no se mueve ni cambia de
+   tamaño** (con 0353 se mueve unos 1,3 mm en horizontal y 1,1 mm en vertical si el plano ignora `SRC_XY`, §3.14). La
+   imagen entera queda 4 píxeles del panel (0,26 mm) a la izquierda respecto a 0353, en los dos modos, y el táctil con
+   ella: tocar un icono pequeño o una tecla del teclado cae donde se ve. El reloj de la pantalla de bloqueo, centrado.
+   Las capturas leen la IOSurface, no el panel: hace falta mirarlo (o una foto).
+7. **La vida del anillo (0354):** con el scanout encendido, apagar y encender la pantalla varias veces, abrir y cerrar
+   apps, y una vez (no más) `killall -9 backboardd`. Mirar en `kern.sweet_fb_scanout_diag`: los huecos en uso (`N of
+   8`: tres en régimen, más en los cambios; `8 of 8` querría decir que el pool vuelve a quedarse corto, y entonces 0354
+   copia sin alternar) y qué superficie hay en cada uno; `refused` sin crecer; la línea
+   `0354:` (`seen` solo crece si el pool se queda corto, y entonces `kept now` vuelve a 0 cuando esas superficies
+   mueren); `plane to scaled` y `to unscaled` crecen como mucho en uno o dos por cada cambio, nunca varias veces por
+   segundo. En el log (`dmesg`), las líneas `SWEET FB: 0354: swap … of N layers`, si hay frames de varias capas: qué
+   capas trae cada uno (si lo que traen importa, componerlas es lo siguiente). La pantalla no salta.
+8. **Medir** (n ≥ 3, `tools/perf/homeswipe.sh`) con `kern.sweet_fb_scanout` 1 y 2 intercalados: buffers/s,
+   commit→fin, ocupación de la GPU, `swap interval`, `flip interval`, `arrival to flip`, temperatura (03 M16, con 0353:
+   60,1 y 48,1 buffers/s frente a 49,2, 41,4 y 43,0; commit→fin 14,2 y 15,7 ms frente a 31,6, 24,7 y 24,4).
+9. **Volver:** `sysctl -w kern.sweet_fb_scanout=2` o `0` (al momento: el frame en pantalla se re-presenta por la copia
+   y el plano vuelve al del ABL), `kern.sweet_fb_flush_taken=0` y, si hiciera falta, `kern.sweet_fb_swapwait=0` (con
+   0354 también apaga el scanout). Las superficies siguen en el pool hasta que backboardd las cambia, y la copia
+   funciona con ellas.
 
 | Si falla… | Se ve | Qué mirar | Vuelta |
 |---|---|---|---|
-| El plano escalado está mal (recorte, escalador) | imagen negra, desplazada, de colores cambiados o basura, con el sistema vivo | `kern.sweet_fb_regs` frente a los valores del paso 5 | `kern.sweet_fb_scanout=0` |
+| El plano escalado está mal (recorte, escalador) | imagen negra, desplazada, de colores cambiados o basura, con el sistema vivo | `kern.sweet_fb_regs` frente a los valores del paso 5 | `kern.sweet_fb_scanout=2` |
+| Los dos caminos siguen sin coincidir | la imagen salta al alternar 1 y 2 (paso 6) | `showing … SRC_XY` (0,0 con 0354), VIG0 +008 y +014 | `kern.sweet_fb_scanout=2` |
 | El DPU no toma un flush del plano escalado | imagen congelada | `flushes not taken` | automático a los 100 ms; si el pipe queda colgado, `reboot` (o `kern.sweet_reboot_mode=2` y `reboot`) |
-| CoreAnimation dibuja en una superficie en uso (con 0353 no debe: el contrato de §3.10 no se cumple) | desgarro | `swapped again while on the panel or waiting`, `drawn after the SwapEnd`, `kern.sweet_fb_swapwait_diag` | `kern.sweet_fb_scanout=0` |
-| CoreAnimation no crea una tercera superficie | menos frames por segundo, muchos `busy` | `pool`, `asked if the surfaces are free … busy`, `swap interval` | `kern.sweet_fb_scanout=0` |
-| La tercera superficie no entra en el pool | el plano cambia de modo decenas de veces por segundo; copias | `pool: 2 of 4`, `not from the pool` creciendo, `plane to scaled/unscaled` | `kern.sweet_fb_scanout=0` |
+| CoreAnimation dibuja en una superficie en uso (el contrato de §3.10 no se cumple) | desgarro | `swapped again while on the panel or waiting`, `drawn after the SwapEnd`, `kern.sweet_fb_swapwait_diag` | `kern.sweet_fb_scanout=2` |
+| CoreAnimation no crea una tercera superficie | menos frames por segundo, muchos `busy` | `pool`, `asked if the surfaces are free … busy`, `swap interval` | `kern.sweet_fb_scanout=2` |
+| Una superficie del anillo queda fuera del pool | con 0353, el plano cambia de modo varias veces por segundo y la imagen salta; con 0354, todo por la copia mientras viva | `pool: N of 8`, `refused`, las líneas de los huecos, `0354: … kept now` | se pasa sola cuando backboardd cambia sus superficies; si no, `kern.sweet_fb_scanout=2` y un reinicio de backboardd |
+| Algo usa la memoria de los huecos nuevos (0xe6400000-0xe7800000) | basura o fallos en la imagen de las superficies de los huecos 4 a 7 | el censo de huecos y la dirección de `showing` | `kern.sweet_fb_scanout=0` y un reinicio de backboardd (las superficies salen del pool) |
+| Un frame de varias capas pierde algo | un elemento que falta en algunos frames | `SWEET FB: 0354: swap … of N layers` en el log; `frames of several layers shown by their layer 0` | ninguna en caliente: componer esas capas es el paso siguiente |
 | `SwapWait` dice ocupado de más (contabilidad de 0353) | la interfaz se congela o va a saltos de 1 s | `answered 0 after 1 s busy` creciendo; en `swaps:`, ids que no avanzan | `kern.sweet_fb_swapwait=0` |
-| Esperas largas en `SwapEnd` o en `idle()` | tirón al empezar a moverse tras un reposo | `SwapEnds held … max`, `timed out`, `waited … max` | `kern.sweet_fb_swapwait=0` |
+| Esperas largas en `SwapEnd` o en `idle()` | tirón al empezar a moverse tras un reposo | `SwapEnds held … max` (hasta 250 ms con 0354), `timed out`, `waited … max` | `kern.sweet_fb_scanout=2` (con la copia no se retiene) |
 | El criterio del pool no coge las superficies de pantalla | nada cambia | `not from the pool` creciendo | ver `SWEET SURF: screen-sized surface …` (0349) |
-| Pánico en código nuevo | reinicio | ring | el arranque siguiente viene con `scanout=0` y `swapwait=0` si se activaron por sysctl |
+| Pánico en código nuevo | reinicio | ring | el arranque siguiente viene con `scanout=0` si se activó por sysctl |
 
 ## 8. Riesgos y lo no verificado
 
-- **No verificado en el teléfono:** que `SRC_XY` recorte una fuente RGB lineal (Linux lo usa así; paso 6); que nadie
-  use 0xe5000000-0xe6400000 (ningún código del port, ninguna región fija del DT); que CoreAnimation cree la tercera
-  superficie con 0353 y la ponga en el pool (lo dice el desensamblado, §3.10; lo mide el paso 5); las propiedades que
-  distinguen sus superficies de pantalla de las de SpringBoard (0349 las registra).
+- **No verificado en el teléfono:** que el plano no aplique `SRC_XY` (lo dice una observación del usuario, §3.14 [H];
+  0354 no depende de ello); que nadie use 0xe6400000-0xe7800000, los cuatro huecos que añade 0354 (ningún código del
+  port, ninguna región fija del DT; 0xe5000000-0xe6400000 se usa desde 0350 sin fallos); qué cambia el anillo de
+  CoreAnimation en el teléfono (§3.13 [H]) y que ocho huecos basten (la cuenta del peor caso da siete; el censo de
+  0354 lo dirá); las propiedades que distinguen sus superficies de pantalla de las de SpringBoard (0349 las registra).
 - **Verificado en el teléfono:** el plano del ABL, la versión del escalador, la lectura de `CTL_FLUSH` y el punto de
-  toma (n = 1 arranque; §1.4, §3.6); que el DPU toma los flips del plano escalado sobre el pool (0xe5500000) sin
-  flushes perdidos ni cuelgues, y que con 0352 CoreAnimation se queda con dos superficies (03 M12, n = 1). Nadie ha
-  mirado la imagen en ese modo: que el SID 0x420 alcance el pool como alcanza los flip buffers se deduce de que no hay
-  fallos, no se ha visto.
+  toma (n = 1 arranque; §1.4, §3.6); que el DPU toma los flips del plano escalado sobre el pool sin flushes perdidos ni
+  cuelgues; que con 0352 CoreAnimation se queda con dos superficies (03 M12) y con 0353 hace la tercera, la pone en el
+  pool y el scanout rinde (03 M16-M17); que el pool de cuatro huecos se llena con horas de uso (03 M22). n = 1 arranque
+  en cada caso. La imagen escaneada se ha visto (03 M16-M22), pero nadie ha comparado su encuadre con el de la copia
+  más allá de los saltos de M22.
 - **El contrato de `SwapWait`:** lo que hace CoreAnimation con cada respuesta está leído [O, §3.10]; el significado de
   cada bit de las banderas se deduce de dónde y cómo se usa [H], y el lado del kernel de Apple (`AppleMobileDispH10P`)
   no se ha leído (no hay kernelcache de 20H392 aquí). Si un bit significara otra cosa, los peores casos están acotados:
@@ -806,20 +1071,39 @@ por sysctl antes que con boot-arg (el cmdline del teléfono ya tiene 572 caracte
   ticks por segundo en el modelo; alineado con la toma del panel, 0,5 (§3.11). De qué se alimenta
   `IOMFBDisplay::timing_reference()`, con la que alinea su fase, está por leer.
 - **Calidad:** bilineal sin tabla, como la copia de hoy. Con tablas haría falta el contenido que da el HAL cerrado.
-- **Medio píxel:** el origen horizontal es 13 en vez de 13,33 (fase inicial 0, como Linux).
-- **Memoria fija:** 20 MiB del banco bajo, en uso solo con superficies en el pool.
+- **Medio píxel:** con 0350-0353 el origen horizontal del scanout es 13 en vez de 13,33; con 0354 el origen es entero
+  en los dos caminos, (16, 12). La copia conserva una fracción de fila en cada una de sus dos pasadas intercaladas (el
+  centrado de sus filas), como antes.
+- **Memoria fija:** 40 MiB del banco bajo con 0354, en uso solo con superficies en el pool.
+- **Frames de varias capas:** con 0354 se ve solo su capa 0 (si es la de pantalla); lo que traigan las demás no se ve
+  en esos frames (con la copia 2x de 0353 tampoco se ve). Las ocho primeras van al log con lo que trae cada capa.
+- **Anotaciones por id y puntero:** una superficie anotada (§3.12) se reconoce por su id y su puntero sin retenerla. Si
+  se liberara y otra nueva tomara la misma dirección y el mismo id (los ids recorren 4095 antes de repetirse), el modo
+  único duraría la vida de la nueva: más copias, nunca un acceso a memoria liberada (el puntero no se desreferencia).
+- **La retención de hasta 250 ms:** un primer frame pesado tras un reposo (abrir el Centro de Control tras un reinicio:
+  68,8 ms de codificación y hasta 34,5 ms de GPU, 03 M23) retiene su `SwapEnd` lo que tarde en llegar al panel; con 0353
+  se suelta a los 50 ms y puede dibujarse en la superficie del panel.
+- **El táctil y la imagen se mueven juntos 4 píxeles del panel** a la izquierda respecto a 0353 (`fOffX` 24 en los dos);
+  si alguna calibración del táctil dependiera del 20, cambiaría con ella.
 
 ## Material
 
-- `~/sapphire-angel/research/metal/display/`: `parches-nuevos/` (0353, y la copia de trabajo de 0352); `work/xnu` (mis
-  0347/0348 sobre la serie a 0342, con un commit por parche), `work/xnu-0350` (worktree del anterior: la serie oficial
-  a 0350, 0352, 0351 y 0353, un commit cada uno), `work/headers/` (descripciones), `work/obsoletos/` (0347/0348 con mi
-  numeración y los arreglos), `work/mkpatch.sh`, `work/verif/` (`check-0352.sh`, `check-0353.sh` y sus `.log`,
-  `check-all.sh`, `inject.py` e `inject-0353.log`, `warn.sh` y `warn-0353.log`, `stubs/`, `arnes/` con `arnes.log` y
-  `arnes-sde.log`, `sim-scanout/` con `simcore.h`, `sim.cpp`, `sim-ca.cpp`, `extract.py`, `mutate.py`, `mutate-ca.py`,
-  `run-0352.log`, `run-0353-old.log`, `run-ca-0353.log`, `mutate.log`, `mutate-0353-old.log`, `mutate-ca.log`), `ref/`
-  (Linux v6.12, SDE KAMORTA, SDM; `dsc-20H392/`: el `__TEXT` de QuartzCore leído del caché dyld del teléfono, su
-  cabecera, `dis.py` y `qc.dis.txt`, el desensamblado anotado), `telefono/` (lecturas del teléfono: sysctl de
-  0336/0340 y volcados de 0349).
+- `~/sapphire-angel/research/metal/display/`: `parches-nuevos/` (0354); `work/xnu` (mis 0347/0348 sobre la serie a
+  0342, con un commit por parche), `work/xnu-0350` (worktree del anterior: la serie oficial a 0350, 0352, 0351, la
+  revisión de 0353 y el trabajo de 0354 sobre ella), `work/xnu-0354` (worktree: la serie oficial 0343-0353 de
+  `xnu/patches/` en un commit y 0354 en otro), `work/headers/` (descripciones), `work/obsoletos/` (0347/0348 con mi
+  numeración y los arreglos, la copia de 0352 igual a la integrada y la revisión de 0353 que no se integró),
+  `work/mkpatch.sh`, `work/verif/` (`check-0352.sh`, `check-0353.sh`, `check-0354.sh` y sus `.log`, `check-all.sh`,
+  `inject.py` e `inject-0353.log`, `warn.sh`, `warn-0354.sh` y `warn-0353.log`, `stubs/`, `arnes/` con `arnes.log` y
+  `arnes-sde.log`, `encuadre/` con `encuadre.cpp`, `extract.py` y `encuadre-0354.log`, `sim-scanout/` con `simcore.h`,
+  `sim.cpp`, `sim-ca.cpp`, `extract.py`, `mutate.py`, `mutate-ca.py`, `mutate-0354.py`, `run-0352.log`,
+  `run-0353-old.log`, `run-0354-old.log`, `run-ca-0353.log`, `run-ca-0354.log`, `run-ca-0354-srcxy-ignored.log`,
+  `mutate.log`, `mutate-0353-old.log`, `mutate-0354-old.log`, `mutate-ca.log`, `mutate-0354.log`, y `v0353/`: el
+  modelo de CoreAnimation con el texto de 0353 de la serie, `run-ca-official.log` y
+  `run-official-srcxy-ignored.log`), `ref/` (Linux v6.12, SDE KAMORTA, SDM; `dsc-20H392/`: el `__TEXT` de QuartzCore
+  leído del caché dyld del teléfono, su cabecera, `dis.py` y `qc.dis.txt`, el desensamblado anotado), `telefono/`
+  (lecturas del teléfono: sysctl de 0336/0340, volcados de 0349, `regs-scan.txt`/`regs-copia.txt` y
+  `diag-scan.txt`/`diag-copia.txt` de 0353 en los dos modos, `surfinfo-20261114-1.txt`, el ring de `ring-20261114/`),
+  `tools/surfinfo.c` (lista las superficies de un tamaño con sus valores).
 - El desensamblado con nombres de QuartzCore que cita §3.10: `~/sapphire-angel/research/metal/ios-graficos/ios-20H392/
   desensamblado/QuartzCore.named.s.gz` (y sus símbolos en `simbolos/`).
