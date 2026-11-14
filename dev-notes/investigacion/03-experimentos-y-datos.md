@@ -211,3 +211,17 @@ Datos crudos: `~/sapphire-angel/research/logs-telefono/E2-R1-usbdiag.txt` y `E2-
   - `ssh_auto=NO` en el CSV era un artefacto de tiempos: `firstboot` ejecuta `boot.d` unos segundos después de que el bucle lo comprobara. Verificado con `ssh sapphire` después.
   - El bucle ahora reintenta durante 60 s.
 - Cmdline de 562 caracteres: el shim vuelve a pasar `sweet_splash`. Pendiente: el usuario confirmará si reaparece la imagen de arranque.
+
+## E7 — Parche 0334 (E/S cruda de UFS sin memcpy a memoria de usuario), 2026-11-14 ~02:30
+
+Kernel de CI, run 43570770230, sha `ffcc981f…`, con 0334 aplicado. Imagen `boot_a-0334.img` con boot-args de expG más `sweet_reboot=2`. Se arrancó por la ruta R, iOS respondía a los 27 s, y todo el ciclo fue automático: SSH a fastboot, flash, arranque y prueba.
+
+| Prueba (como root, por SSH) | Resultado |
+|---|---|
+| `dd if=/dev/rufsroot0 bs=4096 skip=67107839 count=1025` (la que paniqueaba en E5) | **30/30 completas** (4 198 400 B), sin panic |
+| `bs=4194304 count=4` | **10/10 completas** (16 MiB) |
+| `bs=1048576 count=64` | 67 108 864 B exactos |
+| `bs=100 count=1 skip=1` (offset no alineado) | `Invalid argument`: EINVAL limpio, tal como lo diseñó 0334 |
+
+Nota: un primer intento devolvió "0/10" porque el `dd` del teléfono no acepta el sufijo `4m` ("invalid number"). Fue un artefacto de la prueba.
+Conclusión: el panic de E5 queda corregido por 0334. El bucle podría volver a usar `rufsroot0`, pero sigue usando `ufsroot0`.
