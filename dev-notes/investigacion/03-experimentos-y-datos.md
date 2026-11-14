@@ -174,3 +174,23 @@ Datos crudos: `~/sapphire-angel/research/logs-telefono/E2-R1-usbdiag.txt` y `E2-
 
 **Comparación:** con la ruta vieja (E-carga-1, 13 nov) el enlace murió a los 192 KiB, con 130 538 rechazos de Start Transfer.
 **Conclusión (n=1 arranque, 20 transferencias):** la ruta 0330 resuelve la muerte bajo carga.
+
+## E5 — kernel 0332 (valores por defecto) y el "cuelgue" (2026-11-14 ~01:50)
+
+- **Ensayo 1:** arranque normal; enumera a los 44 s. Después el enlace y el teléfono quedan muertos.
+- **Panic real** en el ring (cabecera `seq=PANIC`, caja negra 0146), tras `exec dd / exec tr / exec grep / exec tail`, es decir, el `dd if=/dev/rufsroot0` que el bucle ejecutaba en el teléfono para leer el ring:
+  ```
+  Kernel data abort. at pc 0xfffffff007be90b8, lr 0xfffffff0074e904c
+  x0 0x00000001006f4000 x2 0xfe0 x12 0x474f4c5445455753 ("SWEETLOG") esr 0x9600004f far 0x00000001006f4000
+  ```
+- **Simbolizado** con `xcrun atos` sobre el kernel 0332: `pc = memcpy+72`, `lr = sweet_ufs_strategy+604`.
+- **Causa** (código, parches 0028/0030):
+  - `sweet_ufs_read`/`write` (dispositivo crudo) usan `physio()`, cuyo buffer lleva la **dirección de usuario** del proceso.
+  - `sweet_ufs_strategy` hace `buf_map()` → `memcpy(vaddr + done, bounce, …)`. Para buffers de physio, `buf_map` devuelve esa dirección de usuario.
+  - El kernel escribe en memoria de usuario: fallo de permiso por **PAN** (DFSC 0x0f, WnR=1).
+  - Es intermitente: muchas lecturas anteriores del ring por `/dev/rufsroot0` funcionaron.
+- **No tiene relación con el USB ni con 0332.** La hipótesis que hice antes ("`static int ud_dp = 2` deja correr la ruta v2 antes de inicializarla", que motivó 0333) **queda descartada** por esta evidencia. 0333 es inocuo y se conserva.
+- **"Panics" anteriores:** el del ensayo 1 de e3-n3 también ocurrió con el bucle leyendo `rufsroot0` (allí no quedó caja negra). El del 1.er arranque de E3 no tiene datos.
+- **Acciones:**
+  - El bucle lee ahora el ring por el dispositivo **de bloques** `/dev/ufsroot0`, que usa buffers del kernel.
+  - Arreglo pendiente en el driver: E/S cruda con búfer intermedio del kernel y `uiomove`, sin tocar memoria de usuario desde `strategy`.
