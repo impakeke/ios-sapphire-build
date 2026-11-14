@@ -137,3 +137,40 @@ Datos crudos: `~/sapphire-angel/research/logs-telefono/E2-R1-usbdiag.txt` y `E2-
 - Control en la ruta C con `utmipipe=1`.
 - Aclarar el panic del 1.er arranque.
 - Decidir si `utmipipe` pasa a ser el valor por defecto.
+
+## E4 — Ruta R automática con la ruta de datos nueva (`sweetusb_dp=2`), 2026-11-14
+
+**Configuración**
+- Imagen `boot_a-0331-carga-B.img`: kernel 0331 de CI (incluye 0329+0330+0331); boot-args `sweetusb_utmipipe=1 sweet_reboot=2 sweetusb_dp=2`.
+- Bucle `~/adb-bridge/exp-loop.sh` sin intervención humana: vuelta a fastboot por `kern.sweet_reboot_mode=2` + `reboot` desde la shell 2323, luego `fbusb set_active:a reboot`.
+
+**Resultado: 3/3 arranques normales ENUMERAN, en 44, 41 y 42 s**
+- En todos, GCTL `0x00102000` (controlador en reset al tomar el control, ruta R).
+- Acumulado con `utmipipe=1` por la ruta R: **5/5 enumeran** (E3 ×2 + E4 ×3).
+
+**"Panics" del 1.er arranque de E3 y del ensayo 1 de e3-n3: reinterpretación (hipótesis fuerte)**
+- El usuario vio fondo negro con el log temprano de XNU (`mig_table_max_displ`, `mach_kobj_count`, `debug_log_init… gPanicBase`, `kdp_core zlib`). Son líneas normales de arranque, no texto de panic.
+- Con cmdline > 575 el shim no pasa `sweet_splash`, así que xnu no pinta la imagen de arranque y queda el log visible.
+- El ring del ensayo 1 muestra un arranque completo (USB `address 38`, SpringBoard, Wi-Fi) sin panic. El teléfono terminó en la pantalla de bloqueo.
+- Pendiente: volver a cmdline ≤ 575 (o hacer los valores por defecto en el kernel) y comprobar que la pantalla vuelve a ser la normal.
+
+## Carga-1 con `dp=2` (2026-11-14 ~01:40, mismo arranque que E4-3)
+
+| Prueba | Resultado |
+|---|---|
+| 1×30 MB Mac→tel (SSH, `sha256sum` en el tel) | 4,9 s, SHA-256 igual |
+| 1×30 MB tel→Mac | 6,1 s, sin corte |
+| 10×30 MB Mac→tel | **10/10 SHA-256 iguales**, 107 s |
+| 10×30 MB tel→Mac (archivo en el tel, hash ambos lados + tamaño) | **10/10 hash igual y 31 457 280 B**. Un "fallo" del script fue un artefacto de zsh (`set -- $r` no separa palabras) |
+
+`kern.sweet_usb_dp` tras unos 660 MB:
+- `start ok 1 099 317`; `refused 0`, `timeout 0`, `cmd_busy 0`.
+- `noevt(alpha) 0`, `evt not_started 0`, `hwo_set 0`, `buserr 0`, `evcount over 0`.
+- `bus_resets 1` (solo el inicial).
+- `tx done 590 930`, `rx done 508 384`.
+- `qdrop 10 348`: cola TX llena devuelve ENOBUFS; TCP lo recupera. Se puede afinar.
+- **`hwo0_noevt_polls 82 696`**: medición directa de la ventana en que HWO=0 y el evento aún no ha llegado (la premisa de la auditoría sobre 0327).
+- `poll_max_us 3090`.
+
+**Comparación:** con la ruta vieja (E-carga-1, 13 nov) el enlace murió a los 192 KiB, con 130 538 rechazos de Start Transfer.
+**Conclusión (n=1 arranque, 20 transferencias):** la ruta 0330 resuelve la muerte bajo carga.
