@@ -652,3 +652,30 @@ Kernel de CI, run 43640189709 (0353 aplicado, 351 parches); imagen `boot_a-0353-
 **Interpretación.** Con `SwapWait` contestando el estado real de la cola (18 §3.10), CoreAnimation deja de dibujar
 en la superficie que el panel escanea y el scanout directo quita la copia por GPU: commit→fin baja de ~24,5 a ~15 ms
 y suben los buffers por segundo.
+
+## M17 — Actualizaciones parciales de CoreAnimation restauradas; configuración completa (2026-11-14)
+
+El paso de actualización 50 del instalador pone `CA_DISABLE_DIRTY_REGIONS=1` en el entorno de backboardd (caché de
+launchd): CoreAnimation dibuja entero cada frame. Se quita la variable en el teléfono
+(`plistop … del …:EnvironmentVariables:CA_DISABLE_DIRTY_REGIONS`, copia previa en
+`/var/root/launchd.plist.con-dirty-off`) y se reinicia. Kernel 0353 a 820 MHz, `sweet_fb_queue=1`,
+`sweet_gpu_flush=1`, `sweet_fb_swapwait=1`. Carga `homeswipe.sh 8`.
+
+| Condición | n | Buffers/s | A tiempo / tarde / paradas | Draws/buffer | Hecho→commit | Commit→fin | GPU ocupada |
+|---|---|---|---|---|---|---|---|
+| sin la variable, copia, `merge-4`, `metal_fps=passes` | 1 | 49,9 | 708 / 475 / 13 | 82,0 | 3,1 ms | 14,3 ms | 71 % |
+| sin la variable, scanout directo, `merge-5` | 2 | 55,1 · 58,3 | 1191/143/34 · 1342/121/56 | 74,6 · 73,9 | 6,0 · 2,4 ms | 7,6 · 7,6 ms | 43 · 46 % |
+
+- En reposo en la vista de widgets, sin la variable: 26 command buffers en 16,8 s y GPU ocupada el 2 % (con la
+  variable, el home quieto dibujaba un frame cada 100 ms por el segundero del icono del Reloj: M14).
+- Capturas sin la variable: home, vista de widgets con el Calendario mostrando contenido (`medicion/shots/d1`, `e1`).
+  Falta la comprobación a la vista de restos de frames anteriores (el motivo que daba el paso 50: iconos cortados
+  en el modo de edición del home y manecillas viejas del cronómetro).
+- `merge-5` (4cf8232): `merge-4` más `SINGLE_PRIM_MODE=FLUSH_PER_OVERLAP_AND_OVERWRITE` en los draws que leen su
+  target en sysmem, y scissor vacío que no deja pasar nada. Queda instalado.
+- Temperaturas tras las tandas: CPU 64,1 °C, GPU 61,4 °C.
+
+**Interpretación.** Con el kernel diciendo a CoreAnimation qué superficie sigue en pantalla, las actualizaciones
+parciales vuelven a su comportamiento de origen: menos draws por frame y casi ningún trabajo en reposo. Con todo
+junto (scanout directo, parciales, `merge-5`) un frame del home tarda 7,6 ms de commit a fin, por debajo de un
+intervalo de 120 Hz, y salen 55-58 buffers por segundo con el 43-46 % de la GPU a 820 MHz.
