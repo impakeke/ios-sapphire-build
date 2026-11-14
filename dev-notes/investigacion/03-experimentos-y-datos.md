@@ -80,3 +80,37 @@ Tamaño de muestra: n=1 por ruta. Las repeticiones R2, R3, C2 y C3 están pendie
 - Plan:
   1. Arrancar por R y por C, y comparar los bloques USBDIAG.
   2. Prueba de carga A/B con reclaim=1 y reclaim=0.
+
+### E2 — resultados (2026-11-14, kernel 0329 de CI, misma imagen en ambas rutas)
+
+Datos crudos: `~/sapphire-angel/research/logs-telefono/E2-R1-usbdiag.txt` y `E2-C1-usbdiag.txt`.
+
+| Bloque | R1 (reboot; no enumera) | C1 (continue; enumera) |
+|---|---|---|
+| PHY femto 0x000-0x110 | overrides del DT `a6/85/16` presentes (0x6c-0x74), CTRL5 POR=0, COMMON0 0x88 (SIDDQ=0), PWRDOWN 0x01 | **idéntico** salvo +0x20: 0x03 frente a 0x0e (probable estado de línea) |
+| GCC CBCR 0x1a058 (`gcc_usb3_prim_phy_pipe_clk`, gcc-sm6115) | **0x80000001 (habilitado, APAGADO)** | 0x00000001 (corre) |
+| GCC 0x1a020 (master RCG CFG) | 0x00100105 | 0x00000105 |
+| GCC 0x1a038 (mock_utmi RCG CFG) | 0x00100000 | 0x00000001 |
+| GCC 0x1a064 | 0 | 1 |
+| QSCRATCH GENERAL_CFG (+0x08) | 0x4 | 0x4 |
+| QSCRATCH HS_PHY_CTRL (+0x10), antes del override | 0x10000000 | 0x00000000 |
+| QSCRATCH +0x28 / +0x58 | 0 / 0x00040000 | 2 / 0x00240000 |
+| GSBUSCFG1 0xc104 | 0x1700 | 0x1e00 |
+| GUCTL1 0xc11c | 0x000c1802 | 0x810c1802 (bits 31, 24) |
+| GUSB2PHYCFG 0xc200 | 0x2500 | 0x2400 |
+| GUSB3PIPECTL 0xc2c0 | 0x030c0002 (DEPOCHANGE) | 0x0b080002 (UX_EXIT_PX) |
+| GTXFIFOSIZ 2-7 | tamaños por defecto | redistribuidos por el ABL |
+| DCFG/DCTL/DEVTEN/DALEPENA/GEVNT* | valores de reset | configurados por el ABL |
+
+**Interpretación (hipótesis, con fuente):**
+
+- El PHY HS queda inicializado en ambas rutas, así que no es la causa. La diferencia relevante es el reloj PIPE del PHY USB3 (QMP): en la ruta normal está apagado.
+- Linux, para un dwc3 que solo usa HS, selecciona el UTMI como reloj PIPE (`dwc3_qcom_select_utmi_clk`, `qcom,select-utmi-as-pipe-clk`). Aquí nunca se hizo: GENERAL_CFG vale 0x4 en ambas rutas.
+- Predicción para E3 (parche 0331, `sweetusb_utmipipe=1`): enumera también con la ruta R.
+
+**Hallazgo lateral del respaldo** (`backups/particiones-20261114-0110`, sha256 verificado): `abl_a` = `abl_b`, pero `xbl_a` ≠ `xbl_b`. iOS (slot a) arranca con otro XBL. Queda como variable a tener en cuenta.
+
+### Compilaciones
+
+- 0330: run 43564692243, éxito (compila y enlaza). Kernel sha `ce2a717a…`, UUID D12E0D3D-…
+- 0331: run 43565315944, en curso.
