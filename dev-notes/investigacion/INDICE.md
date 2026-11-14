@@ -11,7 +11,7 @@ Todo es **observación medida**, **fuente primaria citada** o **hipótesis marca
    Transfer se rechaza con *No Resource* y el bucle de `printf` lo convierte en una tormenta.
 3. Contradichas por la evidencia: "se pierden eventos", "0327 lo cura", "toolchain roto",
    "`fastboot boot` brickea", "parche USB probado correcto".
-4. En curso: kernel **0329** de diagnóstico de solo lectura (PHY femto, QSCRATCH, GCC) para
+4. **E3 (0331, `sweetusb_utmipipe=1`): el USB de iOS ENUMERA en arranque normal** (n=1), aplicando la secuencia de Linux que usa UTMI como reloj PIPE.
    comparar rutas de arranque, y gate `sweetusb_reclaim` para el A/B bajo carga.
 5. Diseño correcto ya esbozado: un dueño por endpoint, solo el evento libera, DMA no cacheable,
    sin `delay()` ni `printf` en la ruta de datos, init propia del PHY.

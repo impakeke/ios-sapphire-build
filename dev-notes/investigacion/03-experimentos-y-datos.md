@@ -114,3 +114,26 @@ Datos crudos: `~/sapphire-angel/research/logs-telefono/E2-R1-usbdiag.txt` y `E2-
 
 - 0330: run 43564692243, éxito (compila y enlaza). Kernel sha `ce2a717a…`, UUID D12E0D3D-…
 - 0331: run 43565315944, en curso.
+
+## E3 — UTMI como reloj PIPE (parche 0331, `sweetusb_utmipipe=1`), 2026-11-14
+
+- Imagen: `boot_a-0331-utmipipe1.img` (sha `949bb257…`). Kernel de CI, run 43565315944, sha `5af8886f…`, UUID D205180C-…
+- Cmdline: el de expG más `sweetusb_utmipipe=1`. Con más de 575 caracteres el shim no pasa `sweet_splash`, lo que solo afecta a lo visual.
+- Ruta: `fbusb flash boot_a … set_active:a reboot`, es decir, **arranque normal**.
+
+**1.er arranque:** el usuario informa de un **panic**. En el ring no quedó rastro: solo aparece un arranque del kernel 0331. Se desconoce la etapa del fallo; pendiente de que el usuario describa la pantalla. Después el teléfono se reinició solo, con `sweet_reboot=0`, es decir, otra vez un arranque normal.
+
+**2.º arranque (ruta R, sin pasar por fastboot): ENUMERA.**
+- Al tomar el control, el controlador está en estado de reset, igual que en R1 y E2-R1: GCTL `0x00102000`, DCFG `0x00080804`, GUSB2PHYCFG `0x2500`.
+- `SWEET USBDIAG utmipipe=1 GENERAL_CFG 0x00000004 -> 0x0000000d`, es decir, SEL, PHYSTATUS_SW y bit 2.
+- `soft reset done`, **sin** `ep0 cmd 0x1 timeout`. Después `VBUS override on` y `address 36`.
+- En la Mac: ping de unos 2,6 ms y shell en el puerto 2323. `kern.sweet_usb_stats: configured 1 … rx 233 tx 625`.
+- Bootargs confirmados con `sysctl kern.bootargs`: `sweetusb_utmipipe=1`, `sweet_reboot=0`.
+
+**Conclusión (n=1):** en un arranque normal el controlador DWC3, que solo usa HS, necesita UTMI como reloj PIPE, porque el reloj PIPE del PHY USB3 está apagado. Con la secuencia de Linux `dwc3_qcom_select_utmi_clk` el USB de iOS funciona **sin fastboot**.
+
+**Pendiente:**
+- Repetir hasta n=3 en la ruta R.
+- Control en la ruta C con `utmipipe=1`.
+- Aclarar el panic del 1.er arranque.
+- Decidir si `utmipipe` pasa a ser el valor por defecto.
