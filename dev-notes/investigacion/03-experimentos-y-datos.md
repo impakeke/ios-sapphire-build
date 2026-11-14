@@ -474,3 +474,45 @@ de ~150 a 59 µs y con ello suben los buffers por segundo y los frames a tiempo,
 `gpu-pass` baja la pasada principal de ~22 a ~13 ms y deja la GPU al 38 %, con la CPU como límite. Falta la
 fusión de las dos. Las pasadas en sysmem a pantalla completa (30-39 draws, 20-23 ms) son ahora lo más caro de GPU.
 Queda instalado `cpu-A-wip`.
+
+## M10 — Bundle fusionado, vaciado de caché antes de WFI y frecuencia de la GPU en caliente (2026-11-14)
+
+Kernels de CI: run 43631168892 (0343, 0345-0347; imagen `boot_a-0347-vco2-820.img`) y run 43632182225 (más 0344 y
+0348-0350; `boot_a-0350-vco2-820.img`). `kern.sweet_fb_queue=1`, `kern.sweet_gpu_flush=1`. Driver `merge-1`
+(`cpu-draw` + `gpu-pass`, 98d2c3c), instalado por renombrado y con backboardd como cliente de `SapphireGPU`
+comprobado. Carga `homeswipe.sh 8`.
+
+**Diagnóstico de 0343 y 0344 al arrancar (lecturas).** `kern.sweet_gpu_clocks`: `gx_gfx3d` 819 998 kHz, DDR
+1 555 210 kHz, CPU gold 2 803 196 y silver 1 900 802 kHz. `kern.sweet_thermal` un minuto después de arrancar: 16
+sensores entre 65,6 y 70,2 °C. `kern.sweet_idle_stats` con el modo de origen: en las CPU 0-3 (A73) cada entrada en
+reposo gasta 439-518 µs en el mantenimiento de caché (10 409 entradas y 4,75 s en cpu0 desde el arranque); en las
+CPU 4-7, 24-28 µs. `kern.sweet_cpuregs`: CPU 0-3 MIDR 411fd090 (A73), CCSIDR de L2 70ffe07a; CPU 4-7 MIDR 51af8014.
+
+| Condición | n | Buffers/s | A tiempo / tarde / paradas | CPU/draw | Hecho→commit | Commit→fin |
+|---|---|---|---|---|---|---|
+| 0347, 820 MHz, `merge-1` | 2 | 30,5 · 25,8 | 103/456/60 · 84/355/51 | 69 · 61 µs | 13,9 · 13,6 ms | 20,0 · 21,7 ms |
+| 0350, `kern.sweet_idle_cache=1` (origen) | 2 | 31,6 · 29,6 | 89/526/37 · 106/379/50 | 68 · 62 µs | 14,5 · 15,0 ms | 19,4 · 20,9 ms |
+| 0350, `kern.sweet_idle_cache=0` | 2 | 46,9 · 44,0 | 816/270/38 · 492/384/22 | 25 · 26 µs | 5,9 · 5,6 ms | 26,7 · 27,6 ms |
+| ídem + `kern.sweet_gpu_khz=1025000` | 1 | 44,8 | 595/367/26 | 26 µs | 5,3 ms | 25,9 ms |
+| ídem + `kern.sweet_gpu_khz=1260000` | 1 | 48,0 | 657/377/21 | 27 µs | 5,6 ms | 23,0 ms |
+
+(Las dos filas de `idle_cache` se midieron intercaladas: 1, 0, 1, 0.)
+
+- **Cambio de nivel en caliente (0345):** 820 → 1025 → 1260 MHz sin errores (`kern.sweet_gpu_opp`: 312 y 1 344 µs por
+  cambio); `gxfreq` mide 1025,00 y 1260,00 MHz. Temperaturas tras cada ensayo: CPU 62,9 → 64,5 °C, GPU 60,6 → 62,9 °C.
+- **Gobernador (0346)** con cima en 1260 MHz: en reposo baja a 320 MHz; durante un ensayo, 25 subidas, 5 bajadas y
+  14 pasos a reposo, temperatura máxima de la GPU 71,0 °C, sin recorte térmico. Ese ensayo no es comparable (38
+  draws por buffer: la pantalla no era el home).
+- **Incidencias con la GPU a 1260 MHz y el gobernador activo (n=1, sin causa establecida):** SpringBoard terminó
+  con SIGBUS a las 11:41:57 mientras cargaba la biblioteca de aplicaciones tras un reinicio de backboardd
+  (`crash/SpringBoard-2026-11-14-114157.ips`), entró en el modo seguro del cargador de tweaks (barra de estado
+  roja), y en una captura del bloqueo el fondo de pantalla sale con bloques descolocados
+  (`medicion/shots/hoja-v2.png`). Con el gobernador apagado y 820 MHz fijos, tras salir del modo seguro, el home y
+  su segunda página salen bien (`hoja-s.png`).
+- **Estado en que queda el teléfono:** `boot_a-0350-vco2-820.img`, `merge-1`, gobernador apagado, 820 MHz, y en
+  `/redwood/boot.d/80-gfx.sh`: `kern.sweet_fb_queue=1 kern.sweet_gpu_flush=1 kern.sweet_idle_cache=0`.
+
+**Interpretación.** El vaciado de caché antes de cada WFI (16) era el mayor coste de CPU del sistema en los A73:
+quitarlo baja el driver de 62-68 a 25-26 µs por draw y sube los buffers por segundo un 50 %, hasta que manda la
+GPU (commit→fin 23-27 ms). Subir la GPU a 1260 MHz da poco más (48 buffers/s). Falta saber qué limita ahora la
+GPU, y si las incidencias dependen del gobernador, de 1260 MHz o de `idle_cache=0`.

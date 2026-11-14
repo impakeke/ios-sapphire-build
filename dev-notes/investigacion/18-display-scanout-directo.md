@@ -251,8 +251,9 @@ Para 720×1600 → 1080×2400 (lo que escribe `sweet_plane_scaled_regs`, igual a
 | `OP_MODE` 0xa04 | 0x80034001, + 0x20000400 si el formato lleva alfa | enable, BIL, blend, 8 bits |
 | `SSPP_SRC_OP_MODE` 0x038 | el del ABL \| bit 31 (PE override) | `setup_format` |
 
-Las dos razones son la misma (1,5), así que los dos pasos coinciden. Para estirar la superficie entera (la hipótesis
-del encargo) serían 0x163c6c (750/1080) y 0x15a70e (1624/2400): el arnés los calcula también (§6.3). Sin tabla:
+Las dos razones son la misma (1,5), así que los dos pasos coinciden. Para estirar la superficie entera (750×1624 →
+1080×2400, razones 1,44 y 1,478) serían 0x1638e3 y 0x15a740: el arnés los calcula también (§6.3), pero 0348 no estira.
+Sin tabla:
 filtro bilineal (`y_rgb_filter_cfg = 3`, `DPU_SCALE_BIL`), como la copia de hoy (el blitter también es bilineal,
 G2206-2237).
 
@@ -276,7 +277,8 @@ G2206-2237).
   de scanout: dirección de la superficie, ventana, y como valla la del último submit msm en ese momento (HakiosMetal
   envía al hacer `commit`, `command.cpp:390-396, 603-628`: el submit precede al `SwapEnd`; un ring, en orden). Si un
   submit posterior nombra la superficie, el flip espera también a ese (`gpuFence` de la superficie, que pone el
-  submit). Como mucho 250 ms.
+  submit). Sin límite de tiempo, como las copias: una GPU colgada se reinicia a los 2 s y sus vallas saltan (0317).
+  Un frame de superficie aún sin dibujar cuando se vacía la cola se descarta, no se enseña a medias.
 - **Vida de la superficie:** en uso desde su `SwapEnd` (como hoy) hasta que el DPU ha tomado el flip de un frame
   posterior: mientras está en pantalla y mientras el DPU la abandona. Después se suelta (`sweet_hold` y `release`).
   CoreAnimation solo dibuja en superficies que no están en uso; con dos, una está en pantalla y otra en la cola, y
@@ -304,8 +306,195 @@ G2206-2237).
 - Ancho de banda de scanout: el DPU lee 720×1600×4 = 4,6 MB por refresco en vez de 10,4 MB.
 - Memoria: 20 MiB de pool fijo; los flip buffers se quedan (son la ruta de vuelta).
 
+## 4. Los parches
+
+Fuera de `xnu/patches/`, en `~/sapphire-angel/research/metal/display/parches-nuevos/`. Van en orden, sobre 0342 (y
+con los 0343-0348 de relojes antes o después: §6.1).
+
+### 4.1 `0347-sapphire-fb-dpu-regs-latch-diag.patch` (diagnóstico; solo lectura)
+
+`SweetFramebuffer.cpp` y `SweetSurface.cpp`; 6 hunks. No escribe ningún registro que no se escribiera antes ni cambia
+qué se presenta.
+
+- **`kern.sweet_fb_regs`** (lectura): MDP TOP, CTL0, VIG0, su escalador y su CSC, LM0, PP0 e INTF1 tal como están, 8
+  palabras por línea (~12 KB de texto), más VIG0 y su escalador tal como los dejó el ABL (leídos en `start()` antes del
+  primer flip del kernel). Linux lee esos mismos bloques enteros en su volcado (`dpu_kms_mdp_snapshot`).
+- **`kern.sweet_fb_latch`** (lectura): para cada flip, si `CTL_FLUSH` devuelve los bits recién escritos (0x20001),
+  cuánto tardan en limpiarse, con cuántos frames de `INTF_FRAME_COUNT` de diferencia (por dieciseisavo del refresco
+  en que se escribió el flip), cuántas veces avanzó el contador con los bits aún puestos y cuántos no se limpiaron en
+  100 ms. Lo miran el hilo de la cola (cada 500 µs mientras hay un flip pendiente) y los ticks.
+- **Registro de superficies de pantalla:** las 16 primeras superficies del tamaño del panel o del 2x, quién las crea y
+  los nombres de sus propiedades (`SWEET SURF: screen-sized surface N by P: …`).
+
+```sh
+ssh sapphire 'PATH=/var/jb/usr/bin:/var/jb/usr/sbin:$PATH; sysctl -n kern.sweet_fb_regs kern.sweet_fb_latch'
+```
+
+Qué decide: el formato y el op mode del plano del ABL (alfa, extensión de píxel), el estado del escalador (versión,
+apagado), qué hay en el mezclador; si `CTL_FLUSH` sirve como señal de flip tomado y dónde está, en líneas, el punto en
+que el DPU toma el plano.
+
+### 4.2 `0348-sapphire-fb-scanout-vig-scaler.patch` (scanout directo; apagado por defecto)
+
+`SweetFramebuffer.cpp`, `SweetSurface.cpp`, `SweetSurface.h`, `SapphireGpu.cpp`; 28 hunks.
+
+| Interruptor | Valores | Efecto |
+|---|---|---|
+| `kern.sweet_fb_scanout` (boot-arg `sweetfb_scanout`) | **0** (defecto) | como antes |
+| | 1 | superficies de pantalla de backboardd en el pool y scanout directo de sus frames |
+| | 2 | solo el pool (los frames se siguen copiando) |
+| `kern.sweet_fb_scanout_diag` | lectura | listo o por qué no; pool; frames, flips y frames copiados con su motivo; dibujos después del `SwapEnd`; esperas en `SwapEnd`; cambios del plano y sus esperas; superficies soltadas; paradas; flushes no tomados; la ventana en pantalla |
+
+Piezas: el pool y su criterio (`SweetSurface.cpp`: `sweet_pool_*`, `kernelAddress()` WC para el pool); la valla
+por superficie y el mapeo WC del cliente de la GPU (`SapphireGpu.cpp`: `sapphire_gpu_msm_fence*`, `gpuFence` en el
+submit, `clientMemoryForType`, el modo 0 de la limpieza salta el pool); y en `SweetFramebuffer.cpp`:
+`sweet_plane_scaled_regs` y `sweet_scan_window` (aritmética pura, comprobada en el host), `scanoutInit` (lee y valida
+el plano del ABL, configura el pool), `presentScanout` (decide y encola), `planeScaled`/`planeUnscaled`/`planeWritable`
+(escriben el plano solo cuando no puede tomarse a medias), `frameDone`/`frameShow` (valla y flip de cada clase de
+frame), `scanoutLeave`/`scanoutRetire` (vida de la superficie), `flipNote` (la contabilidad de 0340, ahora tras la
+espera), `scanoutStop` (vuelta a la copia en caliente) y el vigilante de 100 ms en `queueFlip`.
+
+Cambia también dos detalles de 0340 que la simulación sacó a la luz (§6.4): `presentQueued()` limpia el hueco de la
+cola que rellena, y el flip se anota cuando se escribe, no antes de esperar.
+
+## 5. Candados
+
+- Todo el estado del scanout (cola, superficies en pantalla y saliendo, plano) va con `fPresentLock`, como la cola de
+  0340. El tick del apagado de pantalla toma ahora `fPresentLock` alrededor de su flip (antes escribía sin él).
+- Orden: `fPresentLock` → `service_lock` (la copia, como antes) y `fPresentLock` → `sweet_surface_lock` (soltar una
+  superficie puede liberarla y devolver su hueco; 0340 ya soltaba superficies con `fPresentLock`). `fLock` nunca está
+  tomado al tomar `fPresentLock` (`scanoutStop` copia `fPending` con `fLock` y lo suelta antes). `SweetSurface` pregunta
+  `sweet_fb_scanout_pool_on()` sin candado (dos palabras).
+- **Esperas:** el `SwapEnd` que espera sitio en la cola duerme con `IOLockSleepDeadline` (suelta el mutex). La espera
+  de un plano escribible es un bucle de lecturas de registros de 20 ms como mucho, con `fPresentLock`: solo en los
+  cambios de modo (primer frame de superficie tras copias, primera copia tras superficies, vaciado de la cola, apagado,
+  pánico); los flips del hilo de la cola llegan ya escribibles. No usa `IODelay`, así que sirve en la consola de pánico.
+- **Sin candado:** `sweet_cons_show()` (pánico) llama a `scanFrom()` como antes; restaura el plano con el mismo bucle.
+  `gpuFence` lo escribe el submit con `service_lock` y lo lee `frameDone()` sin él (una palabra); igual `msm_seq`.
+- La contabilidad de 0336/0347 son contadores sin candado, como en 0336.
+
+## 6. Verificación
+
+Herramientas en `~/sapphire-angel/research/metal/display/work/verif/`.
+
+### 6.1 Aplicación y compilación
+
+- `check-all.sh`: `git apply --check` y `git apply` en orden sobre un árbol limpio a 0342: **los dos aplican**, y el
+  resultado es idéntico al árbol de trabajo. Con los parches de relojes (0343, 0345, 0346, 0347-ddr-vote,
+  0348-hwcg) antes o después de los míos, **todos aplican** en los dos órdenes.
+- `clang++ -fsyntax-only` con `kernel-gpu/verificacion/syn.sh` y sus stubs: **0 errores** en los tres archivos, solos y
+  con los de relojes.
+- `inject.py`: un identificador sin declarar al principio de cada función nueva (31): **los 31 se señalan**: todo el
+  código nuevo se compila de verdad.
+- `warn.sh` (`-Weverything` con la lista `-Wno` del kernel): en las líneas añadidas solo salen los avisos de las macros
+  `SYSCTL_*` que ya da el código vecino.
+
+### 6.2 Aritmética del plano frente a Linux (`arnes/`)
+
+`extract.py` corta **literalmente** de Linux v6.12 `setup_rects`, `setup_pe_config`, `_dpu_plane_setup_scaler3`,
+`_dpu_plane_setup_pixel_ext`, `dpu_hw_setup_scaler3` (con sus funciones de tabla y de realce), `mult_frac` y las
+estructuras y offsets, y del kernel parcheado `sweet_plane_off[]`, `sweet_plane_scaled_regs()` y
+`sweet_scan_window()`. `arnes.c` hace escribir a Linux un plano escalado en un registrador y lo compara registro a
+registro con el del kernel:
+
+- caso del teléfono (720×1600 en (13,12) → 1080×2400): **Linux escribe exactamente los mismos 27 registros con los
+  mismos valores** (tabla de §3.5);
+- 200 003 casos (rectángulos aleatorios dentro de los límites del escalador, las dos codificaciones de versión
+  0x00030000 y 0x3000, con y sin alfa, 8 y 10 bits, op modes del ABL aleatorios sin volteo): **0 diferencias**;
+- la ventana de `sweet_scan_window()` frente a la de la copia (1/256 px) para cada escala de render de 400 a 1000 ‰:
+  origen dentro del píxel, tamaño a ±0,5 px, **0 fuera**;
+- cinco mutaciones del código del kernel (precarga, filtro de alfa, orden de `REQ_PIXELS`, PE override, paso de fase):
+  **las cinco se detectan** (en todos los casos, o en todos los que tienen alfa).
+
+`arnes-sde.c` hace lo mismo con el driver de stock: `_sde_plane_setup_scaler3` y `sde_hw_setup_scaler3` literales, con
+el bloque del escalador iniciado como lo hace el catálogo con el DT del teléfono (`sde_init_scaler_blk`, 0x3000):
+**100 001 casos, 0 diferencias** en los registros del escalador.
+
+### 6.3 Simulación de la cola con frames de superficie (`sim-0348/`)
+
+`extract.py` corta del `SweetFramebuffer.cpp` parcheado, tal cual (solo las barreras `dsb` pasan a comentario), los
+globales de 0348, `scanFrom`/`flipNote` y todo desde `queueOn()` hasta el user client (la cola de 0340, su hilo y el
+scanout). `sim.cpp` los ejecuta contra un modelo: reloj virtual en el que el código del kernel tarda (cada lectura del
+reloj avanza 100 ns y el hardware sigue, mientras los demás hilos del kernel esperan el candado), una GPU que ejecuta
+dibujos y copias en orden, un DPU que toma el plano en cada inicio de frame si hay un flush pendiente (con y sin
+lectura de `CTL_FLUSH`), el temporizador de 120 Hz, el hilo de la cola y un CoreAnimation que dibuja en superficies
+libres y llama a `SwapEnd`. Los registros del modelo ven cada escritura.
+
+Comprueba en cada ejecución: que el plano nunca se toma a medias (en cada toma los 27 registros son el juego del ABL o
+el escalado para la ventana que contienen, y un plano escalado apunta a una superficie del pool); que la geometría
+solo se escribe sin flush pendiente (con lectura de `CTL_FLUSH`) y dentro de la ventana; que la GPU nunca dibuja en
+una superficie que el panel escanea ni se suelta una superficie que el panel aún puede leer; que ningún frame llega
+al panel antes de terminar su dibujo; el orden; que todo frame se enseña o se cuenta como descartado; y las
+comprobaciones de 0340 (ninguna copia sobre lo que el panel lee o sobre un frame en cola).
+
+Diecisiete escenarios (dos, tres y cuatro superficies y CoreAnimation que crea la tercera; régimen del teléfono,
+GPU saturada, ligero, ráfagas; frames de CPU y frames de superficies fuera del pool mezclados; envíos después del
+`SwapEnd`; `CTL_FLUSH` sin lectura; apagado y encendido en caliente; GPU colgada) × 30 semillas × 600 frames:
+RESULTADO_SIM
+
+Dos defectos del código que encontró la simulación, corregidos en 0348:
+
+1. `presentQueued()` (0340) rellenaba un hueco de la cola sin limpiarlo: una copia que caía en el hueco de un frame de
+   superficie heredaba `scan = true` y se enseñaba como tal (modo del plano equivocado, frames desordenados).
+2. `scanFrom()` anotaba el flip (contador de frames, línea) **antes** de esperar un plano escribible: tras la espera la
+   anotación tenía un frame de retraso y, sin lectura de `CTL_FLUSH`, `flipTaken()` daba el flip por tomado antes de
+   tiempo y soltaba una superficie que el panel aún leía. Ahora se anota al escribir.
+
+Y dos hechos del modelo que no son defectos y se cuentan aparte: un envío que nombra la superficie **después** de que
+su frame ya está en pantalla la rasga (el kernel no puede esperar algo que aún no existe: el diseño supone que el dibujo
+de un frame se envía antes de su `SwapEnd`, como hace HakiosMetal, y `drawn after the SwapEnd` lo vigila); y el
+`queueDrain()` de 0340 suelta las superficies de un frame cuya copia aún no terminó tras 20 ms, lo que es inocuo porque
+lo que CoreAnimation dibuje después en ellas va detrás de la copia en el mismo ring.
+
+## 7. Si falla: qué vería el coordinador y cómo volver
+
+Con 0347 y 0348 y sin tocar nada, la presentación es la de hoy; el arranque añade la línea
+`SWEET FB: scanout (kern.sweet_fb_scanout 0): ready|<motivo>; plane at boot: …` con el plano del ABL.
+
+Activarlo en caliente, sin boot-arg (el cmdline del teléfono ya tiene 572 caracteres; por encima de 575 el shim pierde
+`sweet_splash`):
+
+```sh
+ssh sapphire 'PATH=/var/jb/usr/bin:/var/jb/usr/sbin:$PATH; sysctl -w kern.sweet_fb_scanout=1; killall -9 backboardd'
+ssh sapphire 'PATH=/var/jb/usr/bin:/var/jb/usr/sbin:$PATH; sysctl -n kern.sweet_fb_scanout_diag kern.sweet_fb_latch'
+```
+
+| Si falla… | Se ve | Qué mirar | Vuelta |
+|---|---|---|---|
+| El plano escalado está mal (formato, recorte, el escalador no responde como Linux) | imagen negra, desplazada, de colores cambiados o basura, con el sistema vivo | `kern.sweet_fb_regs`, `flips` creciendo | `sysctl -w kern.sweet_fb_scanout=0`: el frame en pantalla se vuelve a presentar por la copia al momento y el plano vuelve al del ABL |
+| El DPU no toma un flush del plano escalado | imagen congelada | `flushes not taken` | automático a los 100 ms; si el pipe queda colgado, reiniciar (`reboot`, o `kern.sweet_reboot_mode=2` y `reboot` para fastboot) |
+| CoreAnimation dibuja en una superficie en uso | desgarro (franjas de dos frames) | `swapped again while on the panel or waiting` | `kern.sweet_fb_scanout=0` |
+| CoreAnimation no crea una tercera superficie | menos swaps por segundo | `swaps that waited`, `swap interval` | `kern.sweet_fb_queue_depth=1` o `scanout=0` |
+| El criterio del pool no coge las superficies de pantalla | nada cambia | `not from the pool` creciendo, `pool: … made` | reiniciar backboardd con `scanout=1`; ver `SWEET SURF: screen-sized surface …` |
+| Pánico en código nuevo | reinicio | ring | el arranque siguiente viene con `scanout=0` (si se activó por sysctl) |
+
+El USB y SSH no dependen del display: una pantalla negra o congelada se arregla por SSH. Por eso conviene probar
+siempre por sysctl y no con el boot-arg.
+
+**Orden de prueba propuesto:** (1) arrancar sin tocar nada y leer `kern.sweet_fb_regs`, `kern.sweet_fb_latch` y
+`kern.sweet_fb_scanout_diag` (¿`ready`?, ¿`CTL_FLUSH` devuelve los bits?, ¿en qué línea se toma el plano?);
+(2) `scanout=2` y reiniciar backboardd: las superficies pasan al pool con la copia de siempre (debe verse igual y
+dejar de crecer `surface cleans` de `kern.sweet_fb_diag`); (3) `scanout=1`, mirando la pantalla (bordes, barra de
+estado, alineación del táctil); (4) `tools/perf/homeswipe.sh` con 0 y con 1, n≥3: buffers/s, commit→fin, ocupación de
+la GPU, `swap interval`, `flip interval`, `arrival to flip`, temperatura.
+
+## 8. Riesgos y lo no verificado
+
+- **No verificado en el teléfono:** que `CTL_FLUSH` devuelva los bits pendientes (Linux y SDE lo usan; 0347 lo mide y
+  0348 se adapta si no); dónde toma el DPU el plano respecto a `INTF_LINE_COUNT` con el fetch programable (la ventana
+  deja ≥ 2 ms de margen; 0347 lo mide); el estado del VIG0 que deja el ABL (0348 no arranca si no es el esperado); que
+  `SRC_XY` recorte una fuente RGB lineal (Linux lo usa así); que el SID 0x420 alcance 0xe5000000 como alcanza
+  0xe2000000; que nadie use 0xe5000000-0xe6400000 (ningún código del port, ninguna región fija del DT); cómo
+  responde CoreAnimation a superficies retenidas hasta el flip siguiente; las propiedades que distinguen sus
+  superficies de pantalla de las de SpringBoard (0347 las registra).
+- **Calidad:** bilineal sin tabla, como la copia de hoy. Con tablas haría falta el contenido que da el HAL cerrado.
+- **Medio píxel:** el origen horizontal es 13 en vez de 13,33 (fase inicial 0, como Linux).
+- **Memoria fija:** 20 MiB del banco bajo en uso solo cuando hay superficies en el pool.
+- **Sin compilar en CI y sin ejecutar en el teléfono.**
+
 ## Material
 
 - `~/sapphire-angel/research/metal/display/`: `parches-nuevos/` (0347, 0348), `work/xnu` (árbol con un commit por
-  parche sobre la serie a 0342), `work/headers/`, `work/mkpatch.sh`, `work/verif/` (comprobaciones), `ref/` (fuentes
-  primarias), `telefono/` (lectura del teléfono).
+  parche sobre la serie a 0342), `work/headers/` (descripciones), `work/mkpatch.sh`, `work/verif/` (`check-all.sh`,
+  `inject.py`, `warn.sh`, `stubs/`, `arnes/` con `arnes.log` y `arnes-sde.log`, `sim-0348/` con `run.log`),
+  `ref/` (Linux v6.12, SDE KAMORTA, SDM, `math.h`), `telefono/` (lectura del teléfono).
