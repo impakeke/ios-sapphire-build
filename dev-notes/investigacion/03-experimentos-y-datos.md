@@ -738,3 +738,17 @@ Mismo protocolo que M19 (kernel 0353 a 820 MHz, scanout directo, parciales activ
 compilador antes de mirar su caché, y un pipeline ya compilado esperaba 170-430 ms a que un hilo de fondo terminara
 de especializar otro shader (13 §; análisis de las trazas de M18 y M19). Con la caché consultada sin cerrojo
 desaparece. Lo que queda en estas animaciones es el tiempo de GPU por frame (14-19 ms de media).
+
+## M21 — `merge-6` pierde los widgets de fondo opaco (2026-11-14)
+
+Kernel 0353, scanout directo, parciales activas. Capturas de la primera página del home y de la vista de widgets
+(`medicion/shots/hoja-r6.png` con `merge-6`, `hoja-r5.png` con `merge-5`, en la misma sesión; con `merge-5`, 55 s
+después de reiniciar backboardd).
+
+- `merge-6`: en el home no se ve el widget de Calendario; en la vista de widgets solo se ve el de Tiempo (faltan el
+  widget gris superior, el de Calendario y el de titulares). El usuario lo ve igual en el panel.
+- `merge-5`: se ven los cuatro.
+
+Queda instalado `merge-5`. `merge-6` añade sobre `merge-5` la caché de stages consultada sin el cerrojo del
+compilador (M20), la alineación de 64 B declarada para las texturas sobre IOSurface y el swizzle del descriptor de
+textura; cuál de los dos últimos causa la pérdida está sin establecer.
