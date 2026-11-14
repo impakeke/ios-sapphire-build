@@ -1,7 +1,7 @@
 # Investigación de iOS en sapphire — índice
 
 Investigación detrás de los arreglos de USB y UFS del fork (parches 0329-0334) y del trabajo de gráficos
-(parches 0336-0338, driver Metal). Todo lo que hay aquí es
+(parches 0336-0350, driver Metal). Todo lo que hay aquí es
 **observación medida** (03), **fuente primaria citada** (02) o **auditoría fechada** de lo heredado (01, 04).
 Cómo operar el teléfono: [../OPERACION.md](../OPERACION.md).
 
@@ -16,17 +16,26 @@ Cómo operar el teléfono: [../OPERACION.md](../OPERACION.md).
 3. **La E/S cruda de `sweet_ufs` no escribe en memoria de usuario desde el kernel** (0334, validado en 03 E7).
 4. **Acceso:** SSH persistente solo con clave en 192.168.7.2, vuelta remota a fastboot
    (`kern.sweet_reboot_mode=2`) y bucle de ensayos automático (`~/adb-bridge/exp-loop.sh`).
-5. **La GPU corre a 1260,00 MHz** con `gpu_vco2=1 gpu_mhz=1260` (0337; medido con `gxfreq`, 03 M4). Sin
-   `gpu_vco2`, `gpu_mhz=1260` la deja a 630,00 MHz (03 M3).
-6. **Dónde se va un frame** (03 M1-M2, con el binario heredado y la GPU a 630 MHz): el hilo de render de
-   backboardd está saturado de CPU (84-90 %), el 46-60 % en la ruta de draw del driver Metal (~126 µs por
-   draw, ~150 draws por frame), y la pasada principal tarda 20-24 ms de GPU. `metal_defer=1` sube los
-   buffers por segundo un 18 %.
-7. **El driver Metal se compila desde fuente en la Mac** (08): upstream de HackiOS `63fc2b4` más seis parches
-   A610 propios; el bundle `propio-args` carga y pinta bien (03 M5).
-8. **El kernel 0342 deja de pisar frames y de limpiar la caché en cada submit** con `kern.sweet_fb_queue=1` y
-   `kern.sweet_gpu_flush=1` (0340, 0339; 03 M7): pisados 10,6 % → 0, submit 1,74 → 0,05 ms.
-9. **Siguiente:** ver "Gráficos: siguiente trabajo" abajo.
+5. **Frecuencia de la GPU:** con `gpu_vco2=1`, `gpu_mhz` es la frecuencia real del núcleo (0337; `gxfreq`: 820,00 y
+   1260,00 MHz, 03 M4, M7, M10); sin `gpu_vco2`, `gpu_mhz=1260` la deja a 630,00 MHz, 15/15 (03 M3; 11). Se cambia
+   en caliente con `kern.sweet_gpu_khz` (0345: 312-1344 µs por cambio) y hay gobernador (0346; en reposo baja a
+   320 MHz) (03 M10; 17). El DDR corre a 1555,2 MHz bajo iOS, 7/7 (17 §4.3; 03 M10).
+6. **"La GPU está limitada por el ancho de banda de memoria" no se sostiene**: la pasada principal mueve menos de
+   25 MB en 18-24 ms (1,0-1,4 GB/s), y el argumento era que subir el reloj no cambiaba nada cuando el reloj no subía
+   (11 §9, §14; 09 §8).
+7. **El driver Metal se compila desde fuente en la Mac** (08): upstream de HackiOS `63fc2b4` más parches A610 propios.
+   Ramas `cpu-draw` (13) y `gpu-pass` (14); el bundle fusionado `merge-1` es el instalado (03 M9-M10). Se instala por
+   renombrado y se comprueba que backboardd es cliente de `SapphireGPU`: copiado encima de otro, el driver no carga y
+   CoreAnimation compone por software (03 M8; 14; [../OPERACION.md](../OPERACION.md) §9.3). El binario heredado
+   `HakiosMetal` del instalador no es el driver en uso.
+8. **Kernel de la presentación y del submit** (0339-0342; 03 M7; 15): con la cola `kern.sweet_fb_queue=1` ningún frame
+   se pisa (10,6 % → 0) y con `kern.sweet_gpu_flush=1` la limpieza de caché por submit pasa de 1,70 a 0,01 ms. La línea
+   `SWEET FB: 5 s … N by the GPU` cuenta swaps, no frames mostrados, y sus tiempos salen a 0 con `sweetfb_scale=2` (09).
+9. **CPU:** XNU vaciaba la L2 del cluster A73 antes de cada WFI (16 §4). Con `kern.sweet_idle_cache=0` (0344) el
+   driver baja de 62-68 a 25-26 µs por draw y los command buffers por segundo pasan de 29,6-31,6 a 44,0-46,9 (n=2,
+   03 M10). En XNU las CPU 0-3 son los A73 y las 4-7 los A53, al revés que en Linux (16 §1; 03 M8).
+10. **El límite es ahora la GPU:** 23-27 ms de commit a fin por frame (03 M10). Siguiente: "Gráficos: siguiente
+    trabajo" abajo.
 
 ## Reglas para agentes
 
@@ -44,21 +53,26 @@ Cómo operar el teléfono: [../OPERACION.md](../OPERACION.md).
 |---|---|---|
 | 01 | [01-auditoria-sweet_usb.md](01-auditoria-sweet_usb.md) | Auditoría del driver USB post-0328: mecanismo del fallo bajo carga con números de línea, 16 defectos, tabla de afirmaciones, diseño corregido e instrumentación |
 | 02 | [02-fuentes-primarias-dwc3-abl.md](02-fuentes-primarias-dwc3-abl.md) | Fuentes primarias: Linux/U-Boot dwc3, código y binarios de ABL, PHY femto, DT de khaje, erratas |
-| 03 | [03-experimentos-y-datos.md](03-experimentos-y-datos.md) | Bitácora de mediciones en el teléfono (E0-E7 y muestreo de CPU), con tabla resumen |
+| 03 | [03-experimentos-y-datos.md](03-experimentos-y-datos.md) | Bitácora de mediciones en el teléfono: USB y UFS (E0-E7), muestreo de CPU y gráficos (M1-M10) |
 | 04 | [04-auditoria-documentacion-heredada.md](04-auditoria-documentacion-heredada.md) | Auditoría del resto de docs: arranque/recovery, **seguridad** (hash en spwd.db, .supdate root sin firma, shell 2323), qué funciona, reproducibilidad, licencias, riesgos |
 | 05 | [05-parche-0330-ruta-de-datos.md](05-parche-0330-ruta-de-datos.md) | Parche 0330: ruta de datos v2 — diseño, invariantes, verificación, riesgos, boot-args del A/B |
 | 06 | [06-parche-0334-ufs-raw-io.md](06-parche-0334-ufs-raw-io.md) | Parche 0334: panic de `sweet_ufs` en E/S cruda (memcpy del kernel a una VA de usuario vía physio), arreglo con `uiomove` |
-| 07 | [07-plan-cpu-stutter.md](07-plan-cpu-stutter.md) | Plan: descartar la CPU como causa del stutter antes de Metal (hipótesis H1-H6 y protocolo) |
+| 07 | [07-plan-cpu-stutter.md](07-plan-cpu-stutter.md) | CPU y tirones al deslizar: H1-H4 respondidas con mediciones (render saturado en el driver, L2 vaciada, frames pisados); H5 y H6 sin medir |
 | 08 | [08-hakiosmetal-binario-vs-fuente.md](08-hakiosmetal-binario-vs-fuente.md) | El binario `HakiosMetal` frente a la fuente: procedencia, auditoría de los cambios del port al A610, receta de reconstrucción y bundles propios |
 | 09 | [09-auditoria-kernel-gpu.md](09-auditoria-kernel-gpu.md) | Auditoría del kernel en la ruta gráfica: buffers, submit, fences, presentación (frames pisados, copia escalada por frame, vsync), parches 0336 y 0338 |
 | 10 | [10-auditoria-rendimiento-hakios-metal.md](10-auditoria-rendimiento-hakios-metal.md) | Auditoría de rendimiento del driver Metal: coste de CPU por draw, por qué la pasada principal tarda 20 ms (102 tiles, estado repetido por tile), plan por etapas |
 | 11 | [11-gpu-relojes-bus-vs-android.md](11-gpu-relojes-bus-vs-android.md) | Relojes, raíles, bus y memoria de la GPU frente a Android en este teléfono; parche 0337 y su escalera |
 | 12 | [12-escena-drivers-metal-alternativos.md](12-escena-drivers-metal-alternativos.md) | Otros proyectos con driver Metal sobre GPU que no es de Apple: mapa de la escena, cifras publicadas, veredicto |
-| 13 | [13-driver-cpu-por-draw.md](13-driver-cpu-por-draw.md) | Driver: coste de CPU por draw (rama `cpu-draw`, en curso) |
-| 14 | [14-driver-gmem-tiles-estado.md](14-driver-gmem-tiles-estado.md) | Driver: GMEM, tiles y grupos de estado (rama `gpu-pass`, en curso; G1-G3 pintan mal el blur) |
-| 15 | [15-kernel-cache-y-presentacion.md](15-kernel-cache-y-presentacion.md) | Kernel: parches 0339-0342 (limpieza de caché por suciedad, cola de presentación, TLB, caché de BOs) |
+| 13 | [13-driver-cpu-por-draw.md](13-driver-cpu-por-draw.md) | Driver: coste de CPU por draw, rama `cpu-draw` (etapas A y B de 10 §2.7): punto de partida, suite de host con las constantes del A610, arreglo de la palabra de desbordamiento del VSC. **En curso** |
+| 14 | [14-driver-gmem-tiles-estado.md](14-driver-gmem-tiles-estado.md) | Driver: pasada GMEM, estado por tile, geometría de tiles y GMEM o sysmem por pasada (rama `gpu-pass`); por qué un bundle copiado encima no carga; medido en el teléfono (78 tiles, 13 ms); notas para la fusión |
+| 15 | [15-kernel-cache-y-presentacion.md](15-kernel-cache-y-presentacion.md) | Kernel: parches 0339-0342 (limpieza de caché por cuenta, cola de presentación, TLB, caché de BOs); `SwapEnd` no presentaba en su hilo |
+| 16 | [16-planificador-e-hilos.md](16-planificador-e-hilos.md) | Planificador, hilos y caché de los A73: topología en XNU, dónde corren los hilos de un frame, la L2 vaciada antes de cada WFI (0344, 0351), despertares de hilos del kernel |
+| 17 | [17-gpu-escalado-termica-ddr.md](17-gpu-escalado-termica-ddr.md) | GPU: parches 0343 y 0345-0348 (relojes y temperaturas, cambio de nivel en caliente, gobernador, voto del DDR, clock gating); DDR y temperaturas medidas frente a Android |
+| 18 | [18-display-scanout-directo.md](18-display-scanout-directo.md) | Display: qué hace el port con el DPU y scanout directo con el escalador del VIG0 (en el repo, 0349 y 0350; el informe los llama 0347 y 0348). **En curso** |
+| 19 | [19-como-dibuja-ios.md](19-como-dibuja-ios.md) | Cómo dibuja iOS: el camino de un frame, el contrato de CoreAnimation con Metal, no conformidades del driver y diagnóstico de los fallos visibles. **En curso** |
+| — | [../../GPU-ROADMAP.md](../../GPU-ROADMAP.md) | Gráficos: estado y plan, en inglés |
 | — | [../../tools/perf/README.md](../../tools/perf/README.md) | Herramientas de medición: perfil de hilos, contadores del driver, arnés A/B, frecuencia de la GPU, capturas |
-| — | [../OPERACION.md](../OPERACION.md) | Runbook: herramientas de la Mac, acceso, ciclo CI → flash → ensayo → ring, fallos |
+| — | [../OPERACION.md](../OPERACION.md) | Runbook: herramientas de la Mac, acceso, ciclo CI → flash → ensayo → ring, fallos; §9 gráficos (driver, medición, boot-args y sysctls) |
 | — | [../angel.cmdline](../angel.cmdline) · [../bootargs.py](../bootargs.py) · [../repack-boot.py](../repack-boot.py) | Boot-args de expG, su extractor y el empaquetador de imágenes |
 
 ## Anexos en el repo (`anexos/`)
@@ -79,28 +93,45 @@ Cómo operar el teléfono: [../OPERACION.md](../OPERACION.md).
 | `auditoria-docs/` | Assets de la release v0.1.8 (kernel, recovery zip con `sapphire.sh` no versionado, overlay) — **`ovl/` contiene un hash de contraseña: no publicar** |
 | `logs-telefono/` | Datos de 03: ring-logs, volcados USBDIAG de E2, carpetas por serie (`e3-n3-*`, `e4-*`, `e5-*`, `e6-*`, `carga-dp2-*`, `cpu-0334-*`), sesión 2323 |
 | `../backups/` | `boot_a-expG-…img` (base de `repack-boot.py`), `particiones-20261114-0110/` (particiones y GPT), rings (`ring-R1`, `ring-E2R1`, `ring-E5`, `ring-panic2` = e3-n3 ensayo 1) |
+| `metal/rebuild/` | Toolchain, SDK, Mesa, árboles del driver (`hakios-upstream` con las ramas `cpu-draw`, `gpu-pass`, `opcional-puerto`; worktrees `wt-cpu`, `wt-gpu`; `hakios-angel`), `receta.sh`, `build-bundle.sh`, bundles en `out/` (`propio`, `propio-args`, `cpu-A-wip`, `gpu-G*`, `merge-1`…), `gpu-tools/` (prueba de firma `cs-test`, `driver-en-uso.sh`) (08, 13, 14) |
+| `metal/medicion/` | Copias de trabajo de `tools/perf`, ensayos A/B (`ab/`), capturas (`shots/`), crash logs (`crash/`) (03 M1-M10) |
+| `metal/binario-vs-fuente/` | Volcados del binario heredado y comparador función a función (08) |
+| `metal/auditoria-userland/` | `framecount`, desensamblado y caché de stages del teléfono (10) |
+| `metal/kernel-gpu/` | Fuentes reconstruidas del kernel gráfico, referencias fijadas y borradores de 0336-0342 (09, 15) |
+| `metal/relojes/` | DT de Android, referencias de stock (kgsl, gpucc, TSENS), `gxfreq`, árboles `xnu-serie`/`xnu-0342`, lecturas del teléfono, borradores de 0337 y 0343-0348 (11, 17) |
+| `metal/hilos/` | Datos de planificación y caché (`datos/`), herramientas, árboles `xnu-0342`/`xnu-0344`, 0344 y **0351** (16) |
+| `metal/display/` | Referencias del DPU (Linux, SDE, SDM), lecturas del teléfono, borradores del scanout (18) |
+| `metal/ios-graficos/` | Material extraído de iOS 20H392 (fuera de git), no conformidades del driver, bibliografía (19) |
+| `metal/escena/` | Clones de los proyectos con drivers Metal no-Apple (12) |
+| `metal/android/` | Lecturas de Android en este teléfono: topología, temperaturas (03 M8) |
+| `metal/hakios-xnu-kernel/`, `metal/hakios-metal/`, `metal/hakios-sm7325/` | Clon de HackiOS con el remoto del fork de Angel; copia de `hakios-metal`; árbol de HackiOS para otro SoC |
 
 ## Gráficos: siguiente trabajo
 
-Decisión del proyecto: el driver Metal parte del upstream de HackiOS con soporte A610 propio; del port heredado
-solo se conserva lo que una fuente primaria justifica (08 §4). Metal sobre Vulkan (Turnip) está descartado como
-base. Árbol de trabajo y bundles: `~/sapphire-angel/research/metal/rebuild/` (`receta.sh`, `patches/a610/`,
-`out/`); se instalan con `medicion/bundle.sh NOMBRE` (`angel` restaura el heredado, que queda en el teléfono
-como `HakiosMetal.angel`).
+Decisiones del proyecto: el driver Metal parte del upstream de HackiOS con soporte A610 propio y nada del Metal
+heredado es base (08); nada de atajos sobre CoreAnimation: se busca qué exige CoreAnimation de un driver Metal
+correcto y se arregla en el driver o en el kernel (19); Metal sobre Vulkan (Turnip) está descartado (12 §10). Cómo
+compilar, instalar, comprobar y medir: [../OPERACION.md](../OPERACION.md) §9. Objetivo: 120 Hz en el panel (8,33 ms
+por frame).
 
-1. Con la GPU a 1260 MHz: medir la pasada principal y los fps con `tools/perf/ab.sh` (n≥3), vigilar la
-   temperatura, y leer `kern.sweet_fb_diag` (frames pisados, intervalo real entre flips) y `kern.sweet_gpu_diag`.
-2. Probar `kern.sweet_fb_hold_ms=40` (0338): si los frames pisados son frecuentes, diseñar la cola de
-   presentación con contrapresión (09 P1).
-3. Driver: etapas A y B de 10 §2.6 (coste de CPU por draw) y G1-G4 de 10 §3.8 (tiles, estado por tile,
-   framebuffer fetch), validando con los tests de host antes del teléfono.
-4. Kernel: presentación sin la copia escalada por frame (09 §4.3), caché de buffers (09 P2), voto del DDR (11).
-5. Guion de carga verificado con capturas: `swipetest.sh` no desbloquea (03 M1); hace falta uno que llegue al home.
-6. Radios: probar las imágenes `noradio` y de control (03 M5).
+1. **La GPU es el límite: 23-27 ms por frame** (03 M10). Repartirlos (CP, coste por tile, pasadas en sysmem, píxeles)
+   con `metal_fps=passes`/`timeline` y terminar la elección GMEM/sysmem (14 §8), n≥3.
+2. **Incidencia con el gobernador y la GPU a 1260 MHz** (SIGBUS de SpringBoard, fondo con bloques descolocados; n=1,
+   sin causa; 03 M10): repetir con cada factor por separado (1260 MHz fijos, gobernador, `kern.sweet_idle_cache=0`).
+3. **0351**, el arreglo definitivo de la L2 (nada antes de WFI por defecto y el límite correcto en los bucles por
+   set/way): escrito y comprobado con `git apply` en `research/metal/hilos/`, sin integrar (16 §5.1).
+4. **Scanout directo** (0350, `kern.sweet_fb_scanout`): integrado y sin probar en el teléfono (18).
+5. **Calor:** iOS está ~20 °C por encima de Android en reposo (17 §4.4); los hilos del kernel que sondean despiertan a
+   los A73 3600-4100 veces por segundo (16 §1 punto 7, §5.2); `CalendarWidgetExtension` gira al 57-100 % de un núcleo
+   (03 M5; 17 §4.2). Después, el voto del DDR (0347) y el clock gating (0348), sin probar en el teléfono (17 §11).
+6. **Destellos de colores al abrir apps:** sin captura ni traza; hipótesis y protocolo en 19 §4.2.
+7. **Conformidad del driver con Metal** (trabajo omitido sin error, variantes sustituidas, `waitUntilScheduled`
+   prematuro…): 19 §2.9.
+8. **Radios:** probar las imágenes `noradio` y de control (03 M5).
 
 ## Pendientes
 
-- Plan 07: la parte de CPU queda respondida por 03 M1 (el límite es CPU del driver y tiempo de GPU); H5 (USB) y H6 (compilador) siguen sin medir.
+- 07: H5 (tráfico USB) y H6 (compilador del kernel) sin medir.
 - USB: prueba larga (horas, reconexión del cable, reposo y despertar); afinar `qdrop` bajo TCP intenso;
   α frente a β en la ruta vieja nunca se discriminó (sin interés práctico con 0330).
 - Escritura cruda en UFS con `ufsrw=1` tras 0334 (sin probar).
