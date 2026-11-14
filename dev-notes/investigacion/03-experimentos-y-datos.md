@@ -624,3 +624,31 @@ Kernel 0352 a 820 MHz, `merge-3`, ensayos intercalados:
 **Interpretación.** En el home el listón de tiles no cambia nada medible. Repetir el estado en cada bin (como
 hacía la base) cuesta una cuarta parte de los frames: el trabajo del procesador de comandos por bin pesa. La base
 varía entre 38,7 y 46,3 buffers/s con la misma configuración: las diferencias pequeñas no son concluyentes.
+
+## M16 — Kernel 0353: `SwapWait` desde la cola, scanout directo, y `merge-4` (2026-11-14)
+
+Kernel de CI, run 43640189709 (0353 aplicado, 351 parches); imagen `boot_a-0353-vco2-820.img`; al arrancar,
+`kern.sweet_fb_swapwait=1`, `kern.sweet_idle_cache=0`, `kern.sweet_fb_queue=1`. GPU a 820 MHz. Carga
+`homeswipe.sh 8` (113-132 draws por buffer). Driver `merge-3` salvo en la última fila.
+
+| Condición | Buffers/s | A tiempo / tarde / paradas | Commit→fin |
+|---|---|---|---|
+| copia, `swapwait=1` | 45,4 | 813 / 328 / 54 | 29,3 ms |
+| `kern.sweet_fb_scanout=2` (superficies en el pool, copia) | 49,2 · 41,4 · 43,0 | 662/292/31 · 401/567/23 · 496/414/34 | 31,6 · 24,7 · 24,4 ms |
+| `kern.sweet_fb_scanout=1` (scanout directo) | 60,1 · 48,1 | 1338/72/37 · 785/366/24 | 14,2 · 15,7 ms |
+| scanout directo, `merge-4`, `metal_fps=passes` | 48,9 | 739 / 312 / 29 | 18,9 ms |
+
+- Con `scanout=1`: `pool: 3 of 4 slots in use` (CoreAnimation usa tres superficies), `frames 179 flips 179 … swapped
+  again while on the panel or waiting 0`, `plane to scaled 1, to unscaled 0`. Tras cuatro tandas alternando 1 y 2:
+  `frames 4262 flips 4262`, `not one layer 12`, cambios del plano 8 y 8 (los de alternar el sysctl).
+- El widget de Calendario muestra contenido (lo ve el usuario) tras restaurar
+  `CalendarWidget.framework/PlugIns/IntentsExtension.appex` y reiniciar (20).
+- `merge-4` (81dd364): en la consola, `stands in for it` 0, `own module` 4, `refused` 0; pasada principal `tiles 78 …
+  wrote 0x3 read 0x3 loaded 0x1 stored 0x1`, 9,6-11,2 ms. Queda instalado.
+- A la vista del usuario: el widget de Tiempo parpadea cuando algo se le superpone (selector de apps, panel de
+  titulares). Nadie ha comprobado a la vista el encuadre del scanout (alternar 1 y 0 con la pantalla quieta).
+- Queda `kern.sweet_fb_scanout=1` hasta el próximo arranque (el valor al arrancar es 0).
+
+**Interpretación.** Con `SwapWait` contestando el estado real de la cola (18 §3.10), CoreAnimation deja de dibujar
+en la superficie que el panel escanea y el scanout directo quita la copia por GPU: commit→fin baja de ~24,5 a ~15 ms
+y suben los buffers por segundo.
