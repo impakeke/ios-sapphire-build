@@ -752,3 +752,20 @@ después de reiniciar backboardd).
 Queda instalado `merge-5`. `merge-6` añade sobre `merge-5` la caché de stages consultada sin el cerrojo del
 compilador (M20), la alineación de 64 B declarada para las texturas sobre IOSurface y el swizzle del descriptor de
 textura; cuál de los dos últimos causa la pérdida está sin establecer.
+
+## M22 — El scanout directo tras un rato de uso: el pool se llena y la pantalla tiembla (2026-11-14)
+
+Kernel 0353, `kern.sweet_fb_scanout=1` desde M17, varias horas de uso con reinicios de backboardd entre medias.
+
+- El usuario ve toda la pantalla dar saltos cortos y repetidos, en diagonal hacia arriba y a la izquierda, de unos
+  milímetros.
+- `kern.sweet_fb_scanout_diag` en ese momento: `pool: 4 of 4 slots in use, 31 surfaces made in it, 14 refused (full)`;
+  en 10 s, `copied instead: not from the pool` pasa de 4 681 a 4 733 y `plane to scaled` / `to unscaled` de 4 713 a
+  4 790 (unas cinco alternancias por segundo); `flushes not taken 0`.
+- Con `kern.sweet_fb_scanout=2` (superficies en el pool, salida por copia) los contadores de cambio de plano dejan
+  de crecer. Queda así.
+
+**Interpretación.** Con el pool lleno, una de las superficies de CoreAnimation queda fuera y sus frames salen por
+la copia: el plano alterna entre escalado y sin escalar varias veces por segundo, y como los dos caminos no colocan
+la imagen en el mismo sitio, cada cambio se ve como un salto. Hay dos defectos: el pool que se agota y el encuadre
+distinto de los dos caminos (18).
