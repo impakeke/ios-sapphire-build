@@ -41,3 +41,12 @@ el panel se apaga a los ~6 s si sigue en la pantalla de bloqueo.
 
 `swipetest.sh` no desbloquea el teléfono en el estado actual (verificado con capturas): sus gestos actúan sobre
 la pantalla de bloqueo.
+
+## Instalar un bundle del driver
+
+`bundle.sh NOMBRE` instala `rebuild/out/NOMBRE/HakiosMetal` por renombrado (archivo nuevo y `mv`). Copiar encima
+del archivo instalado deja el driver sin cargar si el binario nuevo es mayor que el primero que se cargó en ese
+arranque (el kernel guarda la firma en el vnode y dyld lo rechaza): CoreAnimation compone entonces por software
+(materiales planos, fondos difuminados oscuros con rayas, backboardd a varios núcleos, ninguna línea `fps:`).
+Comprobar siempre, tras reiniciar backboardd, que el driver está dentro: `ioreg -c SapphireGPU -r -l | grep
+IOUserClientCreator` debe nombrar a backboardd (`rebuild/gpu-tools/driver-en-uso.sh`).

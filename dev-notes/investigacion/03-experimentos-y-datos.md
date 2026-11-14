@@ -367,8 +367,8 @@ Mismo arranque que M4 (kernel 43612053690, `gpu_vco2=1 gpu_mhz=1260`). n=1 por c
   30,4 ms, commit→fin 21,5 ms, GPU ocupada 42 %; pasada principal en GMEM `draws 99-124 in 102 tiles`
   15,6-16,5 ms; pasadas `draws 39 in sysmem` 20,4-23,3 ms. Con `metal_defer=1` solo salió un periodo con
   movimiento (17,5 buffers/s, 81 µs por draw).
-- Con el binario heredado a 1260 MHz la consola no recogió ninguna línea `fps:` en dos ensayos (archivo de 0
-  bytes; causa sin mirar). La pantalla pinta bien (captura `medicion/shots/fin-0.png`).
+- Con el binario heredado a 1260 MHz la consola no recogió ninguna línea `fps:` en dos ensayos: el binario no
+  estaba cargado y CoreAnimation componía por software (causa en M8).
 - `kern.sweet_fb_diag` acumulado desde el arranque (~15 min): `swaps 6758 flips 5689 … overwritten 931`: el
   13,8 % de los frames entregados se pisó en el buffer trasero sin llegar al panel.
 - `kern.sweet_gpu_diag` acumulado: 5 520 submits; 8,91 s dentro de la llamada, de ellos 8,64 s en limpieza de
@@ -401,7 +401,8 @@ en caliente, con el teléfono caliente y en un ambiente caluroso: orientativo.
 - **Bundles del driver en la pantalla de la Biblioteca de Apps** (kernel 0338, 820 MHz, capturas
   `medicion/shots/hoja-blur.png`): `propio-args` pinta bien el fondo difuminado (2 de 2); `gpu-G1`, `gpu-G2`,
   `gpu-G3` y el binario heredado lo pintan oscuro y con rayas, y la barra de búsqueda blanca (1 de 1 cada uno).
-- A 1260 MHz fijos el teléfono se calienta y el usuario ve fallos gráficos; por eso la imagen en uso es de 820 MHz.
+- La imagen en uso es de 820 MHz. Los fallos gráficos y el calor vistos a 1260 MHz se dieron con el driver sin
+  cargar (M8); el comportamiento a 1260 MHz con el driver cargado está sin medir.
 
 **Interpretación.** Con la cola, todo frame entregado llega al panel (flips = swaps). Con el seguimiento de
 suciedad, la limpieza de caché por submit desaparece. Los buffers por segundo no cambian porque el límite sigue
@@ -421,12 +422,27 @@ Biblioteca de Apps, cuyo fondo es un blur del fondo de pantalla (`tools/perf/gls
 | binario heredado | el del port | mal, 1 de 1 (con este kernel) |
 
 "Mal": el fondo sale oscuro y verdoso con rayas verticales y bloques, y la barra de búsqueda translúcida sale
-blanca opaca; los iconos salen bien. Con los bundles de las dos ramas el arnés no recibe ninguna línea `fps:`
-por la consola (con `propio-args` sí). En una captura con `cpu-A-wip` la fecha y la hora del bloqueo salen en rojo.
+blanca opaca; los iconos salen bien. Con esos bundles el arnés no recibe ninguna línea `fps:` por la consola y
+backboardd consume el 250-590 % de CPU.
 
-**Interpretación.** El defecto es común a las dos ramas y no está en la base; no depende del cambio propio de
-cada rama (la de CPU no debería alterar el stream). Candidatos sin confirmar: la corrección del word de overflow
-de los flujos de visibilidad en A610, presente en ambas, o el procedimiento de build.
+**Interpretación.** En todas las filas "mal" el driver no está cargado: lo que se ve es CoreAnimation componiendo
+por software. `bundle.sh` copiaba el binario encima del archivo instalado (mismo vnode); el kernel conserva en el
+vnode la firma de código del primer binario cargado en ese arranque, y dyld rechaza todo binario cuya firma
+empiece más allá de la de aquel ("code signature does not cover entire file up to signature"). Offset de la firma
+(`LC_CODE_SIGNATURE dataoff`): `propio` 8 493 120, `propio-args` 8 493 280, `gpu-G1` 8 517 424, `gpu-G3b`
+8 518 192, `cpu-A-wip` 8 558 048, heredado 8 564 880 o más. En los arranques con 0338 y 0342 el primero cargado
+fue `propio-args`, el menor: por eso es el único que "pinta bien". Evidencia: reproducción en la Mac con la
+misma lógica de XNU y dyld (`rebuild/gpu-tools/cs-test/run.sh`, 3 de 3 por orden), y lectura en vivo de
+`ioreg -c SapphireGPU`: sin cliente de backboardd con `cpu-A-wip`, con cliente a los 17 s de reinstalar
+`propio-args` (informe 14, "Lo primero"). Consecuencias:
+
+- Ningún commit de las ramas `gpu-pass` y `cpu-draw` ha corrido aún en la GPU del teléfono; esta tabla no dice
+  nada de ellos.
+- Los fallos gráficos y el calor que el usuario vio a 1260 MHz con el binario heredado (M6, M7) coinciden con
+  este estado (composición por software a varios núcleos), no con la frecuencia de la GPU: la relación entre
+  1260 MHz y esos fallos queda sin medir.
+- `bundle.sh` instala ahora por renombrado (archivo nuevo y `mv`), y antes de capturar o medir hay que comprobar
+  con `rebuild/gpu-tools/driver-en-uso.sh` que backboardd es cliente de `SapphireGPU`.
 
 **Lecturas de Android en este teléfono** (Infinity-X, kernel 5.15.223, por adb sin root, ambiente caluroso;
 `research/metal/android/`): cpu0-3 son los núcleos pequeños (capacidad 433, hasta 1900,8 MHz) y cpu4-7 los A73
