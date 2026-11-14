@@ -13,7 +13,7 @@
   - `sweetfb_hz=120`;
   - `gpu_mhz=1260`;
   - `glwait=0`.
-- Muestreo de 2,5 min tras arrancar (`~/sapphire-angel/logs/cpu-0334-*`): load 4,8 → 2,1; ningún proceso de usuario dominante (cfprefsd ~12 %, notifyd ~4 %). Está incompleto: la sesión SSH se cortó.
+- Muestreo de 10 min (20 muestras cada 30 s) tras arrancar con 0334 (`~/sapphire-angel/research/logs-telefono/cpu-0334-*`): load de 1 min 4,8 → **1,1-2,6 en reposo** (8 núcleos); ningún proceso de usuario dominante (cfprefsd ~12 % al inicio, notifyd ~4 %). **No hay carga de fondo constante.** Falta medir *durante* el deslizamiento (picos/latencia), que es lo que importa para el stutter.
 - El kernel actual (0334) sale de CI con **Xcode 16**; el expG que el usuario usaba antes, de Apple clang 21. El usuario nota el teléfono más fluido hoy, sin medición. Candidatos: el compilador, las cachés de shaders ya completas tras muchos arranques, o percepción.
 
 ## Hipótesis a discriminar
