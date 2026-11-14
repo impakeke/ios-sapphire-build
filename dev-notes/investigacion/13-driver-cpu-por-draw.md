@@ -313,13 +313,13 @@ entre filas de menos de ~15 % no dicen nada con n=1. Dos A/B del coordinador sob
 35,3 buffers/s y sube commit→fin de ~28 a 43,8 ms: el trabajo del procesador de comandos por bin pesa;
 `metal_gmem_draws=6` no cambia nada medible en el home (44,2 y 48,2 buffers/s).
 
-[M] La fila de `merge-7` no es comparable con las de `todo`: es otro arranque, y las líneas `SWEET FB` del kernel
-(`ab-k353-merge7.fb`) dicen que ahí todos los frames pasan por la composición de GPU del kernel (248 a 326 de 248 a
-326 swaps por periodo), mientras que en `todo` casi ninguno (10 de 630). Con ello commit→fin es 16,0 ms y la GPU va
-al 81 % (7,6 ms y 43-46 % en `todo`). El ensayo que se le parece es `ab-k353-dirty-a` (49,9 buffers/s, 19 µs por
-draw, commit→fin 14,3 ms, GPU 71 %; por la hora, `merge-5`: no verificado). Qué opciones del kernel llevaba cada
-arranque no está verificado aquí. En `ab-k353-merge7.txt` los pipelines se hacen en 0,5-0,8 ms («2 of 2 stages from
-the cache») y no hay ninguna línea `refused`, `stands in for it` ni `specialise:`.
+[M] La fila de `merge-7` no es comparable con las de `todo`: es otro arranque y las líneas `SWEET FB` del kernel
+difieren (`ab-k353-merge7.fb`: «248 by the GPU» de 248 swaps en un periodo de 5 s; `ab-k353-todo-1.fb`: «10 by the
+GPU» de 630), es decir, las opciones de presentación del kernel no eran las mismas (qué cuenta cada contador: 18; no
+verificado aquí). En el ensayo de `merge-7` commit→fin es 16,0 ms y la GPU va al 81 %, frente a 7,6 ms y 43-46 % en
+`todo`. El ensayo que se le parece es `ab-k353-dirty-a` (49,9 buffers/s, 19 µs por draw, commit→fin 14,3 ms, GPU
+71 %; por la hora, `merge-5`: no verificado). En `ab-k353-merge7.txt` los pipelines se hacen en 0,5-0,8 ms («2 of 2
+stages from the cache») y no hay ninguna línea `refused`, `stands in for it` ni `specialise:`.
 
 ### 6.1 Por qué el teléfono iba ~13× más lento por draw que el host
 
@@ -568,18 +568,19 @@ attachment escrito, doble si mezcla). Las muestras son las que ese pase pasó la
 instantáneas `ZPASS_DONE` del contador de muestras, al empezar y al acabar (`:642-733`). Sin historia, sysmem solo con
 5 draws o menos (`:504-517`); con un draw que lee su target, GMEM siempre (`:548-554`).
 
-[O] `render::gmemWorth` (`src/render.cpp:2532`, `include/hakios-metal/render.hpp:574-580`) usa la misma desigualdad con D supuesto
-proporcional al número de draws y calibrado por `metal_gmem_draws=56`: supone ~1/23 de pantalla por draw, cierto para
-un home de iconos y 20 veces corto para capas a pantalla completa. Además la regla de apertura deja en sysmem, sin
-grabar para tiles, todo pase cuyo «semejante» tuvo menos de 28 draws en sus últimas 16 veces, sin saber si lleva un
-draw con fetch. Consecuencias medidas: las pasadas de 23-25 draws de §10.1 (8-11,7 ms en sysmem; por la fórmula de
-turnip con sus ~4 pantallas de muestras irían a tiles) y el pase final sobre la pantalla, que desde que se dibuja
-`luma_boost` lleva un fetch a pantalla completa y sale unas veces en 42 tiles y otras en sysmem según la historia de
-draws (`ab-k353-merge4-a.txt`: `draws 7 tiles 42 … touched 0x301` y `draws 11 … sysmem: its like had 11 draws`).
+[O] `render::gmemWorth` (`src/render.cpp:2532`, `include/hakios-metal/render.hpp:574-580`) usa la misma desigualdad
+con D supuesto proporcional al número de draws y calibrado por `metal_gmem_draws=56`: supone ~1/23 de pantalla por
+draw, cierto para un home de iconos y 20 veces corto para capas a pantalla completa. Además la regla de apertura deja
+en sysmem, sin grabar para tiles, todo pase cuyo «semejante» tuvo menos de 28 draws en sus últimas 16 veces, sin saber
+si lleva un draw con fetch. Consecuencias medidas: las pasadas de 23-25 draws de §10.1 (8-11,7 ms en sysmem; por la
+fórmula de turnip con sus ~4 pantallas de muestras irían a tiles) y el pase final sobre la pantalla, que desde que se
+dibuja `luma_boost` lleva un fetch a pantalla completa y sale unas veces en 42 tiles y otras en sysmem según la
+historia de draws (`ab-k353-merge4-a.txt`: `draws 7 tiles 42 … touched 0x301` y
+`draws 11 … sysmem: its like had 11 draws`).
 
 Lo que corresponde, y no está hecho: medir las muestras de cada pase como turnip (el contador ya se usa para las
-consultas de oclusión, `src/render.cpp`, con la espera que el A610 necesita), guardar la historia por clase de pase en
-la cola y decidir con D medido tanto al cerrar como al abrir.
+consultas de oclusión, `src/render.cpp:2280-2323`, con la espera que el A610 necesita), guardar la historia por clase
+de pase en la cola y decidir con D medido tanto al cerrar como al abrir. El diseño, en §11.6 c.
 
 ### 10.5 `metal_all=1`: por qué no se puede dar Metal a todo proceso por defecto
 
@@ -606,3 +607,603 @@ fences y colas por cliente con prioridad al servidor de ventanas; cuotas; caché
 semilla del sistema de solo lectura. No determinado: qué procesos abrieron el dispositivo en la tanda de prueba, si
 alguno aborta con él, y el coste real por proceso.
 
+### 10.6 El tirón de la primera vez: la espera por el compilador y la clave de especialización
+
+[M] Con `merge-5`, recién arrancado backboardd, la primera vez que se abre el selector de apps o el Centro de Control
+hay command buffers cuya codificación (creado → commit) dura cientos de milisegundos: 228,5 ms
+(`capturas-recientes/metal-trace-891-1.txt`, cb 13), 470,0 ms (`capturas-recientes-bocache/metal-trace-951-1.txt`,
+cb 15), 1 318,2 y 539,8 ms (`capturas-blur/metal-trace-800-1.txt`, cb 7 y 8) y 507,6 ms (`800-3`, cb 12). La segunda
+vez el máximo es 38-39 ms (`891-2`, `951-2`).
+
+Qué pasa [M, esas trazas; O, el código]:
+
+1. No es la compilación del pipeline que se crea: es la **espera por el compilador**. `compileStage` tomaba el cerrojo
+   del único compilador (`gCompilerLock`, `src/compiler.cpp:55`: ir3 guarda estado en el objeto compilador) antes de
+   mirar la caché de stages. Un pipeline con sus dos stages ya en disco —medio milisegundo de lectura— esperaba a lo
+   que otro hilo estuviera compilando. En `891-1`, cb 13: los diez encoders empiezan en 34 ms; a los +54 ms se crea
+   `PBGRABsovXm_TmuaA2Xhf_Ixrg_Isup` (dos variantes de la library, en caché) y tarda 172,8 ms: 54 + 173 = 227 de los
+   228,5 ms. En `800-1`, cb 7: tres esperas seguidas de 415-434 ms de pipelines en caché.
+2. Quién tiene el compilador: la cola en serie `hakios.metal.specialise` del plug-in (`CA.m:9234`), que compila el
+   shader genérico de CoreAnimation (`fixed_frag_lph_cpf`, 32 064 palabras de instrucciones) para cada contenido de
+   su `FragmentShaderConfig` de 52 B (N-17), 0,43-1,1 s cada vez (`specialise: … in 1104 ms`, `ab-k353-todo-1.txt`).
+3. Por qué compila con la caché caliente: de los 52 B la compilación lee 34. De los otros 18 —relleno entre campos,
+   campos que el shader no consulta y los cuatro últimos bytes— al menos los últimos no los escribe CoreAnimation y
+   traen restos del pool de buffers (`…003c003c`, `…0000803f`, `…d5e143`). La misma configuración llega con otra
+   basura, la clave (un hash de los 52 B) es otra y se compila otra vez: 25 contenidos distintos para 19
+   configuraciones en las trazas, y en la caché del teléfono (leída por ssh con `merge-5`) 1 313 ficheros, 377 de
+   ellos de exactamente 3 124 B, 153 de 3 252 y 142 de 2 988.
+4. Agravante [O]: cada pipeline genérico tenía 64 ranuras de especialización sin desalojo; llenas, todo contenido
+   nuevo se dibuja con el genérico sin especializar hasta reiniciar backboardd.
+
+Lo hecho:
+
+| Commit | Qué | Evidencia |
+|---|---|---|
+| `6594789` | `compileStage` (`src/compiler.cpp:1404`) mira la caché y sus semillas sin cerrojo; solo una compilación toma el compilador, y al tenerlo vuelve a mirar. `CompileTimes`/`takeCompileTimes` dicen por hilo cuántos stages salieron de la caché, cuántos se compilaron y cuánto se esperó. La consola lo imprime siempre (`linked …; made in X ms (N of M stages from the cache in A ms, K compiled in B ms after C ms waiting for the compiler)`) y la traza también (`pipe … stages cached compiled wait_ms load_ms cc_ms`; `commit … textures= surfaces= buffers= uploads= pipelines= copies=`, cada uno cuenta/ms/MB de lo hecho mientras se codificaba ese buffer) | [M] `merge-6`, `capturas-merge6/`: la codificación máxima al abrir recientes es 51,9 ms y en el Centro de Control 69,8 ms (n=1); ningún pipeline espera (`wait_ms` 0) ni compila |
+| `059f85d` | El plegado del buffer conocido (`foldKnownLoad`, `:264`) anota qué bytes leyó. El stage se archiva además en un índice por función (`<hash>.known` junto a los `.stage`: un registro por compilación con la máscara, los valores bajo la máscara y el nombre del fichero) y un buffer que coincide en los bytes leídos **es** ese stage (`knownIndexFind`, `:1338`; `knownIndexNote`, `:1381`). `CompiledStage::knownReads` lleva la máscara al llamante | [O] host, `stagecc` (§11.2): una configuración compila en 176 ms, la misma con otros bytes finales sale de la caché en 0,4 ms, otra configuración compila; quedan 2 `.stage` y un `.known` de dos registros. [O] teléfono, leído por ssh con `merge-7` instalado: un `.known` de 1 584 B = 11 registros de 144 B, los 11 con la misma máscara de 34 bytes, que es la que da el host |
+| `96d9bac` | Plug-in, `-hakiosProgramFor:offsets:count:` (`CA.m:9163`): cada ranura guarda la máscara de su programa (`hakios_metal_program_known_reads`) y un contenido que coincide con una ranura en esos bytes es esa ranura. 128 ranuras (`HM_SPEC_MOST`) y una línea de consola si se llenan. `metal_spec_mask=0` vuelve a comparar los 52 B | [M] `ab-k353-merge7.txt`: ninguna línea `specialise:` en 34 s de páginas del home, frente a 2 a 19 en cada una de las diez consolas anteriores del mismo ensayo (n=1). Sin prueba de host: el plug-in no se construye ahí |
+
+Los bytes que la compilación lee, de los 52 (host y teléfono): 0-2, 4-6, 8-10, 12, 16-18, 20-22, 24-26, 28, 32-37, 39 y
+41-47. No lee 3, 7, 11, 13-15, 19, 23, 27, 29-31, 38, 40 ni 48-51.
+
+Lo que queda en esos frames con `merge-6` [M, líneas `commit` de `capturas-merge6/`]. El modo de traza encarece la
+codificación (la mediana de un buffer con la traza puesta es 23-41 ms, frente a 2-6 ms sin ella en §6): los números
+valen para comparar buffers de una misma traza.
+
+| Traza, buffer | Codificación | Texturas (n / ms / MB) | Buffers (n / ms / MB) | Pipelines (n / ms) | Subidas, copias por CPU, superficies |
+|---|---|---|---|---|---|
+| `1093-1` (recientes, 1.ª vez), cb 11 | 51,9 ms, 103 draws | 0 | 1 / 0,60 / 2,41 | 2 / 1,00 | 0 |
+| `1093-1`, cb 15 | 43,0 ms, 107 draws | 2 / 10,77 / 0,13 | 0 | 3 / 1,19 | 0 |
+| `1093-2` (recientes, 2.ª vez), cb 69 | 46,8 ms, 136 draws | 2 / 8,30 / 0,20 | 0 | 1 / 0,44 | 0 |
+| `1093-2`, cb 39 | 41,0 ms, 125 draws | 2 / 19,54 / 0,13 | 0 | 0 | 0 |
+| `1093-3` (Centro de Control), cb 7 | 69,8 ms, 162 draws | 8 / 15,07 / 15,07 | 11 / 4,14 / 0,23 | 10 / 7,05 | 0 |
+| `1093-3`, cb 8 | 66,9 ms, 264 draws | 12 / 1,20 / 0,46 | 12 / 1,20 / 0,25 | 6 / 2,51 | 0 |
+
+Los pipelines salen de la caché en 0,3-3 ms cada uno. Lo que queda de «primera vez» es **crear texturas**: hasta
+10,8-19,5 ms en un buffer, y no en proporción al tamaño (dos texturas de 0,13 MB en 19,5 ms; ocho de 15 MB en 15,1 ms;
+en total 0,65, 1,29 y 5,43 ms por MB según la traza). Causa sin establecer: no hay medida de qué parte es la llamada
+al kernel que da la memoria, su mapeo o el resto de `-hakiosNewTextureWithDescriptor:` (`CA.m:4772`).
+
+[M] En las trazas de `merge-5` cuatro pipelines de módulo propio (N-01) tardan 433 a 891 ms en hacerse la primera vez
+(`TimgA2Xhfn_IsrcN3Oc3mtc4` 891, `TcimBpldA2Xhf_Isup` 455, `Tc33A2Xhf_IsrcM1` 435, `TcimBvcmA2Xhf_Icir` 433). Esas
+trazas no separan compilar de esperar al compilador, y con `merge-6` esos stages ya están en la caché de disco: cuánto
+cuesta compilar un módulo propio en el teléfono **no está medido**.
+
+Por qué una especialización cuesta 0,5-1 s [O, host i5-7500, `tools/stagecc.cpp` con el compilador nativo]:
+
+| Qué se compila | Resultado | Tiempo en host |
+|---|---|---|
+| El genérico (`frag.A2Xghfc`, función `fixed_frag_lph_cpf`, 81 768 B de bitcode) sin especializar | 32 064 palabras de instrucciones, las mismas que dice la consola del teléfono | 1,98-2,00 s (frontal 64-85 ms) |
+| El genérico para una configuración de 52 B | 128-256 palabras | 172-193 ms: 55-66 el frontal AIR→NIR, 7-12 el plegado de los bytes conocidos, 106-118 el resto (lowering e ir3) |
+| Una variante de la library (`frag.A2Xhf`, 3 844 B) | 32 palabras | 0,6-1,4 ms |
+
+El frontal recorre el módulo entero y el lowering también, antes de que la poda deje las 128-256 palabras: el coste
+no depende de la configuración. El teléfono tarda 0,43-1,1 s en lo mismo [M]: entre 2 y 6 veces el host. El uber crudo de
+`default.metallib` con las constantes de CoreAnimation ni siquiera compila en host («reads its render targets through
+slots past the 16 the table holds»): [H] en el teléfono Metal entrega en `bitcodeData` un módulo ya especializado.
+
+La caché del teléfono no hace falta vaciarla: los ~1 250 ficheros duplicados por la basura de relleno son inertes
+(4-5 MB) y vaciarla tiraría también los stages buenos (variantes y módulos propios), que se recompilarían en uso. Con
+la clave por bytes leídos cada configuración se compila una vez más, para crear su registro de índice, y no vuelve a
+compilarse.
+
+Lo que esto no resuelve: una configuración o un pipeline que no se ha visto nunca se sigue compilando en uso (en la
+cola de fondo, dibujando mientras tanto con el genérico de 32 064 palabras; o en el hilo de render, para un módulo
+propio). El requisito del usuario es que no se compile en uso; el diseño para cumplirlo, sin implementar, está en
+§11.6.
+
+### 10.7 La alineación declarada, las imágenes en client storage y N-12
+
+[M, coordinador] Con `merge-6` el widget de Calendario del home sale invisible y en la vista de widgets solo se ve el
+de Tiempo (`medicion/shots/hoja-r6.png`). Con `merge-5` y con `merge-7` se ven todos
+(`medicion/shots/hoja-vistas-m5-m.png`, `hoja-vistas-m7-m.png`: home, vista de widgets, Centro de Control y selector).
+
+[M, trazas] Lo que cambia entre `merge-5` y `merge-6` en los recursos que crea CoreAnimation, contando las texturas
+que nombran los command buffers de una traza del selector de apps (`891-1` frente a `1093-1`; una textura cuenta una
+vez por cada command buffer que la nombra):
+
+| | `merge-5` | `merge-6` |
+|---|---|---|
+| `label=com.apple.coreanimation.image` (memoria propia, subida con `replaceRegion`) | 2 941 | 0 |
+| `label=com.apple.coreanimation.image-client-storage` (`origin=buffer`: una textura sobre un buffer) | 1 539 | 4 345 |
+| Texturas con swizzle (`swizzled=1`) | 0 | 0 |
+
+[O] Lo único de `merge-6` que cambia lo que CoreAnimation pide son las respuestas de alineación de N-07 (`e22b881`);
+N-14 no interviene (ninguna textura pide swizzle). Y en este driver un buffer hecho con
+`-newBufferWithBytesNoCopy:` no es la memoria del llamante sino una copia hecha al crearlo (`CA.m:3817`; N-12): lo
+que esa memoria reciba después no llega a la GPU.
+
+[H] La cadena que explica el síntoma: con la alineación declarada CoreAnimation toma todas las imágenes como client
+storage; las que se rellenan después de crear el buffer —los bitmaps que dibuja otro proceso— se dibujan de la copia
+vacía. No está demostrado que los buffers bajo esas texturas sean *no-copy* (la traza no registra con qué llamada se
+hizo cada buffer; lo dice el nombre de la etiqueta), ni cuál de las respuestas lo dispara: QuartzCore solo pregunta
+`iosurfaceReadOnlyTextureAlignmentBytes` (19 §2.8); las lineales las usa Metal.
+
+Lo hecho (`96d9bac`): las respuestas van detrás de `metal_align` (`hm_align`, `CA.m:3659`), **apagadas**. Bit 1:
+`iosurfaceTextureAlignmentBytes` e `iosurfaceReadOnlyTextureAlignmentBytes`. Bit 2: `linearTextureAlignmentBytes`,
+`deviceLinearTextureAlignmentBytes`, `deviceLinearReadOnlyTextureAlignmentBytes` y
+`minimumLinearTextureAlignmentForPixelFormat:`. `metal_align=3` es `merge-6`. Sin el bit contesta la clase base
+(`-hakiosBaseAlignment:`, `CA.m:3677`). La primera cola de cada proceso imprime en consola las respuestas en vigor y
+la de la clase base para `iosurfaceReadOnlyTextureAlignmentBytes` (`CA.m:3736-3752`); `ab.sh` empieza a capturar
+después, así que esa línea no está en `medicion/ab/`.
+
+Lo que lo decide: `merge-7` con `metal_align=1`, `=2` y `=3`, mirando los widgets (`medicion/vistas.sh`). Lo que
+corresponde antes de volver a declarar la alineación: que un buffer *no-copy* comparta de verdad la memoria (el
+kernel tiene que mapear páginas del proceso en el espacio de direcciones de la GPU), que es N-12.
+
+Con las respuestas de la clase base un tercio de las imágenes ya llegan como client storage (la columna de
+`merge-5`): N-12 les aplica igual, y es candidata para cualquier defecto de imágenes que no se actualizan (§11.7, H5).
+
+### 10.8 Qué queda
+
+- **Parpadeo del widget de Tiempo cuando algo se le superpone** [M, observación del usuario con `merge-4`]. Sin causa
+  establecida. Hipótesis y pasos que la deciden, ninguno ejecutado: §11.7.
+- **Destellos de colores al abrir apps**: la traza no tiene nada mal formado; candidatos a la vista son los pipelines
+  sustituidos (corregido), la imagen de lanzamiento en ASTC 4×4 de 750×1624 y un relleno blanco opaco del 90 % bajo
+  una textura de 752×1626 mezclada durante 20 frames. Hace falta una captura de pantalla del frame del destello.
+- **No compilar en uso** (requisito del usuario): preparar antes de que aparezca la interfaz todo lo que deba
+  compilarse. Diseño en §11.6; nada implementado más allá de la clave correcta, que es su condición.
+- **N-12** (§10.7), y con ella N-07.
+- **Crear texturas en uso**: 10-20 ms en un buffer (§10.6); sin causa medida.
+- **Elección tiles/sysmem por muestras medidas** (§10.4, §11.6). No se toca hasta saber la causa del parpadeo, para
+  no taparla.
+- **Trabajo del procesador de comandos por bin** (§10.3, §11.6).
+- **N-02** (command buffer `Completed` con trabajo omitido): con N-03 servido no queda ningún rechazo en uso normal
+  (0 líneas `refused` en las consolas desde `merge-4`); marcar `Error` por defecto pide saber antes qué hace
+  CoreAnimation con un command buffer en error. **N-09** (un estado rechazado envenena el encoder): no aparece en
+  ninguna consola.
+- **N-05, N-06** (YCbCr y superficies no alineadas por copia de CPU al enlazar): activas en uso normal (las dos líneas
+  de aviso salen en todas las consolas; filas de 2 848 B). Lo conforme es leerlas en la GPU al ejecutar, con una
+  pasada propia antes del pase que las muestrea; no está hecho.
+- **Memoria de las texturas memoryless**: siguen teniendo filas (4,9 MB cada una a pantalla completa) para los pases
+  en sysmem; asignarlas solo cuando un pase en sysmem las necesita no está hecho.
+
+## 11. Relevo
+
+Esta sección basta para continuar el trabajo: el resto del informe es la justificación y las medidas. Reglas que
+siguen en vigor, del usuario y del coordinador:
+
+- El agente no instala nada en el teléfono ni lo reinicia: lo hace el coordinador con
+  `~/sapphire-angel/research/metal/medicion/bundle.sh` y mide con `ab.sh`. `ssh sapphire` se usa en solo lectura.
+- Equivalencia de streams en verde en cada commit; commits pequeños, comentados, que compilan y pasan las pruebas;
+  medir antes y después.
+- Nada de rodeos: se arregla lo que el driver incumple.
+- No cambiar la elección tiles/sysmem hasta saber la causa del parpadeo (§11.7).
+- Requisito de diseño del usuario sobre la compilación: «esto es un sistema operativo, no un juego: es aceptable y
+  normal que el encendido tarde, y no es aceptable compilar en uso. Todo lo que deba compilarse … se prepara antes de
+  que aparezca la interfaz: en la instalación o en el primer arranque (y tras cada actualización del driver), con la
+  pantalla de arranque puesta, fuera del hilo de render; en uso normal el driver solo lee su caché … Primero la clave
+  de especialización correcta (sin bytes de relleno), que es condición para que la caché sea finita.»
+
+### 11.1 Estado de la rama, los bundles y el teléfono
+
+- **Árbol**: `~/sapphire-angel/research/metal/rebuild/wt-cpu`, worktree del repositorio
+  `~/sapphire-angel/research/metal/hakios-xnu-kernel`. Rama `cpu-draw`, punta **`f58c688`**, árbol limpio: no hay
+  nada sin commit. `f58c688` es `96d9bac` más dos comentarios del plug-in, línea por línea: el código y los números
+  de línea son los de `96d9bac`. Base: `opcional-puerto` (`620950c`, worktree `rebuild/hakios-upstream`). Contiene
+  entera la rama `gpu-pass` (`fa8d36c`, worktree `rebuild/wt-gpu`, informe 14).
+- **Suite de host en la punta**: 284 pruebas sin fallos con las constantes de los dos chips, golden por las tres vías
+  y golden de las escenas con los stages del teléfono (`cpu-tools/tmp/final/check-tip.txt`, sobre `96d9bac`).
+- **Commits**: con la identidad genérica de los commits de la rama (`git log -1 --format='%an %ae'`, pasada con
+  `git -c user.name=… -c user.email=… commit`); mensaje en inglés: una frase que dice qué hace el driver, el porqué
+  con sus cifras y, si cambia el stream, qué líneas de golden cambian.
+- **Este informe** no tiene commit en el repositorio ios-sapphire y `INDICE.md` no lo recoge: lo hace el
+  coordinador.
+
+Bundles, en `~/sapphire-angel/research/metal/rebuild/out/NOMBRE/` (`HakiosMetal`, `Info.plist`, `COMMIT`):
+
+| Bundle | Commit | Bytes | sha256 | Qué añade | En el teléfono [M] |
+|---|---|---|---|---|---|
+| `cpu-A-wip` | `99279c0` + plug-in | 8 643 152 | `e992c97d409cc33f…` | Estado guardado por programa (§3.1-3.6, §3.8) | 142 → 59 µs por draw |
+| `merge-1` | `98d2c3c` | 8 685 328 | `ab3d6e8ec030f8db…` | Fusión con `gpu-pass` | 61-69 µs; 26 µs con la L2 viva |
+| `merge-2` | `6d3f273` | 8 708 032 | `e695290ca2247388…` | Reciclado, `appendStream`, cierre de pase sin asignaciones | 17-20 µs por draw |
+| `merge-3` | `4e0a51a` | 8 708 176 | `c8839e2ef6261c24…` | Corte de la grabación doble; `wrote`/`read` en `passes:` | 16 µs |
+| `merge-4` | `81dd364` | 8 767 408 | `27a9c4799a4ccaf6…` | Traza de frame, memoryless, N-03, N-01, N-24/N-08 | 0 `stands in for it`, 0 `refused`; c1 sin guardar |
+| `merge-5` | `4cf8232` | 8 767 408 | `7be356c2568827b3…` | N-18, N-04 | 55,1 / 58,3 buffers/s en la configuración «todo» |
+| `merge-6` | `6594789` | 8 770 800 | `42de530ce34d2a12…` | Caché sin cerrojo e instrumentación; N-07 con todas las respuestas a 64; N-14 | Tirón de primera vez 228-1 318 → 52-70 ms; **widgets de fondo opaco invisibles** (§10.7) |
+| `merge-7` | `96d9bac` | 8 774 448 | `b44a31f13264bae9…` | Índice por bytes leídos, ranuras por máscara, N-07 detrás de `metal_align` (apagado), `metal_swizzle=0` | Instalado. Pinta como `merge-5`; 0 `specialise:` en el ensayo del home |
+
+**Teléfono** [O, leído por ssh]: binario instalado con sha256 `b44a31f13264bae9…` y 8 774 448 B (`merge-7`);
+`/var/tmp/metal.args` vacío; caché `/private/var/db/hakios-metal-cache` con 1 348 `.stage` y un `.known` de 11
+registros. [M, coordinador] Capturas de `merge-7`: `medicion/shots/hoja-vistas-m7-m.png` (home, vista de widgets,
+Centro de Control, selector: como `merge-5`) y consola `medicion/ab/ab-k353-merge7.txt`.
+
+Lo que está hecho y **sin verificar en el teléfono**, y qué lo verifica:
+
+| Qué | Lo que se sabe | Lo que lo verifica |
+|---|---|---|
+| Ranuras por máscara del plug-in (`96d9bac`) | Sin prueba de host (el plug-in no se construye ahí). En el teléfono el índice del núcleo se escribe (11 registros), `merge-7` pinta bien las cuatro vistas y no hay líneas `specialise:` en 34 s de home (n=1) | Tras reiniciar backboardd, abrir cada vista dos veces con `metal_fps=1` y la consola desde el arranque: `specialise:` solo la primera vez de cada configuración. A/B con `metal_spec_mask=0` |
+| N-14, swizzle del descriptor (`e22d7bf`) | Ninguna textura lo pide en las trazas: el camino no ha corrido en el teléfono. El núcleo (`Texture::swizzled`) tiene sus pruebas de vistas con swizzle | Contenido que pida `MTLTextureDescriptor.swizzle`: la consola dice una vez `a texture was asked for with a swizzle of …` |
+| N-07 (`e22b881`, detrás de `metal_align`) | Apagado. Qué bit trae el client storage, sin establecer; que los widgets invisibles vengan de N-12 es [H] | `metal_align=1`, `2` y `3` con `merge-7` y `medicion/vistas.sh` |
+| N-18 (`4c3a83d`), N-04 (`4cf8232`) | Prueba de host. Van en el teléfono desde `merge-5` sin defecto atribuido; no hay caso conocido que los ejercite | N-18: un path con solapes propios dibujado con fetch en sysmem, con y sin `metal_gmem_off=8192` |
+| N-08 (`edr_scale` compilado tal cual, `81dd364`) | Ninguna traza trae un pipeline `edr_scale` | Contenido EDR |
+| Red de seguridad de N-01 (`hm_bitcode_nearest`) | No ha saltado: 0 `stand in for it` desde `merge-4` | `grep 'stand in'` en cada consola |
+| Coste de compilar un módulo propio en el teléfono | Sin medir (§10.6) | Vaciar un stage de módulo propio de la caché y leer `cc_ms` de su línea `pipe`, o la línea `linked … compiled in` |
+| Coste de crear texturas (10-20 ms en un buffer) | Medido el total por buffer, no el reparto | Cronometrar dentro de `-hakiosNewTextureWithDescriptor:` |
+| Rendimiento de `merge-7` frente a `merge-5` | Un ensayo, con otras opciones del kernel (§6) | n≥3 con las mismas opciones |
+
+### 11.2 Cómo construir y probar
+
+```sh
+R=~/sapphire-angel/research/metal/rebuild
+T=$R/wt-cpu/hakios-metal
+STAGES=~/sapphire-angel/research/metal/auditoria-userland/stage-cache/files   # 202 stages de la caché del teléfono
+
+# 1. Suite de host y golden, los dos chips. Verde = por chip: «284 tests, 0 failed checks» dos veces,
+#    «golden streams: the same -- from kept states (each draw checked, and unchecked) and written whole» y
+#    «golden streams of the phone's stages: the same, from kept states and written whole».
+$R/cpu-tools/check.sh 2>&1 | grep -v 'left out'
+make -C $T -f tools/dev.mk -j4 CHIP=a610 tests drawbench && $T/out/dev-a610/tests | tail -1      # un chip, sin golden
+
+# 2. Golden: comparar y, cuando el stream cambia a propósito, reescribir (decirlo en el commit)
+make -C $T -f tools/dev.mk -j4 CHIP=a610 check
+make -C $T -f tools/dev.mk -j4 CHIP=a610 golden && make -C $T -f tools/dev.mk -j4 CHIP=a635 golden
+$R/cpu-tools/check.sh --write                 # golden de las escenas S, T, U: cpu-tools/golden-stages-<chip>.txt
+
+# 3. drawbench: CPU por draw, y lo que recibe la GPU del fake
+$T/out/dev-a610/drawbench --scene STU --stages $STAGES 2>&1 | grep -v 'left out'
+$T/out/dev-a610/drawbench --gpu --scene SPQUV --stages $STAGES 2>&1 | grep -v 'left out'
+#    … --gpu admite --gmem-off BITS, --gmem-draws N y --no-memoryless
+$R/cpu-tools/measure.sh ETIQUETA && python3 $R/cpu-tools/table.py base A1-kept merge2 ETIQUETA
+$R/cpu-tools/ab-host.sh "ETIQUETA1 ETIQUETA2" KLSTU     # A/B de binarios en cpu-tools/bin/drawbench-ETIQUETA
+
+# 4. Bundle para el teléfono (unos 3 minutos; clang 18.1.8 y SDK de theos por $R/env.sh; firma ad hoc)
+cd $R && SRC=$R/wt-cpu IOS_EXTRA="-g" CACHE_BUILD=24ed84207640dc54c2b865f7 ./build-bundle.sh $R/out/NOMBRE \
+    > $R/cpu-tools/tmp/build-NOMBRE.log 2>&1; grep -c ' error' $R/cpu-tools/tmp/build-NOMBRE.log     # 0
+git -C $R/wt-cpu rev-parse --short HEAD > $R/out/NOMBRE/COMMIT
+D=$(mktemp -d); cp $R/out/NOMBRE/HakiosMetal $D/ && codesign -v $D/HakiosMetal && shasum -a 256 $D/HakiosMetal
+
+# 5. Solo comprobar que el plug-in compila (segundos, sin bundle)
+bash -c "source $R/env.sh; \"\$LLVM/clang\" -target arm64-apple-ios16.0 -isysroot \"\$SDK\" -O1 -fsyntax-only \
+    -DHAKIOS_METAL_GPU -I $T/include $R/wt-cpu/userland/src/HakiosMetalCA.m"
+
+# 6. El compilador del driver en host: Mesa nativo en $R/mesa/build-host, y tools/stagecc.cpp
+$R/cpu-tools/build-hostcc.sh                  # deja $T/out/host-cc/stagecc
+S=$T/out/host-cc/stagecc; V=$R/cpu-tools/variants
+$S $V/frag.A2Xghfc.metallib --list
+$S $V/frag.A2Xghfc.metallib fixed_frag_lph_cpf --runs 2          # el genérico sin especializar: 32 064 palabras
+A=000000000501060003000101ff000000000000000000000000000000ff00000000013600010100200000000000000000003c003c
+B=000000000501060003000101ff000000000000000000000000000000ff000000000136000101002000000000000000000000803f
+E=000000000501060003000101ff000000000000000000000000000000ff00000000013700010100200000000000000000003c003c
+$S $V/frag.A2Xghfc.metallib fixed_frag_lph_cpf --known 0 $A --runs 3   # especializado; imprime los bytes leídos
+export HAKIOS_METAL_CACHE=$(mktemp -d)        # con caché: A compila, B (otra basura en 49-51) sale de la caché,
+for k in $A $B $E $B; do $S $V/frag.A2Xghfc.metallib fixed_frag_lph_cpf --known 0 $k; done   # E (byte 34) compila
+ls -l $HAKIOS_METAL_CACHE; unset HAKIOS_METAL_CACHE              # 2 .stage y un .known de 288 B
+
+# 7. Trazas de frame y lectura del teléfono (solo lectura)
+python3 ~/sapphire-angel/research/metal/ios-graficos/trace/trace-frame.py TRAZA.txt [--draws] [--cb N] [--max-filas N]
+ssh sapphire 'ls /private/var/db/hakios-metal-cache | grep -c "\.known$"; cat /var/tmp/metal.args'
+```
+
+- **La clave de caché** (`CACHE_BUILD=24ed84207640dc54c2b865f7`, la de `propio-args`) se mantiene mientras lo que
+  `compileStage` produce para una misma entrada no cambie: `translate`, el lowering, los archivos de Mesa y el
+  tamaño de `Stage` y de `Kernel`. Si algo de eso cambia hay que construir **sin** `CACHE_BUILD` (el `Makefile` pone
+  entonces el hash de `src/compiler.cpp`, las cabeceras y Mesa): con la clave fija el teléfono cargaría stages
+  compilados de otra manera. A cambio, la primera sesión recompila todo en uso.
+- **El Mesa nativo** (`rebuild/mesa/build-host`, 84 MB) está configurado con las opciones de `build-mesa.sh` sin el
+  fichero de cross y con `rebuild/mesa/native-host.ini` (el clang del sistema); `build-host/meson-private/cmd_line.txt`
+  tiene la lista. Se reconstruye con `ninja -C $R/mesa/build-host` seguido de las 13 rutas de archivo que lista
+  `build-hostcc.sh`.
+- **Un `.known`**: registros de `2·L + 40` bytes para un buffer conocido de `L` bytes (144 B para los 52 de
+  CoreAnimation): la máscara (`0xff` donde la compilación leyó), los valores bajo la máscara y el nombre del fichero
+  del stage (`/` + 32 dígitos hex + `.stage`, relleno con ceros).
+- **Instalar y medir** es del coordinador: `medicion/bundle.sh NOMBRE` (instala por renombrado),
+  `medicion/ab.sh ETIQUETA "ARGS"` (escribe `/var/tmp/metal.args` con `metal_fps=1 ARGS`, reinicia backboardd, espera
+  28 s, calienta con una ronda y captura 34 s de consola durante `homeswipe 8`), `medicion/ab-sum.py`,
+  `medicion/vistas.sh NOMBRE`
+  (cuatro capturas de pantalla y hoja de contacto).
+
+### 11.3 Interruptores
+
+Se leen de los boot-args y, después, de `/var/tmp/metal.args` (`hm_bootargs`, `CA.m:130`), una vez por proceso.
+
+| Interruptor | Por defecto | Qué hace |
+|---|---|---|
+| `metal_fps=1`, `=passes`, `=draws` | apagado | Resumen cada 2 s; `passes` añade una línea por pasada (`CA.m:7264-7274`); `draws`, tiempo por programa en sysmem |
+| `metal_trace=frame` (`metal_trace_cbs=K`, `metal_trace_every=S`, `metal_trace_dir=DIR`) | apagado | `echo K > /var/tmp/metal.trace` vuelca K command buffers a `/var/tmp/metal-trace-PID-N.txt` (`CA.m:1438-1600`) |
+| `metal_skip=PALABRA` | — | Omite los draws cuya línea de traza contiene la palabra (`metal_skip=luma_boost`) |
+| `metal_keep=0` | 1 | Ningún draw desde estado guardado: mismo stream por el camino largo |
+| `metal_verify=1` | 0 | Cada draw de estado guardado se comprueba contra sí mismo escrito entero |
+| `metal_gmem_draws=N` | 56 | Listón de draws de `gmemWorth`. `0`: todo en sysmem. `1`: todo lo que puede, a tiles |
+| `metal_gmem=1` | 0 | Tiles también con `metal_gmem_draws=0`, eligiendo por tiempo de GPU medido. `metal_gmem=0` no existe: no hace nada |
+| `metal_gmem_off=BITS` | 0 | Refinamientos de los tiles fuera, por bits (`include/…/command.hpp:186-201`): 1 área entera, 2 todos los attachments, 4 fetch por barrera, 8 sin elección medida, 16 sin binning, 32 texturas nulas, 64 cuerpo sin grupos de estado, 128 sin salida temprana, 256 bins antiguos, 512 un bin por attachment, 1024 barreras en línea, 2048 todo ordenado, 4096 elegir solo por draws, 8192 fetch en sysmem sin orden entre primitivas (N-18 apagado) |
+| `metal_strict` | apagado | Un rechazo acaba el buffer en error; un módulo propio rechazado no se sustituye |
+| `metal_nospec` | apagado | Sin especialización del shader genérico |
+| `metal_spec_mask=0` | máscara | Las ranuras de especialización se comparan por los 52 B |
+| `metal_align=N` | 0 | Bit 1: respuestas de alineación de IOSurface a 64. Bit 2: las lineales. `3` es `merge-6` (§10.7) |
+| `metal_swizzle=0` | aplica | No aplica el swizzle del descriptor |
+| `metal_all=1` | solo backboardd | El dispositivo para todo proceso. No activar (§10.5) |
+| `metal_defer=1` | 0 | Grabación diferida en un hilo del núcleo; no optimizada ni medida aquí |
+
+### 11.4 Mapa del código tocado, por función
+
+Núcleo, el camino de un draw y el cierre de un pase (`src/render.cpp` salvo donde se dice; detalle en §3):
+
+| Función | Línea | Qué hace | Commit |
+|---|---|---|---|
+| `drawFacts`, `emitDraw<S>` | 1383, 1719 | Un draw en dos mitades: lo que decide el stream, y su emisión por grupos | `6f2e4e0` |
+| `buildState`, `ProgramState`, `StateCache` | 3513, 3292, 3328 | El estado de un programa en un tipo de pase, guardado por `Program::uid` | `afc2eca` |
+| `fastFacts`, `fastTables`, `emitFast` | 3663, 3851, 3922 | El draw desde estado guardado: reglas del draw, tablas escritas en sitio, grupos comparados con el `Cursor` | `afc2eca`, `343cc35` |
+| `DedupSink`, `Cursor`, `PassCache`, `DrawCache`, `packetsOf` | 3122, 3371, 3440, 3461, 3263 | Deduplicación al generar; lo último que tuvo el stream de cada grupo; cachés del pase y del command buffer | `afc2eca`, `343cc35`, `99279c0` |
+| `verifyDraw` | 4144 | `metal_verify=1`: el draw corto contra el largo | `afc2eca` |
+| `CommandBuffer::draw` | 4303 | Elige tiles/sysmem al abrir (regla «its like had N draws», 4517-4532), graba de las dos formas y adelanta la decisión (4880-4903); aplica `kSysmemFetchUnordered` (4587) | `6867870`, `4c3a83d` |
+| `CommandBuffer::closePass(next, kept)` | 5120 | Cierra el pase: `keptFor` (5133) y `loadStore` (5139) deciden qué attachment se carga y se guarda; un memoryless solo se guarda cuando el pase de Metal sigue en otro del núcleo | `db05cce`, `050c059` |
+| `gmemWorth` | 2532 | La desigualdad de turnip con D proporcional a los draws (§10.4) | `92ed3e7` (de `gpu-pass`) |
+| `pushedRanges` | 260 | N-03: un rango que pasa de las páginas del buffer se carga directo. En dispatch, `src/compute.cpp:373-400` | `c571fcd` |
+| `kEmptyScissor`; `drawFacts` 1673, `fastFacts` 3740, `drawArea` 2624 | 323 | N-04: scissor vacío (1,1)-(0,0); el draw no toca ningún bin | `4cf8232` |
+| `emitDraw` 1789, `emitFast` 4091 | — | N-18: `SINGLE_PRIM_MODE` para un draw con fetch en sysmem (`Options::fbReadOverlap`) | `4c3a83d` |
+| `appendStream` | 4191 | NOP y `append` | `316d077` |
+| `render::drawStates` | `src/gmem.cpp:158` | Los draws de un pase como grupos de estado; almacenamiento por hilo (`Work`, 107) | `db05cce` |
+| `Texture::setMemoryless`, `Texture::swizzled` | `include/…/texture.hpp:309`, `src/texture.cpp:890` | Marca memoryless; la vista con swizzle la conserva | `050c059`, `e22d7bf` |
+| `CommandQueue::checkVsc`, `takeSlab`, `commandBuffer`; `CommandBuffer::piece`, `finish` | `src/command.cpp:281`, `155`, `569`, `80`, `429` | Palabra de desbordamiento del VSC por chip; slabs sin poner a cero; reciclado entre command buffers | `b935418`, `1eedf93`, `99279c0`, `01ca4f6` |
+
+Núcleo, compilador y caché de stages (`src/compiler.cpp`; `include/…/compiler.hpp:83-160`):
+
+| Función | Línea | Qué hace | Commit |
+|---|---|---|---|
+| `compileStage` | 1404 | Caché y semillas sin cerrojo (`found`, 1417); `gCompilerLock` (55) solo para compilar; con y sin preámbulo; guarda el stage y su registro de índice | `6594789`, `059f85d` |
+| `stageCacheName` | 1180 | Nombre del fichero: hash de `kCacheBuild`, tamaños de `Stage` y `Kernel`, `iboBase`, bitcode, cada constante suministrada y el buffer conocido | heredado |
+| `stageCacheSave`, `stageCacheLoad`, `stageCacheFind` | 1216, 1254, 1305 | Formato del `.stage`; búsqueda en el directorio escribible y en las semillas | heredado, `6594789` |
+| `knownIndexName`, `knownIndexFind`, `knownIndexFindAnywhere`, `knownIndexNote` | 1327, 1338, 1365, 1381 | El índice `<hash>.known` por función y forma del buffer; búsqueda por máscara; alta de un registro en un solo `append` | `059f85d` |
+| `foldKnownLoad`, `KnownFold`, `translate` | 264, 260, 286 | El plegado anota los bytes leídos; `translate` cronometra frontal y plegado | `059f85d` |
+| `compileStageOnce` | 1472 | Una compilación (frontal, plegado, lowering, ir3) | heredado |
+| `takeCompileTimes`, `CompileTimes` | 1398; `compiler.hpp:153` | Tiempos por hilo desde la última consulta | `6594789`, `059f85d` |
+
+Interfaz C (`src/c_api.cpp`, declarada en `include/hakios-metal/hakios_metal.h`):
+
+| Función | Línea | Commit |
+|---|---|---|
+| `hakios_metal_texture_set_memoryless`, `hakios_metal_texture_memoryless` | 549, 553 | `050c059` |
+| `hakios_metal_cb_pass_access`, `hakios_metal_cb_pass_moved` | 987, 996 | `4e0a51a`, `050c059` |
+| `hakios_metal_program_specialize` | 1189 | heredado |
+| `hakios_metal_program_known_reads`, `hakios_metal_compile_times`, `hakios_metal_program_fs_traits` | 1271, 1278, 1293 | `059f85d`, `6594789`, `8707158` |
+| `drawCommon` (scissor vacío en 1566) | 1452 | `25ad496`, `4cf8232` |
+| `hakios_metal_draw_states`, `hakios_metal_cb_set_gmem_off` | 938, 913 | `afc2eca`, `gpu-pass` |
+
+Plug-in (`userland/src/HakiosMetalCA.m`, 10 724 líneas; no se construye en host):
+
+| Función | Línea | Qué hace | Commit |
+|---|---|---|---|
+| `hm_bootargs` | 130 | Boot-args y `/var/tmp/metal.args` | heredado |
+| Traza de frame: `hm_ft_mode`, `hm_ft_watch`, `hm_ft_take`, `hm_ft_pass`, `-hakiosFtFinish` | 1568, 1965, 2014, 2244, 6613 | `metal_trace=frame`; líneas `cb enc att tex pipe pblend draw dtex dsamp dbuf gpass commit` | `8707158` |
+| `hm_ft_work_began`, `hm_ft_worked` | 1518, 1524 | Cuenta/ms/MB de texturas, superficies, buffers, subidas, pipelines y copias para la línea `commit` (7805) | `6594789` |
+| `hm_bitcode_for_how`, `hm_bitcode_nearest` | 2821, 2861 | N-01: la variante exacta por la etiqueta de la función o del pipeline, si no el módulo propio con las constantes de CoreAnimation; la cercana solo si el compilador rechaza | `81dd364` |
+| `-newRenderPipelineStateWithDescriptor:error:` | 4367 | Las dos etapas del mismo origen (4394-4432); línea `linked … made in` con los tiempos del compilador (4534) | `81dd364`, `6594789` |
+| `hm_align`, `-hakiosBaseAlignment:`, las seis respuestas | 3659, 3677, 3687-3700 | N-07 detrás de `metal_align`; línea de consola en 3736-3752 | `e22b881`, `96d9bac` |
+| `-newBufferWithBytesNoCopy:…` | 3817 | N-12: copia al crear | heredado |
+| `-hakiosNewTextureWithDescriptor:`, `…iosurface:plane:` | 4772, 4909 | Creación de texturas; `hakios_metal_texture_set_memoryless` (4900); los puntos de entrada públicos (5096, 5105) aplican el swizzle | `81dd364`, `e22d7bf` |
+| `-hakiosConvertYCbCr`, `-hakiosRefreshShadow` | 5697, 5743 | N-05 y N-06: copias por CPU | heredado |
+| `-hakiosSwizzledBy:` | 5883 | N-14; `metal_swizzle=0` | `e22d7bf` |
+| Interruptores de los tiles: `hm_gmem_on`, `hm_gmem_off`, `hm_gmem_draws` | 7122, 7155, 7177 | Se aplican al crear el command buffer (6538-6549) | `gpu-pass` |
+| Línea `passes:` | 7264-7274 | `wrote read loaded stored` y el motivo de sysmem | `4e0a51a`, `81dd364` |
+| `-hakiosKeepFragment:constants:count:` | 9098 | Qué pipeline es «genérico» (fragmento de 4 096 palabras o más con un buffer de constantes de 256 B o menos); reserva de las ranuras | heredado, `96d9bac` |
+| `hm_spec_exact`, `-hakiosProgramFor:offsets:count:` | 9150, 9163 | Ranuras de especialización: coincidencia exacta, alias recientes, máscara; cola `hakios.metal.specialise` (9234) | `6c42baf`, `96d9bac` |
+| `hm_skip_word` | 9914 | `metal_skip` | heredado |
+| `-hakiosDraw:…`, `-hakiosDrawOnce:…` | 9868, 10176 | El draw; `_vsTexturesTold` (10252) | `6c42baf` |
+
+Herramientas y pruebas dentro de git (`hakios-metal/`): `tools/drawbench.cpp` (escenas A-H, J-L, P-R, V, W y, con
+`--stages`, S, T, U; `--gpu`, `--each`, `--golden`, `--long`, `--record`, `--cold`, `--no-memoryless`: opciones en
+1043-1057), `tools/stagecc.cpp`,
+`tools/dev.mk`, `tests/golden.hpp` y `tests/golden/{tests,drawbench}-{a635,a610}.txt`. Pruebas de §10.2:
+`tests/render_test.cpp:631` (scissor vacío), `:2161` (N-03), `:4460` (N-18), `:6507` (memoryless);
+`tests/draw_state_test.cpp:209` (scissor por la interfaz C) y los frames aleatorios de §4. Fake GPU:
+`include/…/fake_gpu.hpp:162` (`Stats::loadedPixels`), `src/fake_gpu.cpp:2012` (`reaches`).
+
+### 11.5 No conformidades de 19 §2.9: estado
+
+| N.º | Estado | Commit | Nota |
+|---|---|---|---|
+| N-01 | Hecha | `81dd364` | [M] 0 sustituciones desde `merge-4` |
+| N-02 | Pendiente, a propósito | — | Sin rechazos en uso normal; falta saber qué hace CoreAnimation con un buffer en `Error` |
+| N-03 | Hecha | `c571fcd` | [M] 0 `refused` desde `merge-4` |
+| N-04 | Hecha | `4cf8232` | Prueba de host; sin caso en el teléfono |
+| N-05, N-16 | Pendientes | — | YCbCr por copia de CPU: activa en uso normal. Diseño: convertir en la GPU, en una pasada propia, al ejecutar |
+| N-06 | Pendiente | — | Superficies de filas no alineadas (2 848 B) por copia de CPU: activa en uso normal. Mismo diseño |
+| N-07 | Hecha y apagada | `e22b881`, `96d9bac` | Depende de N-12 (§10.7); `metal_align` |
+| N-08 | Hecha | `81dd364` | `edr_scale` se compila como se pide; sin ejercitar |
+| N-09 | Sin tocar | — | No aparece en ninguna consola |
+| N-10, N-11, N-13, N-15, N-19, N-20, N-26 | Sin tocar | — | Fuera de lo que mostraron las trazas |
+| N-12 | Pendiente; es la causa probable de la regresión de `merge-6` | — | Buffers *no-copy* y texturas sobre buffer son copias al crear (§10.7, §11.6) |
+| N-14 | Hecha | `e22d7bf` | Sin ejercitar en el teléfono; `metal_swizzle=0` |
+| N-17 | Abierta; su coste está corregido | `059f85d`, `96d9bac` | La especialización sigue leyendo el buffer al codificar; lo corregido es la clave (bytes leídos) y la espera (§10.6) |
+| N-18 | Hecha | `4c3a83d` | `metal_gmem_off=8192` lo apaga |
+| N-22, N-35 | Sin tocar | — | Del kernel |
+| N-24 | Hecha | `81dd364` | `luma_boost` se dibuja en todos los frames |
+| Memoryless guardada (no numerada en 19) | Hecha | `050c059` | [M] `loaded 0x1 stored 0x1` |
+| Cerrojo del compilador antes de la caché (rendimiento) | Hecha | `6594789` | [M] §10.6 |
+
+### 11.6 Diseño pensado y no implementado
+
+Todo lo de esta sección es propuesta: [H] salvo los datos que se citan.
+
+**a) La clave de especialización.** Hecho: la clave son los bytes que la compilación lee, con índice por función
+(§10.6). Lo que falta de la clave:
+
+- `stageCacheName` (`src/compiler.cpp:1196-1199`) mezcla en el hash todas las constantes de función que se le
+  suministran, también las que el módulo no declara. `translate` (`:289-298`) solo aplica las que el módulo declara:
+  las demás no cambian el resultado y sí el nombre, y CoreAnimation suministra a cada función el juego entero de su
+  pipeline. Normalizar: mezclar solo las constantes que `air_module_function_constants` devuelve para el módulo, con
+  su valor final. Cambia los nombres de fichero: o se busca por el nombre nuevo y luego por el antiguo, o la caché
+  del teléfono deja de valer. Cuántos duplicados produce hoy en el teléfono no está medido.
+- Las 128 ranuras del plug-in no tienen desalojo: llenas, lo nuevo se dibuja con el genérico sin especializar hasta
+  reiniciar backboardd (la consola lo dice una vez). Corresponde desalojar la menos usada, cuidando que su programa
+  no se libere mientras un draw lo tiene entre manos: `-hakiosProgramFor:` devuelve el puntero sin retenerlo.
+- Mientras una configuración compila, cada variante de basura suya que llega toma una ranura propia y encola su
+  propia llamada, que sale del índice sin compilar cuando la primera acaba (0,4 ms en host). No cuesta
+  compilaciones; gasta ranuras.
+- El índice no tiene recogida: los `.stage` duplicados de antes siguen en el directorio, inertes.
+
+**b) No compilar en uso (el requisito del usuario).** Qué se compila hoy en uso: (1) cada configuración nueva del
+shader genérico, 0,43-1,1 s en la cola de fondo, dibujando mientras con el genérico de 32 064 palabras; (2) el módulo
+propio de cada pipeline que CoreAnimation crea en ejecución, la primera vez, en el hilo de render (coste sin medir);
+(3) las variantes de la library la primera vez, milisegundos cada una. Con la clave correcta el conjunto es finito:
+19 configuraciones en todas las trazas, 11 en el índice del teléfono tras los primeros minutos de `merge-7`. Diseño:
+
+1. *Guardar las entradas, no solo los resultados.* Al compilar un stage por primera vez se archiva lo que lo produjo
+   (bitcode, constantes, `iboBase`, binding y bytes conocidos bajo la máscara) junto al `.stage`. El bitcode de un
+   módulo propio solo existe cuando Metal lo entrega: sin guardarlo no se puede volver a compilar sin CoreAnimation.
+2. *Un paso de precompilación en el núcleo* que recorre las entradas y compila las que no tienen stage con la clave de
+   esta build (tras una actualización del driver, todas). Corre antes de que aparezca la interfaz, con la pantalla de
+   arranque puesta y fuera del hilo de render: de forma síncrona al crear el dispositivo en backboardd, antes de la
+   primera cola, o en un proceso lanzado antes de backboardd. Coste estimado con los tiempos medidos: 20-30
+   compilaciones de 0,5-1 s.
+3. *Semilla de instalación.* El driver ya lee `HAKIOS_METAL_CACHE_SEED` (`/redwood/share/hakios-metal-cache`, solo
+   lectura, `CA.m:608-609`, `:3419-3425`) después del directorio escribible, también para los `.known`. La semilla es
+   la caché (entradas y stages) de un teléfono tras un recorrido de la interfaz. Compilarla en host con `stagecc` es
+   posible si el stage sale idéntico byte a byte al del teléfono: `Stage` tiene la misma disposición LP64 en los dos,
+   pero la igualdad del resultado **no está verificada** (compilar las mismas entradas en los dos y comparar ficheros).
+4. *Abaratar cada especialización.* De los 172-193 ms de host, 55-66 son el frontal sobre el módulo entero y 106-118
+   el lowering sobre el shader entero. Guardar el NIR del genérico tras el frontal (una vez por módulo) y podar el
+   código muerto justo después del plegado, antes del lowering, dejaría cada configuración en el plegado más el
+   lowering de 128-256 palabras.
+5. *Lo que quede fuera.* Una configuración que ninguna semilla trae se compila en uso una vez y queda en las
+   entradas para el siguiente arranque. Cerrar el conjunto del todo pediría enumerar las configuraciones desde
+   CoreAnimation, que no está estudiado.
+
+**c) Tiles o sysmem por muestras medidas** (§10.4). No tocar hasta resolver §11.7. turnip toma dos instantáneas
+`ZPASS_DONE` del contador de muestras, al abrir y al cerrar el pase (`tu_autotune.cc:642-733`), y decide con las del
+mismo pase la vez anterior (`:541-640`). Aquí el contador ya se usa para las consultas de oclusión
+(`src/render.cpp:2280-2323`, con la espera que el A610 necesita) y la cola ya guarda historia por clase de pase
+(`CommandQueue::preferGmem`, `noteDraws`, `peakDraws`, `src/command.cpp:291-326`; `render::tuneKeyOf`). Falta: emitir
+las dos instantáneas en cada pase, leerlas al completarse el buffer, guardarlas por clase y dar a `gmemWorth`
+D = muestras × bytes por muestra de los attachments escritos (doble si mezcla), al cerrar y también al abrir, en
+lugar de «its like had N draws». Cambia el stream (tres paquetes al abrir y al cerrar): interruptor en
+`metal_gmem_off`, el fake tiene que modelar el contador, y los golden de todo pase cambian. Efecto esperado: las
+pasadas de 23-25 draws con capas a pantalla completa (8-11,7 ms en sysmem) pasan a tiles, y el pase final sobre la
+pantalla deja de alternar de modo.
+
+**d) Trabajo del procesador de comandos por bin** (§10.3; [M] pesa: con `metal_gmem_off=64` los buffers/s bajan de
+38,7-46,3 a 35,3 y commit→fin sube de ~28 a 43,8 ms, §6). En la escena S, de 897 K palabras: grupo de programa 2 661
+ejecuciones × 136 palabras, cargas 3 232 × 51, viewport 3 232 × 21, rasterizador 1 841 × 28, vértices 1 185 × 34,
+mezcla 873 × 33, pase 237 × 69, y 160 K fuera de grupos (cada tile lee los `CP_SET_DRAW_STATE` y el paquete de draw de
+los 110 draws aunque se salte 70).
+Caminos, sin medir ninguno: grupos idénticos entre draws consecutivos compartidos por dirección, para que el
+procesador no los repita (hoy todos van marcados `DIRTY`, `0a65a5b`; el porqué está en 14 §3.1); viewport y
+scissor en grupos separados; una lista de draws por bin hecha en la CPU con el área de cada draw (`render::drawArea`),
+que quita las 160 K. `drawbench --gpu` da las palabras por grupo de cada variante antes de ir al teléfono.
+
+**e) N-12: memoria compartida de verdad.** Un buffer *no-copy* tiene que ser las páginas del llamante: el servicio del
+kernel tendría que mapear memoria del proceso en el espacio de direcciones de la GPU (base y longitud alineadas a
+página, que es lo que Metal exige a quien llama) y mantenerla fijada hasta el deallocator. Refrescar la copia en cada
+uso no es viable con miles de imágenes por frame. Hasta entonces `metal_align` queda en 0.
+
+**f) Crear texturas en uso** (§10.6): medir primero dentro de `-hakiosNewTextureWithDescriptor:`; si es la llamada al
+kernel, reciclar la memoria de texturas liberadas como ya se reciclan los buffers (la línea
+`buffers: N made, M taken again from the pool` de la consola).
+
+**g) Memoria de las texturas memoryless**: asignar sus filas solo cuando un pase en sysmem las necesita.
+
+**h) `metal_all`**: análisis completo en §10.5; nada que hacer en el driver antes del aislamiento de direcciones en
+el kernel.
+
+### 11.7 Parpadeo del widget de Tiempo y destellos al abrir apps
+
+[M, usuario, con `merge-4`] El widget de Tiempo parpadea cuando algo se le superpone (un menú, un panel). No se sabe
+si ocurre con `merge-3`, `merge-5` o `merge-7`. El informe 20 (§4, «Parpadeo») aporta el contexto del lado de
+SpringBoard: al superponerse algo al home, SpringBoard cambia la vista viva del widget por su instantánea
+(«Requested mode changed to static») y al volver hace lo contrario («changed to live», «Create caar snapshot view»),
+sin relanzar el widget; el parpadeo estaría en cómo se dibuja ese cambio. Eso pone delante las hipótesis de imágenes
+y superficies leídas por copia (H4, H5). Hipótesis, todas [H]:
+
+- **H1. El mismo pase sale unas veces en tiles y otras en sysmem**, y los dos modos no dan lo mismo. [M] El pase
+  final sobre la pantalla sale `draws 7 tiles 42 … touched 0x301` y otras veces
+  `draws 11 … sysmem: its like had 11 draws` (`ab-k353-merge4-a.txt`); con `merge-7`,
+  `draws 5 in sysmem (its like had 5 draws at most lately)`. La regla de apertura decide sin saber que el pase lleva
+  un fetch. N-18 era un candidato de la diferencia entre modos.
+- **H2. El degradado del widget** es `PBGRAXm_TimgA2Xhfn_IsrcN3Oc3mtc4`, uno de los pipelines que desde `merge-4` se
+  compilan del módulo propio (antes, la variante sin ruido). [M] Su buffer 5 (`noise_scale`, un `half` de 2 B) va
+  seguido de bytes viejos del pool, distintos en cada buffer de frame (`8b3a…`, `d040…`): si el shader leyera más de
+  esos 2 B, el ruido cambiaría de un frame a otro. El fondo usa el mismo camino (`TimgA2Xhfn_Isrc`, de la library)
+  sin que nadie lo vea parpadear.
+- **H3. `luma_boost`** (se dibuja desde `merge-4`) con resultado distinto en sysmem y en tiles.
+- **H4. La copia por CPU de superficies de filas no múltiplo de 64 B** (N-06): 2 848 B = 712 px, el ancho de un
+  widget mediano. La traza lo dice en la línea `tex` (`shadow=1`).
+- **H5. N-12**: la imagen del widget como client storage, creada de nuevo en cada frame con una copia de memoria que
+  otro proceso está escribiendo. En una traza se ve si el `id` de la textura del widget (`origin=buffer`) cambia de
+  un frame al siguiente.
+
+Los pasos que lo deciden, **ninguno ejecutado** (los ejecuta el coordinador; un cambio cada vez en
+`/var/tmp/metal.args`):
+
+1. ¿Parpadea con `merge-3` instalado? Si no, es H2, H3 o lo de memoryless; si sí, H1, H4 o H5.
+2. Con `merge-4`: `metal_skip=luma_boost` (quita H3); `metal_gmem_draws=1` (todo lo que puede va a tiles: si deja de
+   parpadear es H1 con el lado sysmem malo); `metal_gmem_draws=0` (todo en sysmem: si el widget sale mal de forma
+   fija, confirma el lado sysmem).
+3. `merge-5` (o `merge-7`) tal cual y con `metal_gmem_off=8192`: si sin el interruptor no parpadea y con él sí, era
+   N-18.
+4. Una traza durante el parpadeo (`metal_trace=frame`; `echo 40 > /var/tmp/metal.trace` con el menú ya encima del
+   widget, sin tocar nada más) con la consola de ese rato y dos capturas de pantalla, una de cada estado. Con 40
+   buffers seguidos se ve si lo que CoreAnimation pide es igual frame a frame (entonces lo pone el driver: el modo del
+   pase, qué pipeline dibuja el widget, de qué textura) o si cambia.
+
+**Destellos de colores al abrir apps**: la traza de abrir Tiempo (`capturas/metal-trace-2079-2.txt`) no tiene nada
+mal formado. Candidatos a la vista: los pipelines sustituidos (corregido en `merge-4`), la imagen de lanzamiento en
+ASTC 4×4 de 750×1624 (`TimgA2Xhf_Ixrg`, solo en el primer frame) y un relleno blanco opaco del 90 % de la pantalla
+bajo una textura de 752×1626 mezclada durante 20 frames (cb 18-38). Hace falta una captura de pantalla del frame del
+destello, o `echo 90 > /var/tmp/metal.trace` con captura de pantalla a la vez, para casar el color con un draw. No se
+sabe si siguen ocurriendo con `merge-7`.
+
+### 11.8 Trampas
+
+- **`check.sh`**: su código de salida no es fiable; se miran las líneas. Las escenas con los stages del teléfono
+  imprimen cientos de líneas `left out`: `grep -v 'left out'`.
+- **El plug-in no se construye en host.** No tiene pruebas; solo la comprobación de sintaxis de §11.2 y el teléfono.
+  El build de iOS usa la libc++ 15 del SDK: lo que compila en host puede no compilar ahí.
+- **`CACHE_BUILD`**: sin él, cualquier cambio de cabecera cambia la clave y el teléfono recompila todo en uso; con
+  él, un cambio de lo que el compilador produce cargaría stages viejos (§11.2).
+- **Instalar por renombrado** (lo hace `bundle.sh`): copiar encima del binario cargado hace que dyld lo rechace y
+  CoreAnimation componga por software.
+- **`codesign -v` sobre `out/NOMBRE/HakiosMetal`** falla («code has no resources but signature indicates they must be
+  present») porque toma el directorio por un bundle: verificar una copia en un directorio vacío.
+- **`metal_gmem=0` no existe.** Todo en sysmem es `metal_gmem_draws=0`. El protocolo del parpadeo que tiene el
+  coordinador nombra `metal_gmem=0` en su paso 2: el interruptor correcto es el de §11.7.
+- **`ab.sh` reescribe `/var/tmp/metal.args`** en cada ensayo y empieza a capturar la consola unos 30 s después de
+  reiniciar backboardd: las líneas `HM_ONCE` y las de la primera cola (respuestas de alineación, interruptores en
+  vigor, primeras compilaciones) no están en `medicion/ab/`.
+- **El modo de traza encarece la codificación** (mediana de 15-41 ms por buffer frente a 2-6 ms): no comparar
+  tiempos de codificación de una traza con los de una consola.
+- **Variabilidad**: ensayos idénticos dan 38,7-46,3 buffers/s, y entre ensayos con opciones de presentación del
+  kernel distintas commit→fin va de 7,6 a 14-16 ms (§6). Comparar solo lo igual, con n≥3.
+- **El reloj del teléfono no es el de la Mac** (los ficheros de la caché del teléfono llevan otra hora): no casar por
+  hora de pared.
+- **Las cuentas de texturas de una traza** son por command buffer que las nombra, no texturas distintas.
+- **El fake GPU no rasteriza**: fragmentos, mezcla y tiempo de GPU no salen del host; palabras del CP, cargas, tiles y
+  megabytes movidos, sí.
+- **El uber crudo de `default.metallib` no compila en host** con las constantes de CoreAnimation; para medir se usan
+  los 451 módulos de variante de `cpu-tools/variants/` (sacados de `default.pipelinelib`).
+- **Mesa nativo**: con el clang 18 de conda no enlaza (LTO) ni compila contra la libc++ del SDK de macOS (pide
+  `__builtin_ctzg`); va con el clang del sistema. El `ld` de Apple no tiene `--start-group`: `build-hostcc.sh` enlaza
+  los archivos uno a uno.
+- **Scripts en bash**: zsh no parte en palabras las variables sin comillas.
+- **`Texture::sampledWords`** guarda el descriptor de una textura: quien cambie su buffer o su swizzle después de
+  crearla deja el descriptor rancio (`Texture::swizzled` crea otra textura, y por eso no lo sufre).
+- **Disco**: 14 GB libres en la Mac al escribir esto; `mesa/build-host` ocupa 84 MB y `wt-cpu/hakios-metal/out` 131 MB.
+
+### 11.9 Dónde está cada cosa
+
+Todo bajo `~/sapphire-angel/research/metal/` salvo este informe. Nada de esto está en git de ios-sapphire.
+
+| Ruta | Qué es |
+|---|---|
+| `rebuild/wt-cpu/` | El árbol de trabajo (rama `cpu-draw`): `hakios-metal/` (núcleo, pruebas, herramientas), `userland/src/HakiosMetalCA.m` (plug-in) |
+| `rebuild/build-bundle.sh`, `env.sh`, `build-mesa.sh` | Receta del bundle de iOS, entorno (clang 18.1.8, SDK), Mesa para iOS |
+| `rebuild/out/` | Bundles construidos (§11.1) |
+| `rebuild/mesa/build-host/`, `rebuild/mesa/native-host.ini` | Mesa nativo para el compilador en host |
+| `rebuild/cpu-tools/check.sh`, `measure.sh`, `table.py`, `ab-host.sh`, `build-hostcc.sh` | Suite completa; medidas de host y su tabla; A/B de binarios; `stagecc` |
+| `rebuild/cpu-tools/golden-stages-{a635,a610}.txt`, `each-base-a610.txt` | Golden de las escenas S, T, U; referencia de `drawbench --each` con el camino de draw de la base |
+| `rebuild/cpu-tools/variants/` | 451 módulos de variante de CoreAnimation (`frag.*.metallib`, `vert.*.metallib`): código de Apple, fuera de git |
+| `rebuild/cpu-tools/results/`, `bin/` | CSV de `measure.sh` (`base`, `A1-kept`, `merge2`); binarios de `drawbench` para A/B |
+| `rebuild/cpu-tools/stage-info.txt` | Qué hace cada stage de fragmento de la caché del teléfono con los attachments |
+| `rebuild/cpu-tools/tmp/` | Logs: `build-merge{4,5,6,7}.log`, `check-*.log`, `final/check-tip.txt`, `host-mesa-flags.txt`, `phone-known/phone.known` (el índice leído del teléfono) |
+| `auditoria-userland/stage-cache/files/` | 202 stages de la caché del teléfono, entrada de las escenas S, T, U |
+| `ios-graficos/qc-20H392/extract/System/Library/Frameworks/QuartzCore.framework/` | `default.metallib` y `default.pipelinelib/` (`functions`, `pipelines.desc`) del teléfono |
+| `ios-graficos/trace/trace-frame.py`, `LEEME.md` | Lector de trazas y formato |
+| `ios-graficos/trace/capturas/` | `merge-1` con el bundle de traza: home (`metal-trace-2079-1.txt`) y abrir Tiempo (`-2.txt`), con sus informes |
+| `ios-graficos/trace/capturas-blur/` | `merge-5`: Centro de Control y vistas con blur, recién arrancado (`metal-trace-800-{1,2,3}.txt`) |
+| `ios-graficos/trace/capturas-recientes/`, `capturas-recientes-bocache/` | `merge-5`: selector de apps, primera y segunda vez (`891-{1,2}`, `951-{1,2}`) |
+| `ios-graficos/trace/capturas-merge6/` | `merge-6`: recientes primera y segunda vez y Centro de Control (`metal-trace-1093-{1,2,3}.txt`), con los tiempos de pipelines y las líneas `commit` |
+| `medicion/ab/` | Consolas de cada ensayo (`ab-ETIQUETA.txt`), líneas del kernel (`.fb`) y CPU por proceso (`.cpu`): `ab-k352-merge3-b`, `ab-k353-merge4-a`, `ab-k353-todo-{1,2}`, `ab-k353-merge7`… |
+| `medicion/shots/` | Capturas de pantalla: `hoja-r5.png`, `hoja-r6.png` (la regresión de `merge-6`), `hoja-vistas-m5-m.png`, `hoja-vistas-m7-m.png` |
+| `medicion/bundle.sh`, `ab.sh`, `ab-phone.sh`, `ab-sum.py`, `vistas.sh`, `homeswipe.sh` | Instalar, ensayar, resumir y capturar: del coordinador |
+| `display/work/xnu-0350/` | El kernel leído para §10.5 (`SapphireGpu.cpp`) |
+| `~/Documents/ios-sapphire/dev-notes/investigacion/` | Este informe; 10 (auditoría de partida), 14 (`gpu-pass`), 19 (cómo dibuja iOS y la lista de no conformidades) |
