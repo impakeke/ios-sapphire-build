@@ -3,12 +3,15 @@
 #
 #   tools/sapphire-boot.sh [--readonly] [--console] [--amp] [--gpu-fw DIR] KERNEL [OUT.img] [extra boot-args]
 #
+# The cmdline below has no ufsroot=: the kernel then takes the partition named
+# userdata as the iOS root. On the dual-boot layout the iOS root is iosroot and
+# userdata is Android's: pass ufsroot=iosroot in the extra boot-args, or with
+# ufsrw=1 the kernel writes its console log over the end of Android's userdata.
 # --readonly drops ufsrw=1/rootrw=1: xnu cannot write the UFS at all (no
-# root writes, no persistent log), for test boots with Android still on
-# userdata.
+# root writes, no persistent log).
 # --console keeps the kernel text drawn over the GUI (sweetfb_noconsole=1 is
-# left out); without it the log is still in the ring at the end of userdata
-# (tools/sweet-log-pull.sh from recovery).
+# left out); without it the log is still in the ring at the end of the root
+# partition (iosroot on dual boot; tools/sweet-log-pull.sh reads userdata).
 # --amp lists all eight cores (gold P cluster + silver E cluster) and boots with
 # cpus=8: only for a kernel built with TOPAZ_4K=1 (4 KiB pages; silver has no
 # 16K granule).

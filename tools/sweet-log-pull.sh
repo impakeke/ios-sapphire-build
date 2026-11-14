@@ -2,7 +2,10 @@
 # Read the SWEET console log (kernel patch 0047) from a phone booted into
 # OrangeFox recovery (fastboot boot recovery/recovery.img; adb root shell).
 #   tools/sweet-log-pull.sh OUT.txt
-# Only reads: the last 1025 blocks (4 KiB) of the userdata partition.
+# Only reads: the last 1025 blocks (4 KiB) of the userdata partition. That is
+# the ring only when the iOS root is userdata (no ufsroot= boot-arg). On the
+# dual-boot layout the ring is at the end of iosroot (ufsroot=iosroot), and
+# userdata is Android's: this script then reads the wrong partition.
 set -eu
 out=${1:?usage: sweet-log-pull.sh OUT.txt}
 dev=$(adb shell 'for d in /dev/block/by-name/userdata /dev/block/bootdevice/by-name/userdata; do [ -e $d ] && readlink -f $d && break; done' | tr -d '\r')

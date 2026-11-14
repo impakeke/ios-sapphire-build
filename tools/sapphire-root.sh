@@ -7,7 +7,7 @@
 # Cryptex1,AppOS images from the iPhone10,3 16.7.16 (20H392) IPSW. WSL2's
 # stock kernel has no HFS+: pass an hfsplus.ko built for the running kernel
 # and it is loaded first. Output: OUTDIR/ios16-root.img and its sparse
-# OUTDIR/ios16-root.simg for `fastboot flash userdata`.
+# OUTDIR/ios16-root.simg. Dual boot: the root goes to iosroot; userdata is Android's data.
 set -euo pipefail
 
 [[ $# -ge 4 ]] || { sed -n '2,11p' "$0"; exit 2; }

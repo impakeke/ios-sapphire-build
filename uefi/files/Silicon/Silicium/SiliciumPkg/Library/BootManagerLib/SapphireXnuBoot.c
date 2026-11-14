@@ -5,7 +5,8 @@
   runs (the memory map reserves that range). When BDS finds nothing else to boot, this takes the
   shim (an arm64 Image with the XNU payload behind it, 4K aligned) and the phone's device tree
   out of it, leaves the boot services, cleans the caches and turns the MMU off, and enters the
-  shim at EL1 with x0 = the device tree: what ABL does after "fastboot boot". The shim then loads
+  shim at EL1 with x0 = the device tree: the same entry ABL gives a kernel it boots from boot_<slot>
+  or with "fastboot boot". The shim then loads
   XNU as it always has.
 
   Container: u32 'XNUP', u32 size (bytes after these 8), u32 shim offset, u32 shim size,

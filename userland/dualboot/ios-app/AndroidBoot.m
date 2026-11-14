@@ -6,6 +6,9 @@
  *   "Update Sapphire": the same slot switch, but the restart goes to that slot's recovery (OrangeFox; xnu 0311,
  *   kern.sweet_boot_android = 3), where the PC installer's update mode takes over (and makes iOS's slot
  *   active again when it is done).
+ * kern.sweet_boot_android activates the slot that is not active in the GPT, which is Android's only when
+ * iOS booted from its own active slot (the installed layout); after `fastboot boot` with Android's slot
+ * active it would activate iOS's slot instead (bsd/dev/sweet_ufs.c).
  * Spanish or English, as the phone's language.
  */
 #import <UIKit/UIKit.h>

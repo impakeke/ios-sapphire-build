@@ -1,5 +1,7 @@
 #!/bin/bash
 # Restart the phone (iOS on sapphire, kernel 0221+) into fastboot, recovery or the system:
+# "system" is a normal boot of the GPT's active slot, i.e. iOS again when iOS's
+# slot is active (the installed layout); it is not "boot Android".
 #   tools/sapphire-reboot.sh [bootloader|recovery|system]     (default bootloader)
 # Runs over the USB network from WSL; iOS shuts down cleanly (journal closed) first.
 set -e

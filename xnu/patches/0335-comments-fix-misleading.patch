@@ -1,0 +1,364 @@
+From: giovannipodesta
+Subject: [PATCH] xnu: 0335 — comments only: state what the code and the measurements say
+
+Comment-only. Rewrites comments that state facts contradicted by dev-notes/investigacion
+(01 audit, 03 measurements, 06): sweet_usb (boot-path state of the DWC3, delay() blocking,
+late-not-lost events, 0327/ud_watch reclaim, 0328 target, defaults of sweetusb_dp and
+sweetusb_utmipipe), sweet_reboot / SweetPlatformExpert (restart modes and how iOS boots),
+sweet_ufs (ufsroot=iosroot on dual boot, which slot kern.sweet_boot_android activates),
+caches.c (flush_dcache/clean_dcache are real on this board) and SWEET.h (topaz is ARMv8.0).
+The comment-stripped token stream of every file is identical before and after.
+---
+diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
+index 0628506..fffc033 100644
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -1,8 +1,9 @@
+ /*
+  * sapphire 0221: where a restart goes (SweetPlatformExpert::haltRestart). sysctl
+- * kern.sweet_reboot_mode = 0 system (Android, from the boot partition), 1 recovery, 2 bootloader
+- * (fastboot, the default: iOS is only ever started with fastboot boot); boot-arg sweet_reboot=N
+- * sets the default.
++ * kern.sweet_reboot_mode = 0 system: a normal boot of the GPT's active slot (boot_<slot>), which is
++ * iOS itself when iOS's slot is active (the installed layout flashes iOS into boot_<iOS slot>) and
++ * Android only after kern.sweet_boot_android switched slots; 1 recovery; 2 bootloader (fastboot),
++ * the default. Boot-arg sweet_reboot=N sets the default.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index ac14c92..5140cb6 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -8,7 +8,10 @@
+  * one at a time, to LUN 0. It finds one GPT partition by name (boot-arg
+  * ufsroot=, default "userdata") and exposes it as the BSD disk ufsroot0
+  * (rufsroot0), with 512-byte logical sectors over the device's 4 KiB blocks.
+- * Root on it with rd=ufsroot0.
++ * Root on it with rd=ufsroot0. On the dual-boot layout the iOS root is the
++ * "iosroot" partition and the boot-args must say ufsroot=iosroot: without it
++ * this takes Android's userdata as the iOS root and, with ufsrw=1, writes the
++ * console log over userdata's last 4 MiB + 4 KiB.
+  *
+  * All DMA goes through one physically contiguous allocation (descriptors and
+  * a 1 MiB bounce buffer); the host is not cache coherent, so caches are
+@@ -1182,6 +1185,9 @@ sweet_ufs_rootdev(dev_t *dev)
+  *
+  * kern.sweet_boot_android (anybody may write it; the iOS app does): 1 = the other slot (Android's) active,
+  * then reboot; 2 = the same without the reboot (a test). Reads: 'a' or 'b', the active slot, 0 unknown.
++ * "The other slot" is the one that is not active in the GPT, not the one iOS was loaded from: it is
++ * Android's only when iOS booted from its own active slot (the installed layout). After `fastboot
++ * boot` with Android's slot active, writing 1 makes iOS's slot active instead.
+  */
+ static int
+ ufs_write_slot_blocks(uint8_t lun, uint64_t lba, uint32_t count)
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 2e6cc65..ef8b41a 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1,14 +1,17 @@
+ /*
+- * SWEET: USB bring-up, step 1 - read-only state probe.
++ * SWEET: USB device. sweetusb=1 only reports the controller state, sweetusb=2 also starts the
++ * CDC-ECM gadget (sweet_usb_gadget_start).
+  *
+  * The phone's USB is a Synopsys DWC3 (USB 2.0 only, maximum-speed
+  * high-speed) behind Qualcomm's dwc-usb3-msm wrapper; its power domain is
+  * the USB30_PRIM GDSC and its clocks come from GCC. sapphire/topaz
+  * (SM6225 khaje): DWC3 at 0x04e00000, Synopsys femto HS PHY at 0x01613000
+- * (not read here), GCC offsets from Linux gcc-sm6115.c (the khaje GCC; the
++ * (only read, by the USBDIAG dump), GCC offsets from Linux gcc-sm6115.c (the khaje GCC; the
+  * USB30_PRIM GDSC at 0x141a004 matches the phone's DT). ABL uses this
+- * controller for fastboot; this probe only reports what state it is left
+- * in after `fastboot boot`. It never writes a register, and it touches the
++ * controller for fastboot, so what the driver finds depends on the boot path: after leaving
++ * fastboot (`fastboot continue`) the DWC3 is configured by ABL; on a normal boot of boot_<slot>
++ * it is at reset values and the USB3 PIPE clock is off (dev-notes/investigacion/03, E1/E2).
++ * sweet_usb_probe() itself never writes a register, and it touches the
+  * DWC3 / PHY register blocks only when the GCC status registers say their
+  * power domain and clocks are on (an access to a gated block would hang).
+  */
+@@ -171,12 +174,15 @@ sweet_usb_probe(void)
+ 
+ /*
+  * Step 2: USB device mode with only the default control endpoint, enough
+- * for the host to enumerate the phone (boot-arg sweetusb=2). ABL leaves
+- * the DWC3 powered, clocked, in device mode and halted, with the PHY set
+- * up, so only the device controller is restarted: soft reset, an event
++ * for the host to enumerate the phone (boot-arg sweetusb=2). On both boot paths the GDSC and the
++ * controller clocks are on when the driver starts; the DWC3 itself is only configured by ABL
++ * after fastboot, and on a normal boot it is at reset values with the USB3 PIPE clock off
++ * (investigacion/03, E1/E2). gadget_start therefore selects UTMI as the PIPE clock
++ * (sweetusb_utmipipe, default 1), then: device soft reset, an event
+  * buffer in our memory, endpoint 0, run. Events are polled from a kernel
+  * thread (no interrupt), like the UFS driver. DMA is not cache coherent
+- * (DT qcom,gsi-disable-io-coherency): buffers are cleaned/invalidated.
++ * (DT qcom,gsi-disable-io-coherency): ud_sync() cleans/invalidates (flush_dcache64 is a real
++ * dc civac in this build); data path v2 maps its area non-cacheable instead (R6).
+  * Register layout and the control-transfer state machine follow the
+  * Synopsys DWC3 databook as used by Linux drivers/usb/dwc3 (gadget.c,
+  * ep0.c).
+@@ -278,14 +284,15 @@ static struct {
+ 	bool        xfer_active[EP_INT + 1];
+ 	uint8_t     xfer_rsc[EP_INT + 1];
+ 	uint32_t    resets;
+-	/* transfers the controller finished without an event reaching us (ud_watch) */
++	/* old data path: transfers ud_watch took on HWO=0 before their event was seen; the event
++	 * still arrives later (events arrive late, they are not lost: audit 01 §4) */
+ 	uint32_t    lost_rx, lost_tx, stale_rx;
+ 	uint32_t    rx_rearms;      /* RX armed but silent, ended and armed again (ud_watch) */
+ 	uint32_t    halt_clears;    /* 0289: CLEAR_FEATURE(ENDPOINT_HALT) / SET_INTERFACE: sequence numbers reset */
+ 	uint64_t    watch_rx, watch_tx;
+ } ud;
+ 
+-/* 0330: sweetusb_dp=2 selects the data path v2 (below, before ud_thread); 0 = unchanged */
++/* 0330: data path v2 (below, before ud_thread); sweetusb_dp set to anything but 2 selects the old path */
+ /*
+  * 0332: data path v2 (0330) is the default; sweetusb_dp=0 selects the old path for an A/B.
+  * Evidence (dev-notes/investigacion/03, E4 / carga-1): 20 x 30 MB both ways intact, 0 refused
+@@ -336,7 +343,10 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ 	dwc_wr(DEPCMDPAR1(ep), p1);
+ 	dwc_wr(DEPCMDPAR2(ep), p2);
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+-	for (int i = 0; i < 5000; i++) {   /* 0328: raised from 1000 (ep cmd on the slow suspend clock) */
++	/* 5000 polls (0328). delay() blocks in this port (cpu_idle_latency is 0, so ml_delay_should_spin
++	 * is false): each delay(1) is a thread_block and the bound is not 5 ms. The old data path calls
++	 * this with ud.lock held (ud_tx_kick_locked, audit 01 D5); data path v2 spins instead (R5). */
++	for (int i = 0; i < 5000; i++) {
+ 		uint32_t v = dwc_rd(DEPCMD(ep));
+ 		if (!(v & DEPCMD_CMDACT)) {
+ 			uint32_t status = (v >> 12) & 0xf;
+@@ -636,9 +646,10 @@ ud_setup(void)
+  * 0289: the host reset a data endpoint's data toggle (CLEAR_FEATURE(ENDPOINT_HALT), or SET_INTERFACE,
+  * which resets every endpoint of the interface): the controller's sequence number must go back to
+  * DATA0 as well (DWC3 ClearStall does that), its transfer ended first and armed again after.
+- * Ignoring it left the bulk OUT one toggle off: every packet from the host was ACKed and thrown away
+- * as a retry, the link silent until the next bus reset. usbipd/Windows reset the pipe that way after
+- * a transfer it cancelled (a cdc_ether transmit timeout on the PC), which is how big copies died.
++ * usbipd/Windows reset the pipe that way after a transfer it cancelled (a cdc_ether transmit
++ * timeout on the PC). What ignoring it does to the link is not measured: a one-packet toggle
++ * mismatch resynchronises by itself (audit 01 §4, 0289); the measured dead link under load is
++ * 0327's double completion (investigacion/03 E-carga-1).
+  */
+ static void
+ ud_ep_reset_seq(unsigned ep)
+@@ -683,13 +694,14 @@ ud_rx_done(void)
+ 	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
+ 	ud_sync(UD_TRB_RX, 16);
+ 	/*
+-	 * 0291: the completion event can come before the controller's write-back of the TRB is visible
+-	 * (HWO still set). Returning there left RX unarmed for good -- the event had already marked the
+-	 * transfer inactive, so ud_watch did not look at it either -- and every bulk OUT from the host
+-	 * was NAKed from then on: the PC -> phone direction of the link died ("late rx" went up by one
+-	 * each time). Wait for the write-back; if HWO stays set the controller finished the transfer
+-	 * without writing the TRB back (that frame is lost): arm RX again at once (ud_rx_arm ends a
+-	 * transfer the controller still holds first).
++	 * 0291: the XferComplete for RX can find HWO still set in the RX TRB ("late rx"). The cause is
++	 * not established: the RX TRB shares a 64-byte cache line with the other TRBs (audit 01 D4),
++	 * and 0327's reclaim can consume one completion twice (audit 01 I5); a slow TRB write-back is
++	 * not shown. Returning without arming leaves RX unarmed (the event already marked the transfer
++	 * inactive, ud_watch skips it) and every bulk OUT from the host is NAKed. So: wait up to
++	 * 100 x delay(10) -- each one blocks the thread, delay() does not spin in this port -- and if
++	 * HWO is still set, drop that frame and arm RX again (ud_rx_arm ends a transfer the controller
++	 * still holds first).
+ 	 */
+ 	for (int i = 0; (t[3] & TRB_HWO) && i < 100; i++) {
+ 		delay(10);
+@@ -1015,10 +1027,12 @@ ud_event(uint32_t ev)
+ }
+ 
+ /*
+- * Every 500 ms: a data transfer the controller has finished (HWO clear in its TRB) while no
+- * event came for it, twice in a row with no frame moving. The link went dead that way under
+- * load (rx and tx counters frozen for half a minute, no USB event, back at the next bus reset):
+- * take the frame as if the event had come.
++ * Old data path only (ud_thread, sweetusb_dp other than 2). Every 500 ms: a data transfer whose
++ * TRB has HWO clear while its XferComplete has not been processed, twice in a row with no frame
++ * moving, is taken as if the event had come. That is not safe: events arrive late, they are not
++ * lost (audit 01 §4), so the late event consumes the same completion a second time (audit 01 I3,
++ * D1), and HWO=0 does not make a TRB available (Linux 51f1954ad853). Data path v2 never does
++ * this (R2, R7).
+  */
+ static void
+ ud_watch(void)
+@@ -1044,10 +1058,10 @@ ud_watch(void)
+ 	}
+ 	rx_seen = rx_idle;
+ 	/*
+-	 * RX armed (HWO still set) and not a frame in 2 s: the link died that way under load too --
+-	 * the host's bulk OUT never completing, its cdc_ether "transmit queue timed out" every 5 s,
+-	 * until usbipd gave the device up, while the phone's own frames kept going out. End the
+-	 * transfer and arm it again; on a link that is merely idle that costs nothing.
++	 * RX armed (HWO still set) and not a frame in 2 s: end the transfer and arm it again. This
++	 * also runs on a link that is merely idle and is not free there: each re-arm is a ForceRM End
++	 * Transfer with a fixed 100 us wait (audit 01 D6), and if the new Start is refused RX stays
++	 * dead until a bus reset (D7, D9).
+ 	 */
+ 	/* 0291: configured and no RX transfer at all (nothing armed): arm it */
+ 	static unsigned rx_unarmed;
+@@ -1132,12 +1146,14 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_usb_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLF
+     0, 0, sysctl_sweet_usb_stats, "A", "USB Ethernet gadget state");
+ 
+ /*
+- * 0327: reclaim a completed bulk transfer the instant its TRB HWO bit clears,
+- * on every poll (~1 ms) -- not only on the controller event, which gets lost
+- * under load (the link then froze until the next bus reset). HWO clear means the
+- * controller is done with the TRB, so taking it here is always safe; if the event
+- * does arrive, xfer_active is already clear and the handler ignores it. ud_watch
+- * keeps the slower force-rearm paths (HWO still set) on its 500 ms cadence.
++ * 0327, old data path only (sweetusb_reclaim=0 turns it off): on every poll, a bulk transfer
++ * whose TRB has HWO clear is taken as complete without waiting for its XferComplete. That is
++ * not safe. Events are not lost under load, they arrive late (hwo0_noevt_polls,
++ * investigacion/03 carga-1), and the handler does not ignore the late one: ud_event clears
++ * xfer_active/tx_busy and kicks again (audit 01 §1.1 I1, I5). The same completion is consumed
++ * twice and the next Start Transfer is refused with status 1 (No Resource): the dead link of
++ * E-carga-1. HWO=0 does not make a TRB available (Linux 51f1954ad853). Data path v2 (the
++ * default) does not reclaim on HWO (R2).
+  */
+ static void
+ ud_reclaim_fast(void)
+@@ -1164,8 +1180,8 @@ ud_reclaim_fast(void)
+ }
+ 
+ /*
+- * 0330: data path v2, boot-arg sweetusb_dp=2. With sweetusb_dp=0 or unset nothing below runs and the
+- * driver behaves as up to 0329 (same kernel for the A/B). Audit 01 (2026-11-14): §1 mechanism of the
++ * 0330: data path v2, the default (sweetusb_dp unset or 2). With sweetusb_dp set to any other value
++ * nothing below runs and the old path (ud_thread) is used (same kernel for the A/B). Audit 01 (2026-11-14): §1 mechanism of the
+  * dead link (observation B), §2 defects D1-D9, D13, D14, D16, §5 corrected design.
+  *
+  *  R1 Only ud_thread (here ud_dp_thread) touches the controller, the data TRBs and the endpoint state.
+@@ -1189,7 +1205,7 @@ ud_reclaim_fast(void)
+  *     never written again). sweetusb_dpnc=0 keeps it cacheable with clean+invalidate per line.
+  *  R7 A transfer whose TRB was written back (HWO=0) while no event came for DP_NOEVT_POLLS polls and
+  *     2 ms (the "alpha" signature, audit §1.7) is counted, snapshotted and ended; its frame is then
+- *     accounted from the TRB. That is the only way out of a lost event, and it goes through End Transfer.
++ *     accounted from the TRB. That is the only way out of an event that never comes, and it goes through End Transfer.
+  * No printf on the data path: counters and latched snapshots (first 8 and the last of each kind) are in
+  * sysctl kern.sweet_usb_dp.
+  */
+@@ -2100,9 +2116,8 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 
+ 	ud.dwc = dwc;
+ 	{
+-		/* 0333: default 2 chosen here, at the same point 0330 read the boot-arg, never as the
+-		 * variable's initial value: 0332's `static int ud_dp = 2` let the v2 paths run before
+-		 * gadget_start had set them up (hang on a normal boot, 2026-11-14 E5). */
++		/* sweetusb_dp: default 2, applied here where the boot-arg is read; ud_dp stays 0 until
++		 * this point. Any value other than 2 selects the old data path. */
+ 		int want = 2;
+ 		PE_parse_boot_argn("sweetusb_dp", &want, sizeof(want));
+ 		ud_dp = (want == 2) ? 2 : 0;
+@@ -2123,7 +2138,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	ud_if_create();
+ 
+ 	/*
+-	 * 0331 (E3, behind sweetusb_utmipipe=1; default 0 = unchanged): use the UTMI clock as the
++	 * 0331 (sweetusb_utmipipe, default 1; 0 disables): use the UTMI clock as the
+ 	 * PIPE clock, as Linux dwc3-qcom does for an HS-only controller (dwc3_qcom_select_utmi_clk,
+ 	 * binding qcom,select-utmi-as-pipe-clk: "disable USB3 pipe_clk requirement"). 0329 showed that
+ 	 * on a normal boot GCC gcc_usb3_prim_phy_pipe_clk (CBCR 0x1a058) reads 0x80000001 (enabled but
+@@ -2154,7 +2169,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 			}
+ 		}
+ 	}
+-	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
++	/* Device controller soft reset. The PHY and the global registers are not programmed here (only
++	 * GUSB2PHYCFG below and, in v2, GUCTL2): they keep what the boot path left, which on a normal
++	 * boot is reset values (investigacion/03 E2). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+ 	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+@@ -2166,10 +2183,11 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 
+-	/* 0328: endpoint commands (SETEPCONFIG) need the UTMI PHY awake. Clear GUSB2PHYCFG SUSPHY
+-	 * (bit 6) + ENBLSLPM (bit 8), as Linux dwc3 does around every ep command. Our boot path
+-	 * (set_active+reboot, not `fastboot boot`) can leave the PHY suspended, so SETEPCONFIG on ep0
+-	 * hung ("ep0 cmd timeout"), bring-up aborted, and the gadget never pulled up D+ / enumerated. */
++	/* 0328: clear GUSB2PHYCFG SUSPHY (bit 6) + ENBLSLPM (bit 8) once; Linux dwc3 clears them around
++	 * every ep command (data path v2 does too, dp_cmd). On a normal boot SUSPHY is already 0 and
++	 * ENBLSLPM is 1 (GUSB2PHYCFG 0x2500), but clearing them does not cure the ep0 SETEPCONFIG
++	 * timeout there: that comes from the USB3 PIPE clock being off, which the UTMI-as-PIPE
++	 * selection above fixes (investigacion/03 E1-E3). */
+ 	dwc_wr(0xc200, dwc_rd(0xc200) & ~((1u << 6) | (1u << 8)));
+ 	if (ud_dp) {
+ 		ud_dp_core_init();
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index a46c3e2..cc6f033 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -24,9 +24,10 @@ public:
+ /*
+  * sapphire 0221: restart and power off. Nothing set PE_halt_restart, so both did nothing and
+  * XNU panicked after unmounting. Restart writes the reboot reason ABL reads (PMIC PON spare)
+- * and asks PSCI for SYSTEM_RESET; halt is PSCI SYSTEM_OFF. iOS is started with fastboot boot,
+- * so a plain restart would come up in Android: the default is the bootloader (fastboot).
+- * kern.sweet_reboot_mode (or boot-arg sweet_reboot): 0 system, 1 recovery, 2 bootloader.
++ * and asks PSCI for SYSTEM_RESET; halt is PSCI SYSTEM_OFF. The default is the bootloader
++ * (fastboot). kern.sweet_reboot_mode (or boot-arg sweet_reboot): 0 system = a normal boot of the
++ * GPT's active slot (iOS when iOS's slot is active, as installed), 1 recovery, 2 bootloader.
++ * See bsd/dev/sweet_reboot.c.
+  */
+ extern "C" int sweet_spmi_set_reboot_reason(unsigned mode);
+ extern "C" int sweet_reboot_mode_get(void);
+diff --git a/osfmk/arm/caches.c b/osfmk/arm/caches.c
+index 9bbdac8..6c8ac8d 100644
+--- a/osfmk/arm/caches.c
++++ b/osfmk/arm/caches.c
+@@ -383,11 +383,10 @@ platform_cache_flush_wimg(
+ #else   /* __ARM_COHERENT_IO__ */
+ 
+ /*
+- * topaz/sweet: Apple SoCs keep DMA coherent with the CPU caches, so
+- * flush_dcache/clean_dcache stay no-ops (making them real slowed the whole
+- * kernel to a crawl: XNU calls them on every pmap/IOMD path). Drivers whose
+- * hardware reads DRAM behind the caches (the MDP scanout, DSI command DMA)
+- * call sweet_dcache_clean() on just their buffers.
++ * Only built with __ARM_COHERENT_IO__ (Apple SoCs, DMA coherent with the CPU caches), where
++ * flush_dcache/clean_dcache are no-ops. The SWEET/sapphire board config (SWEET.h) does not define
++ * __ARM_COHERENT_IO__, so this branch is not compiled for the phone: flush_dcache/clean_dcache
++ * (and flush_dcache64) are the real dc civac / dc cvac versions at the top of this file.
+  */
+ void sweet_dcache_clean(vm_offset_t addr, unsigned length);
+ 
+@@ -550,11 +549,10 @@ platform_cache_flush_wimg(
+ #endif  /* __ARM_COHERENT_IO__ */
+ 
+ /*
+- * topaz: cache maintenance that really happens. This kernel is built with the
+- * Apple SoC config (__ARM_COHERENT_IO__), where clean_dcache/flush_dcache are
+- * no-ops; the Qualcomm display (MDP), DSI command DMA and GPU SMMU read DRAM
+- * behind the caches, so their buffers are cleaned (dc cvac) or cleaned and
+- * invalidated (dc civac) to the point of coherency by these.
++ * topaz: cache maintenance by VA range, to the point of coherency, for the Qualcomm display
++ * (MDP), DSI command DMA and GPU SMMU, which read DRAM behind the caches: clean (dc cvac) or
++ * clean and invalidate (dc civac). Compiled in every config. On the phone (SWEET.h, no
++ * __ARM_COHERENT_IO__) flush_dcache/clean_dcache are real too, not no-ops.
+  */
+ void sweet_dcache_clean(vm_offset_t addr, unsigned length);
+ void sweet_dcache_flush(vm_offset_t addr, unsigned length);
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index cfeb976..ef5eb0f 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -1,6 +1,8 @@
+ /*
+  * Board config for the Redmi Note 10 Pro ("sweet", Qualcomm SM7150 /
+  * Snapdragon 732G): Kryo 470 = Cortex-A76 + Cortex-A55, ARMv8.2, no PAC.
++ * The same config builds the sapphire/topaz kernel (Qualcomm SM6225: Cortex-A53 +
++ * Cortex-A73, ARMv8.0: no PAN, no PAC).
+  *
+  * Generic ARM like BCM2837 (no APPLE_ARM64_ARCH_FAMILY: none of Apple's
+  * implementation-defined system registers exist), 16K pages and GICv3 like
+@@ -20,7 +22,8 @@
+ /*
+  * All eight cores as one homogeneous SMP cluster (topaz: four A53 at
+  * MPIDR 0x0-0x3 + four A73 at 0x100-0x103; sweet: six A55 + two A76):
+- * cpus=N is clamped here. Same ISA level (ARMv8.2), 64-byte lines, PSCI
++ * cpus=N is clamped here. Same ISA level within each phone (topaz/sapphire:
++ * ARMv8.0, no PAN; sweet: ARMv8.2), 64-byte lines, PSCI
+  * CPU_ON; the scheduler does not know the A76s are faster (no AMP/P-E
+  * clusters yet).
+  */
