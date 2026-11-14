@@ -1,0 +1,42 @@
+From: giovannipodesta <podestagiovannie@users.noreply.github.com>
+Date: Thu, 13 Nov 2026 00:00:00 +0000
+Subject: [PATCH] xnu: usb 0328 — wake UTMI PHY before ep commands + longer ep0
+ timeout
+
+On the set_active+reboot cold-boot path (the only one that works on this ABL;
+`fastboot boot` bricks), ABL can hand off with the DWC3 UTMI PHY suspended.
+SETEPCONFIG on ep0 then hangs ("ep0 cmd timeout"), bring-up aborts, and the
+gadget never pulls up D+ — the host (macOS ioreg) never sees idVendor 0x1209.
+
+Clear GUSB2PHYCFG SUSPHY (bit 6) + ENBLSLPM (bit 8) right after the device-
+controller soft reset, before the first DEPCMD, exactly as Linux dwc3 does
+around every ep command; and raise the ep-command poll bound 1000 -> 5000
+(the command runs on the slow suspend clock until the PHY is fully awake).
+
+Status: compiles + boots to lock screen (expG). USB still not enumerating in
+testing — see dev-notes/usb-status.md; next step is the persistent ring log.
+---
+--- a/bsd/dev/sweet_usb.c	2026-11-13 19:12:03
++++ b/bsd/dev/sweet_usb.c	2026-11-13 19:12:03
+@@ -270,7 +270,7 @@
+ 	dwc_wr(DEPCMDPAR1(ep), p1);
+ 	dwc_wr(DEPCMDPAR2(ep), p2);
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+-	for (int i = 0; i < 1000; i++) {
++	for (int i = 0; i < 5000; i++) {   /* 0328: raised from 1000 (ep cmd on the slow suspend clock) */
+ 		uint32_t v = dwc_rd(DEPCMD(ep));
+ 		if (!(v & DEPCMD_CMDACT)) {
+ 			uint32_t status = (v >> 12) & 0xf;
+@@ -1181,6 +1181,12 @@
+ 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+ 		return;
+ 	}
++
++	/* 0328: endpoint commands (SETEPCONFIG) need the UTMI PHY awake. Clear GUSB2PHYCFG SUSPHY
++	 * (bit 6) + ENBLSLPM (bit 8), as Linux dwc3 does around every ep command. Our boot path
++	 * (set_active+reboot, not `fastboot boot`) can leave the PHY suspended, so SETEPCONFIG on ep0
++	 * hung ("ep0 cmd timeout"), bring-up aborted, and the gadget never pulled up D+ / enumerated. */
++	dwc_wr(0xc200, dwc_rd(0xc200) & ~((1u << 6) | (1u << 8)));
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
