@@ -5,14 +5,15 @@
 ## 2026-11-14 (fork giovannipodesta): graphics
 
 Details, raw numbers and sources: `dev-notes/investigacion/` (`INDICE.md`; `03-experimentos-y-datos.md` M1-M10 for
-every measurement; reports 08-19). State and plan: `GPU-ROADMAP.md`; how to build, install and measure:
+every measurement, M1-M11; reports 08-19). State and plan: `GPU-ROADMAP.md`; how to build, install and measure:
 `dev-notes/OPERACION.md` §9. Kernels from the `xnu-4k` workflow: run 43612053690 (0336-0338), 43620776409
-(0339-0342), 43631168892 (0343, 0345-0347), 43632182225 (0344, 0348-0350).
+(0339-0342), 43631168892 (0343, 0345-0347), 43632182225 (0344, 0348-0350); 43635044868 also builds 0351-0352.
 
-Commits: 95675f9 (0336-0338), 6b978c8 (0339-0342), 82e5613 (0343, 0345-0347), a6f8ced (0344, 0348-0350);
+Commits: 95675f9 (0336-0338), 6b978c8 (0339-0342), 82e5613 (0343, 0345-0347), a6f8ced (0344, 0348-0350),
+067ef0b (0351-0352);
 6a2d013, 26f23c1, c365caa, 4ca01df (`tools/perf`: thread profiles, driver counters, A/B harness, screenshots, the
 home-screen load `homeswipe.sh`); 61800bc (`bundle.sh` installs by rename); the lab log entries 2c53d96, 9fadc07,
-52a01c4, 3241da2, 6a22f6b, fcf5e54.
+52a01c4, 3241da2, 6a22f6b, fcf5e54, cc84713.
 
 Image in use: `boot_a-0350-vco2-820.img`, boot-args
 `debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1
@@ -32,7 +33,9 @@ Patches (each new behaviour behind a sysctl or a boot-arg; defaults in `OPERACIO
 - 0343: clocks, DDR and the 16 temperature sensors, read only. 0344: cache maintenance before WFI as a switch
   (`kern.sweet_idle_cache`). 0345: GPU level changed at run time (`kern.sweet_gpu_khz`). 0346: GPU governor.
   0347: DDR vote by GPU level. 0348: GPU clock gating. 0349: display engine registers and flush latch, read only.
-  0350: direct scanout through VIG0's scaler (`kern.sweet_fb_scanout`).
+  0350: direct scanout through VIG0's scaler (`kern.sweet_fb_scanout`). 0351: nothing before WFI by default and the
+  right level bound in the set/way loops. 0352: scanout fixes and flips taken by `CTL_FLUSH`
+  (`kern.sweet_fb_flush_taken`). 0351 and 0352 are not yet tried on the phone.
 
 Observed (measured on the phone; small samples, n given):
 - `gpu_mhz=1260` alone runs the GPU core at 630.00 MHz (15/15 samples with `gxfreq`): it sets the PLL's VCO and the
@@ -51,7 +54,11 @@ Observed (measured on the phone; small samples, n given):
 - XNU cleaned and invalidated the A73 cluster's L2 before every WFI (439-518 µs per idle entry on CPUs 0-3, which
   are the A73 in XNU). With `kern.sweet_idle_cache=0` and `merge-1`: 25-26 µs per draw and 44.0-46.9 command
   buffers/s, against 62-68 µs and 29.6-31.6 with the maintenance (n=2 each, interleaved); 48.0 at 1260 MHz (n=1).
-  Commit to end of GPU work: 23.0-27.6 ms: the GPU is now the limit.
+  Commit to end of a command buffer: 23.0-27.6 ms.
+- GPU busy time from its own counter (`kern.sweet_gpu_marks=1`, 820 MHz, n=1): 8.3 ms per driver submit plus 4.15 ms
+  per scaled copy to the panel, 12.5 ms per frame. The render thread spends ~13.7 ms of CPU per frame and waits for
+  its next tick 23 % of the time. No single resource is saturated: the 23-27 ms commit-to-end is latency with
+  queueing, and what sets the frame rate is how CPU, GPU, copy and presentation chain.
 - GPU level changes at run time 820 → 1025 → 1260 MHz without errors (312 and 1344 µs a change). The governor
   drops to 320 MHz at rest.
 - DDR at 1555.2 MHz under iOS (7/7). At rest iOS sits about 20 °C above Android on the same phone (GPU 61.4-61.7 °C,
@@ -64,8 +71,8 @@ MB in 18-24 ms); `SWEET FB: 5 s … N by the GPU` counts swaps, not frames shown
 Unfinished:
 - With the GPU at 1260 MHz and the governor on: one SpringBoard SIGBUS and a wallpaper with misplaced blocks (n=1,
   no cause established); the image stays at 820 MHz fixed.
-- Where the 23-27 ms of GPU per frame go; 0351 (the lasting L2 fix) is written and not in the series; direct
-  scanout (0350), the DDR vote (0347) and clock gating (0348) not tried on the phone.
+- Frame pacing: remove the 4.15 ms copy (direct scanout, 0350 + 0352) and cut the GPU's 8.3 ms and the render
+  thread's CPU. 0351, direct scanout, the DDR vote (0347) and clock gating (0348) not tried on the phone.
 - Heat: kernel threads that poll wake the A73 cluster 3600-4100 times a second; `CalendarWidgetExtension` spins.
 - Coloured flashes when an app opens: not captured or traced. Radio images (`noradio`, control) not tried.
 - Reports 13, 18 and 19 are still being written.
