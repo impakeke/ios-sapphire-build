@@ -1,0 +1,172 @@
+From: giovannipodesta
+Subject: [PATCH] xnu: ufs 0334 — raw device read/write without physio (no kernel memcpy to user memory)
+
+Panic 2026-11-14 (black box), running as root on the phone
+`dd if=/dev/rufsroot0 bs=4096 skip=... count=1025`:
+
+  Kernel data abort. at pc 0xfffffff007be90b8 (memcpy+72), lr 0xfffffff0074e904c (sweet_ufs_strategy+604)
+  x0 0x00000001006f4000 x2 0xfe0 esr 0x9600004f far 0x00000001006f4000
+
+ESR: EC 0x25 (data abort, same EL), WnR=1, DFSC 0x0f (permission fault, level 3):
+a kernel store to a user page whose PTE was read-only at that moment.
+
+sweet_ufs_read/sweet_ufs_write went through physio(), which sets B_PHYS|B_RAW and puts the
+caller's user address in b_datap (kern_physio.c: buf_setflags / buf_setdataptr). For a buf
+without B_CLUSTER buf_map() returns b_datap unchanged (vfs_bio.c buf_map_range_internal),
+so sweet_ufs_strategy() memcpy'd device data straight into user memory (and out of it for
+writes). There is no PAN on Cortex-A53/A73 (patch 0081), so this works whenever the user
+PTE happens to be writable; but memcpy is not in copyio's recovery table, so any fault on
+that page -- including the ones the VM resolves routinely, e.g. the arm pmap's modified-bit
+emulation (writable pages entered read-only + MODFAULT) -- is driven against kernel_map by
+handle_kernel_abort() (osfmk/arm64/sleh.c), vm_fault fails and the kernel panics. Whether
+it faults depends on the VM state of the user page at that instant: hence intermittent.
+
+Fix: rufsroot0 read/write no longer use physio. sweet_ufs_rw() loops over the uio in
+chunks of at most BOUNCE_SIZE (1 MiB); under sweet_ufs_lock it runs the same
+ufs_read_blocks/ufs_write_blocks (with read-merge-write of partial device blocks) as the
+strategy routine, stages the data in a kalloc_data buffer, and moves it with uiomove()
+(copyout/copyin, faults handled) with the mutex dropped -- a fault there may page in from
+this same disk. Offsets must be multiples of the sector size (physio silently rounded
+them down); a read is cut at the end of the partition (0 bytes = EOF instead of EINVAL);
+a write that does not fit is refused whole before anything is written. The block path
+(buf cache, cluster I/O incl. direct I/O with B_PHYS|B_CLUSTER) is unchanged; the strategy
+routine now refuses a B_PHYS buf without B_CLUSTER (ENOTSUP) instead of memcpy'ing to it.
+The persistent console log area (last 4 MiB + 4 KiB, 0047) is read from disk as before.
+---
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index c454116..ac14c92 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -537,6 +537,16 @@ sweet_ufs_strategy(buf_t bp)
+ 	bool rd = buf_flags(bp) & B_READ;
+ 
+ 	buf_setresid(bp, count);
++	/*
++	 * sapphire 0334: a physio() buffer (B_PHYS without B_CLUSTER) points at user memory, which
++	 * buf_map() hands back as is. The raw device no longer sends any here (sweet_ufs_rw); refuse
++	 * one rather than memcpy to it. Cluster direct I/O (B_PHYS | B_CLUSTER, e.g. HFS uncached
++	 * reads) is fine: buf_map() maps its UPL into the kernel.
++	 */
++	if ((buf_flags(bp) & (B_PHYS | B_CLUSTER)) == B_PHYS) {
++		error = ENOTSUP;
++		goto done;
++	}
+ 	if (!rd && !su.writable) {
+ 		error = EROFS;
+ 		goto done;
+@@ -664,19 +674,108 @@ sweet_ufs_psize(__unused dev_t dev)
+ 	return su.ready ? (int)MIN(su.nblocks * UFS_BLOCK / su.secsize, INT_MAX) : -1;
+ }
+ 
++/*
++ * sapphire 0334: read/write of the raw device (rufsroot0). These used physio(), whose buf
++ * carries the caller's USER address; sweet_ufs_strategy() memcpy'd straight to/from it. That
++ * memcpy is not in copyio's recovery table, so any fault on the user page -- even one the VM
++ * resolves on every copyout, like the first write to a page mapped read-only to track the
++ * modified bit -- is driven against kernel_map and panics (osfmk/arm64/sleh.c,
++ * handle_kernel_abort). 2026-11-14: dd if=/dev/rufsroot0 bs=4096 ... -> data abort in memcpy
++ * from sweet_ufs_strategy, far 0x1006f4000, esr 0x9600004f.
++ *
++ * Now: chunks of at most BOUNCE_SIZE. The device I/O goes through the bounce buffer under
++ * sweet_ufs_lock exactly as in strategy (partial device blocks of a write are read, merged and
++ * written back); the data is staged in a kernel buffer and moved with uiomove() (copyin /
++ * copyout, faults handled) with the lock dropped, since such a fault may page in from this
++ * same disk. Offsets must be multiples of the sector size (physio silently rounded them down);
++ * a read is cut at the end of the partition (0 = end of file); a write that does not fit is
++ * refused whole, before anything is written.
++ */
+ static int
+-sweet_ufs_read(dev_t dev, struct uio *uio, __unused int ioflag)
++sweet_ufs_rw(struct uio *uio, bool rd)
+ {
+-	return physio(sweet_ufs_strategy, NULL, dev, B_READ, minphys, uio, (int)su.secsize);
++	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
++	uint32_t secsize = su.secsize;
++	off_t off = uio_offset(uio);
++	user_ssize_t resid = uio_resid(uio);
++	int error = 0;
++
++	if (!su.ready) {
++		return ENXIO;
++	}
++	if (!rd && !su.writable) {
++		return EROFS;
++	}
++	if (off < 0 || (uint64_t)off % secsize) {
++		return EINVAL;
++	}
++	if (resid <= 0 || (rd && (uint64_t)off >= part_bytes)) {
++		return 0;
++	}
++	if ((uint64_t)off > part_bytes) {
++		return EINVAL;
++	}
++	uint64_t total = MIN((uint64_t)resid, part_bytes - (uint64_t)off);
++	if (!rd && total < (uint64_t)resid) {
++		return EINVAL;
++	}
++
++	uint32_t bufsize = (uint32_t)MIN(total, (uint64_t)BOUNCE_SIZE);
++	char *kbuf = kalloc_data(bufsize, Z_WAITOK);
++	if (kbuf == NULL) {
++		return ENOMEM;
++	}
++	char *bounce = (char *)(su.dma + DMA_BOUNCE);
++	for (uint64_t done = 0; done < total;) {
++		uint64_t pos = (uint64_t)off + done;
++		uint64_t lba = su.first_block + pos / UFS_BLOCK;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want = (uint32_t)MIN(total - done, (uint64_t)(BOUNCE_SIZE - skip));
++		want = MIN(want, bufsize);
++		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
++
++		if (!rd && (error = uiomove(kbuf, (int)want, uio))) {
++			break;
++		}
++		lck_mtx_lock(&sweet_ufs_lock);
++		if (rd) {
++			error = ufs_read_blocks(lba, blocks);
++			if (!error) {
++				memcpy(kbuf, bounce + skip, want);
++			}
++		} else {
++			/* Partial device blocks at either end: read, merge, write back. */
++			if (skip || (want % UFS_BLOCK)) {
++				error = ufs_read_blocks(lba, blocks);
++			}
++			if (!error) {
++				memcpy(bounce + skip, kbuf, want);
++				error = ufs_write_blocks(lba, blocks);
++			}
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
++		if (!error && rd) {
++			error = uiomove(kbuf, (int)want, uio);
++		}
++		if (error) {
++			break;
++		}
++		done += want;
++	}
++	kfree_data(kbuf, bufsize);
++	return error;
+ }
+ 
+ static int
+-sweet_ufs_write(dev_t dev, struct uio *uio, __unused int ioflag)
++sweet_ufs_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+-	if (!su.writable) {
+-		return EROFS;
+-	}
+-	return physio(sweet_ufs_strategy, NULL, dev, B_WRITE, minphys, uio, (int)su.secsize);
++	return sweet_ufs_rw(uio, true);
++}
++
++static int
++sweet_ufs_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return sweet_ufs_rw(uio, false);
+ }
+ 
+ static const struct bdevsw sweet_ufs_bdevsw = {
