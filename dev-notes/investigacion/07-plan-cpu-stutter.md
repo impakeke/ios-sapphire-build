@@ -4,8 +4,8 @@ Pregunta: ¿la CPU es la causa de que el deslizamiento del home vaya lento y a t
 por falta de núcleos o de frecuencia. El hilo de render de CoreAnimation estaba saturado de CPU en la ruta de draw
 del driver Metal, y los A73 trabajaban casi sin L2 porque XNU la vaciaba antes de cada WFI. Con eso corregido, el
 hilo de render deja de estar saturado y ningún recurso lo está: por frame gasta ~13,7 ms de CPU y la GPU 12,5 ms
-(8,3 dibujando y 4,15 en la copia al panel), y los frames por segundo los fija cómo se encadenan (03 M11). El estado de gráficos y el siguiente trabajo están en [INDICE.md](INDICE.md) y en
-[../../GPU-ROADMAP.md](../../GPU-ROADMAP.md).
+(8,3 dibujando y 4,15 en la copia al panel), y los frames por segundo los fija cómo se encadenan (03 M11). El
+estado de gráficos y el siguiente trabajo están en [INDICE.md](INDICE.md) y en [../../GPU-ROADMAP.md](../../GPU-ROADMAP.md).
 
 | # | Hipótesis | Resultado | Evidencia |
 |---|---|---|---|
