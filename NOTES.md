@@ -2,6 +2,74 @@
 
 > From the section "Agent handoff / active work (2026-10-15, latest)" down, entries without the `sapphire:` prefix are about the earlier device, **sweet** (Redmi Note 10 Pro, SM7150), not sapphire.
 
+## 2026-11-14 (fork giovannipodesta): graphics
+
+Details, raw numbers and sources: `dev-notes/investigacion/` (`INDICE.md`; `03-experimentos-y-datos.md` M1-M10 for
+every measurement; reports 08-19). State and plan: `GPU-ROADMAP.md`; how to build, install and measure:
+`dev-notes/OPERACION.md` §9. Kernels from the `xnu-4k` workflow: run 43612053690 (0336-0338), 43620776409
+(0339-0342), 43631168892 (0343, 0345-0347), 43632182225 (0344, 0348-0350).
+
+Commits: 95675f9 (0336-0338), 6b978c8 (0339-0342), 82e5613 (0343, 0345-0347), a6f8ced (0344, 0348-0350);
+6a2d013, 26f23c1, c365caa, 4ca01df (`tools/perf`: thread profiles, driver counters, A/B harness, screenshots, the
+home-screen load `homeswipe.sh`); 61800bc (`bundle.sh` installs by rename); the lab log entries 2c53d96, 9fadc07,
+52a01c4, 3241da2, 6a22f6b, fcf5e54.
+
+Image in use: `boot_a-0350-vco2-820.img`, boot-args
+`debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1
+wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1
+sweettouch_rx=8640 sweettouch_ry=9600 sweetusb=2 gpu=3 gpu_delay=20 gpu_mmu=1 gpu_service=1 sweetfb_gpucopy=1
+sweetgl=1 modem=1 wifi=1 audio=2 gpu_div=1 sweetfb_direct=0 gpu_mhz=820 glwait=0 ipa=1 glenv=FD_MESA_DEBUG=sysmem
+sweetfb_scale=2 sweetfb_w=750 sweet_glload=1 qsee=1 sweetfb_hz=120 ufsroot=iosroot sweet_reboot=2 sweetmetal=2
+sweetsched=15 gpu_vco2=1`; `/redwood/boot.d/80-gfx.sh` sets `kern.sweet_fb_queue=1 kern.sweet_gpu_flush=1
+kern.sweet_idle_cache=0` at every boot. Metal driver: bundle `merge-1`, governor off, GPU at 820 MHz fixed.
+
+Patches (each new behaviour behind a sysctl or a boot-arg; defaults in `OPERACION.md` §9.6):
+- 0336: read-only diagnostics of the GPU driver and the presentation path (`kern.sweet_fb_diag`,
+  `kern.sweet_gpu_diag`). 0337: `gpu_vco2=1` programs `gpu_cc_pll0` as Android does, so `gpu_mhz` is the core
+  clock. 0338: an experiment that holds `SwapEnd` (no effect on this phone).
+- 0339: surface cache maintenance by account (`kern.sweet_gpu_flush`). 0340: presentation queue (`kern.sweet_fb_queue`).
+  0341: GPU SMMU TLB not invalidated after only mapping (on by default). 0342: per-client buffer cache.
+- 0343: clocks, DDR and the 16 temperature sensors, read only. 0344: cache maintenance before WFI as a switch
+  (`kern.sweet_idle_cache`). 0345: GPU level changed at run time (`kern.sweet_gpu_khz`). 0346: GPU governor.
+  0347: DDR vote by GPU level. 0348: GPU clock gating. 0349: display engine registers and flush latch, read only.
+  0350: direct scanout through VIG0's scaler (`kern.sweet_fb_scanout`).
+
+Observed (measured on the phone; small samples, n given):
+- `gpu_mhz=1260` alone runs the GPU core at 630.00 MHz (15/15 samples with `gxfreq`): it sets the PLL's VCO and the
+  core runs at half. With 0337 and `gpu_vco2=1`, 1260.00 MHz (3/3) and 820.00 MHz.
+- The Metal driver builds from source on the Mac (HackiOS's `hakios-metal` at `63fc2b4` plus the fork's A610
+  patches; report 08). Copying a bundle over the loaded binary left the driver unloaded whenever the new binary's
+  code signature started further into the file: CoreAnimation then composed on the CPU. The striped dark blurs
+  belong to that state, and so most likely do the faults and heat seen at 1260 MHz earlier in the day (03 M8; their
+  relation to 1260 MHz is not measured). Installing by rename fixes it.
+- Render thread with the inherited binary at 630 MHz: 84-90 % CPU, 46-60 % of it in the driver's draw path, 126 µs
+  per draw, ~150 draws per frame, main pass 20-24 ms of GPU (n=3).
+- Kernel 0342 on the home screen: frames drawn and never shown 10.6 % → 0 with the queue, cache maintenance per
+  submit 1.70 → 0.01 ms with the account (n=1 each).
+- Driver branches at 820 MHz (n=1 each): `cpu-draw` 59 µs per draw and 29.4 command buffers/s against 142 µs and
+  22.3 for the base; `gpu-pass` main pass 13.3-13.5 ms in 78 tiles against ~22 ms in 102.
+- XNU cleaned and invalidated the A73 cluster's L2 before every WFI (439-518 µs per idle entry on CPUs 0-3, which
+  are the A73 in XNU). With `kern.sweet_idle_cache=0` and `merge-1`: 25-26 µs per draw and 44.0-46.9 command
+  buffers/s, against 62-68 µs and 29.6-31.6 with the maintenance (n=2 each, interleaved); 48.0 at 1260 MHz (n=1).
+  Commit to end of GPU work: 23.0-27.6 ms: the GPU is now the limit.
+- GPU level changes at run time 820 → 1025 → 1260 MHz without errors (312 and 1344 µs a change). The governor
+  drops to 320 MHz at rest.
+- DDR at 1555.2 MHz under iOS (7/7). At rest iOS sits about 20 °C above Android on the same phone (GPU 61.4-61.7 °C,
+  CPU 64.8-67.5 °C against 41-43 and 42-48).
+
+Inherited claims that do not hold: "the GPU is bound by memory bandwidth" (report 11 §9: the main pass moves under 25
+MB in 18-24 ms); `SWEET FB: 5 s … N by the GPU` counts swaps, not frames shown, and its times print 0 with
+`sweetfb_scale=2` (report 09).
+
+Unfinished:
+- With the GPU at 1260 MHz and the governor on: one SpringBoard SIGBUS and a wallpaper with misplaced blocks (n=1,
+  no cause established); the image stays at 820 MHz fixed.
+- Where the 23-27 ms of GPU per frame go; 0351 (the lasting L2 fix) is written and not in the series; direct
+  scanout (0350), the DDR vote (0347) and clock gating (0348) not tried on the phone.
+- Heat: kernel threads that poll wake the A73 cluster 3600-4100 times a second; `CalendarWidgetExtension` spins.
+- Coloured flashes when an app opens: not captured or traced. Radio images (`noradio`, control) not tried.
+- Reports 13, 18 and 19 are still being written.
+
 ## 2026-11-14 (fork giovannipodesta): iOS USB on a normal boot, a data path that survives load (patches 0329-0334)
 
 Details, raw numbers and sources: `dev-notes/investigacion/` (`INDICE.md`; `03-experimentos-y-datos.md` for
