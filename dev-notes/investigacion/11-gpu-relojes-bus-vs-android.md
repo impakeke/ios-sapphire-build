@@ -16,7 +16,7 @@ Convenciones: **G123** = línea 123 de `iokit/Kernel/arm/SapphireGpu.cpp` recons
 1. **O (medido). El núcleo de la GPU corre a 630,00 MHz, no a 1260.** 15 muestras de 15 con `gxfreq`
    (03 M3): los contadores de ciclos del CP y del RBBM contra el contador de 19,2 MHz. `gpu_mhz=1260`
    programa el **VCO** de `gpu_cc_pll0` a 1260 MHz; el reloj del núcleo sale de `OUT_MAIN`, que es el VCO
-   dividido por 2.
+   dividido por 2. **Con 0337 y `gpu_vco2=1 gpu_mhz=1260` el núcleo corre a 1260,00 MHz** (medido, 3 de 3).
 2. **O (fuentes y binarios del teléfono). Android consigue 1260 MHz con el VCO a 2520 MHz.** La cadena
    completa, con el posdivisor ÷2 y el RCG en ÷1, está en los módulos del `vendor_boot` de este teléfono
    (`gpucc-khaje.ko`, `clk-qcom.ko`) y en el código de stock (§4). El valor de `USER_CTL` y el del RCG que
@@ -97,6 +97,11 @@ clock gating de la GPU (§11), así que los contadores cuentan siempre.
 **O (03 M3, kernel 0334, `gpu_mhz=1260 gpu_div=1`).** 3 ejecuciones de `gxfreq 200 5`, 15 muestras: los
 dos contadores dan **630,00 MHz** en las 15; ventanas de 200-300 ms, 20-21 ticks entre las dos lecturas
 del always-on de una misma muestra.
+
+**O (kernel de CI 43612053690 con 0336 + 0337 + 0338, imagen `gpu_vco2=1 gpu_mhz=1260`).**
+`kern.sweet_gpu_pll` da `gx_gfx3d 1260000 kHz` (`l 131 alpha 4000`, `user_ctl 0100010f`) y `gxfreq` mide
+**1260,00 MHz** en 3 de 3. Arranca a la primera con esa imagen, sin pasar por los pasos intermedios de la
+escalera de §8.
 
 No hay otra forma de leerlo en caliente con el kernel 0334-0335: ningún sysctl expone registros de GPUCC
 (`kern.sweet_audio` solo llega al códec, a los amplificadores y a TLMM). Lo que sí queda en el ring de
@@ -285,7 +290,8 @@ Todos los valores de `gpu_mhz` menos 1260 dejan la GPU **más lenta** que `gpu_d
 `git apply` en orden tras 0336 (`xnu-serie/`) y también sobre 0335 solo; ninguno de sus hunks toca los de
 0336. Lo nuevo se ha compilado y ejecutado en el anfitrión contra registros simulados
 (`parche/work/harness.cpp`: L y alpha de los diez OPP, lectura de vuelta, tope por bin, voto rechazado,
-PLL sin bloqueo, corriente de pico con y sin *danger*). Dentro de xnu lo compila el CI.
+PLL sin bloqueo, corriente de pico con y sin *danger*). Compila en el CI (kernel 43612053690) y, con
+`gpu_vco2=1 gpu_mhz=1260`, el teléfono arranca y el núcleo mide 1260,00 MHz (§3).
 
 **Elección de interfaz.** `gpu_vco2=1` hace que `gpu_mhz` sea la frecuencia del núcleo. Por defecto vale
 0 y no cambia nada: una imagen con la cmdline actual sigue a 630 MHz al actualizar el kernel, y el
@@ -561,7 +567,7 @@ calcula.
 | # | Qué | Predicción | Estado |
 |---|---|---|---|
 | X1 | `gxfreq` con `gpu_mhz=1260` | 630 MHz | **Hecho: 630,00 MHz, 15/15** (03 M3) |
-| X2 | Escalera de 0337 (§8): `gxfreq`, `kern.sweet_gpu_pll`, tiempo de la pasada principal | `gxfreq` = N; tiempo ∝ 1/N si manda el reloj | Pendiente |
+| X2 | Escalera de 0337 (§8): `gxfreq`, `kern.sweet_gpu_pll`, tiempo de la pasada principal | `gxfreq` = N; tiempo ∝ 1/N si manda el reloj | **Paso 6 hecho: 1260,00 MHz, 3/3**, arranque a la primera. Sin hacer: pasos 1-5 y el tiempo de la pasada en cada frecuencia |
 | X3 | Misma pasada con el kernel actual a 300, 600 y 630 MHz (`gpu_div=2`, `gpu_div=1`, `gpu_mhz=1260`) | ∝ 1/f | Pendiente |
 | X4 | Periodo del reloj del DDR (0x447d220), con `kern.sweet_gpu_clocks` de 0339 | 478 ps si está a 2092 MHz | Pendiente (necesita 0339) |
 | X5 | `membw` × 4 con QoS de interfaz | S ≥ 4 GB/s si el DDR está en los niveles altos | Pendiente |
@@ -585,3 +591,37 @@ calcula.
 
 Los informes [09](09-auditoria-kernel-gpu.md) (§ energía y tabla final) y
 [10](10-auditoria-rendimiento-hakios-metal.md) dan la GPU "a 1260 MHz": vale la frecuencia medida aquí.
+
+## 15. Estado al cerrar (14 de noviembre de 2026)
+
+**Terminado.**
+- La causa: `gpu_mhz` programaba el VCO y el núcleo iba a la mitad. Medido antes (630,00 MHz, 15/15) y
+  después (1260,00 MHz, 3/3 con 0337 y `gpu_vco2=1`).
+- La cadena de Android para este teléfono, de kgsl al PLL, con sus niveles de raíl, de bus y de corriente
+  de pico (§4), y la tabla Android frente a iOS (§6, §11).
+- 0337 en `xnu/patches/`, compilado en el CI y arrancado a 1260 MHz.
+- El borrador 0339 (relojes medidos, DDR incluido, y resto de `hw_init`), que aplica sobre 0001-0338 y
+  está sin compilar en xnu y sin probar en el teléfono.
+
+**A medias.**
+- La escalera de §8: solo está hecho el paso de 1260 MHz. Faltan los intermedios y, sobre todo, el
+  **tiempo de la pasada principal a 630 y a 1260 MHz**, que es lo que dice si la hipótesis de §9 (coste por
+  tile al ritmo del reloj, 18-24 ms → 9-12 ms) es cierta.
+- Del arranque a 1260 MHz no están recogidas en este informe las líneas del log: el speed bin leído del
+  fusible, si el RPM aceptó el nivel 464 de VDD_CX y el 416 de VDD_MX, y si los dos votos de `cx_ipeak`
+  quedaron como `taken`.
+- El ring del log no se pudo leer desde esta sesión (`/dev/ufsroot0` ocupado).
+
+**Siguiente paso, por orden.**
+1. **Tiempo de la pasada principal** con `metal_fps=1` a 1260 MHz frente a 630 (misma animación, n ≥ 3), y
+   las líneas `SapphireGpu` del ring de ese arranque (bin, votos de raíl, votos de pico).
+2. **Temperatura.** Nada baja el reloj ni vigila el calor, y Android solo sostiene 1260 MHz y el nivel 464
+   bajo carga. Antes de dejar `gpu_vco2=1` como valor por defecto hace falta una prueba larga a 1260 MHz
+   con la temperatura a la vista, y decidir si el valor de uso es 1260 o 1114,8 MHz (nivel 416).
+3. **Votos de pico.** Comprobar en el log que se toman, probar con el módem transmitiendo, y medir si
+   tenerlos puestos de forma permanente recorta la potencia del módem (H de §8).
+4. **DDR/BIMC.** Compilar 0339 y leer `kern.sweet_gpu_clocks`: el periodo del DDR (478 ps = 2092 MHz) y los
+   relojes de `gcc_bimc_gpu_axi` y `gcc_gpu_memnoc_gfx`. Si el DDR no está al máximo, el traspaso de
+   `clk-smd-rpm` (voto máximo en todos los relojes del RPM y después activar el escalado), en un parche
+   aparte.
+5. Los A/B menores de 0339: `gpu_mal=1` y `gpu_hwcg=1`.
