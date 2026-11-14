@@ -2,18 +2,33 @@
 """scrub.py IN.tar OUT.tar.gz: the overlay as it may be given to anyone.
 
 - /var/jb/etc/master.passwd keeps every account but its password hash becomes '*' (locked; set one on the
-  phone with `passwd`); sshd's host keys go (each phone makes its own).
+  phone with `passwd`); /var/jb/etc/passwd the same. libiosexec looks users up only in pwd.db/spwd.db
+  (NOTES.md, 2026-10-23), so those two are never copied from the phone: they are made again here from the
+  scrubbed master.passwd with tools/mkpwdb (MKPWDB=path, or tools/mkpwdb, or mkpwdb in PATH), every account
+  locked. Without mkpwdb the scrub stops: an old spwd.db carries the reference phone's hash, and a missing one
+  leaves sshd and PAM knowing nobody. sshd's host keys go (each phone makes its own).
 - Third-party jailbreak packages are not ours to redistribute: their files (dpkg's lists) and dpkg records
   go; testers install them from Sileo (the repos stay). Also the ones the user did not want (AIM, BoldersReborn).
 - Per-phone data goes or becomes a placeholder the recovery fills in for the phone being installed:
   the sensors' factory calibration (/var/root/sensfiles/mnt: copied from that phone's persist, read-only)
-  and the Bluetooth address (@BDADDR@, made from that phone's serial number).
+  and the Bluetooth address (@BDADDR@, made from that phone's serial number): every file named bdaddr
+  becomes the placeholder, and the address it held is replaced wherever else it appears.
 Members are copied byte for byte otherwise (numeric owners, modes, links).
+Last, the written overlay is read back: any crypt hash ($1$, $2a/b/x/y$, $5$, $6$, $y$) in any file, or a
+reference phone's Bluetooth address, deletes OUT and exits 1.
 """
-import io, re, sys, tarfile
+import io, os, re, shutil, subprocess, sys, tarfile, tempfile
 
 SECRET = 'private/var/jb/etc/master.passwd'
-DEVICE_BDADDR = b'f8:38:8f:07:bc:af'           # the phone the overlay was read from
+PASSWD = 'private/var/jb/etc/passwd'
+PWDB = {'private/var/jb/etc/pwd.db': ('pwd.db', 0o644), 'private/var/jb/etc/spwd.db': ('spwd.db', 0o600)}
+DEVICE_BDADDRS = {b'f8:38:8f:07:bc:af'}        # the phone the overlay was read from (+ any bdaddr file's)
+PLACEHOLDER = b'@BDADDR@'
+# crypt(3) hashes as they are stored: MD5, bcrypt, SHA-256/512, yescrypt
+HASH = re.compile(rb'\$1\$[./0-9A-Za-z]{1,8}\$[./0-9A-Za-z]{22}'
+                  rb'|\$2[abxy]\$[0-9]{2}\$[./0-9A-Za-z]{53}'
+                  rb'|\$[56]\$(?:rounds=[0-9]+\$)?[./0-9A-Za-z]{1,16}\$[./0-9A-Za-z]{43,86}'
+                  rb'|\$y\$[./0-9A-Za-z]+\$[./0-9A-Za-z]{1,86}\$[./0-9A-Za-z]{43}')
 DROP_PREFIXES = (
     'private/var/jb/etc/ssh/ssh_host_',
     'private/var/root/sensfiles/mnt',
@@ -31,6 +46,28 @@ def scrub_passwd(data):
             f[1] = '*'
         out.append(':'.join(f))
     return ('\n'.join(out) + '\n').encode()
+
+
+def find_mkpwdb():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for c in (os.environ.get('MKPWDB'), os.path.join(here, '..', '..', 'tools', 'mkpwdb'), shutil.which('mkpwdb')):
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    sys.exit('scrub: pwd.db/spwd.db must be made again from the scrubbed master.passwd and mkpwdb was not found.\n'
+             '  Build tools/mkpwdb.c (macOS: cc -o tools/mkpwdb tools/mkpwdb.c; Linux: with FreeBSD\'s lib/libc/db)\n'
+             '  and run again, or set MKPWDB=/path/to/mkpwdb. The old databases are never shipped.')
+
+
+def make_pwdb(master):
+    """pwd.db and spwd.db (bytes) from the scrubbed master.passwd: OpenBSD's format, what libiosexec reads."""
+    tool = find_mkpwdb()
+    with tempfile.TemporaryDirectory() as t:
+        with open(os.path.join(t, 'master.passwd'), 'wb') as f:
+            f.write(master)
+        out = os.path.join(t, 'db')
+        os.mkdir(out)
+        subprocess.run([tool, os.path.join(t, 'master.passwd'), out], check=True, stdout=subprocess.DEVNULL)
+        return {n: open(os.path.join(out, n), 'rb').read() for n in ('pwd.db', 'spwd.db')}
 
 
 REMOVE_PKGS = {
@@ -62,6 +99,21 @@ def drop_from_status(data):
 
 src = tarfile.open(sys.argv[1], 'r:*')
 members = src.getmembers()
+by_name = {m.name: m for m in members}
+# the accounts first: the databases are made from the scrubbed master.passwd
+master = by_name.get(SECRET)
+dbs = None
+if master is not None:
+    dbs = make_pwdb(scrub_passwd(src.extractfile(master).read()))
+elif any(n in by_name for n in PWDB):
+    sys.exit('scrub: pwd.db/spwd.db without master.passwd to make them again from: stopped')
+# this overlay's Bluetooth address files: what they hold is replaced everywhere
+for m in members:
+    if m.isfile() and m.name.rsplit('/', 1)[-1] == 'bdaddr':
+        a = src.extractfile(m).read().strip()
+        if a and a != PLACEHOLDER:
+            DEVICE_BDADDRS.add(a.lower())
+            DEVICE_BDADDRS.add(a.upper())
 listed = set()
 for m in members:
     for pkg in REMOVE_PKGS:
@@ -91,14 +143,21 @@ for m in members:
         continue
     if m.isfile():
         data = src.extractfile(m).read()
-        if m.name == SECRET:
+        if m.name in (SECRET, PASSWD):
             data = scrub_passwd(data)
+            n += 1
+        elif m.name in PWDB:
+            data = dbs[PWDB[m.name][0]]
+            n += 1
+        elif m.name.rsplit('/', 1)[-1] == 'bdaddr':
+            data = PLACEHOLDER + b'\n'
             n += 1
         elif m.name == DPKG + 'status':
             data = drop_from_status(data)
-        if DEVICE_BDADDR in data:
-            data = data.replace(DEVICE_BDADDR, b'@BDADDR@')
-            n += 1
+        for a in DEVICE_BDADDRS:
+            if a in data:
+                data = data.replace(a, PLACEHOLDER)
+                n += 1
         m.size = len(data)
         dst.addfile(m, io.BytesIO(data))
     else:
@@ -112,5 +171,30 @@ for m in members:
             else:
                 sys.exit('empty symlink target: ' + m.name)
         dst.addfile(m)
+# databases the reference phone did not have: made anyway, next to master.passwd and with its owner
+if master is not None:
+    for name, (db, mode) in PWDB.items():
+        if name not in by_name:
+            ti = tarfile.TarInfo(name)
+            ti.uid, ti.gid, ti.mtime, ti.mode = master.uid, master.gid, master.mtime, mode
+            ti.uname, ti.gname = master.uname, master.gname
+            ti.size = len(dbs[db])
+            dst.addfile(ti, io.BytesIO(dbs[db]))
+            n += 1
 dst.close()
-print('scrubbed', n, 'file(s);', gone, 'entries left out')
+
+# read back what was written: no hash and no reference phone's address may be left anywhere
+bad = []
+with tarfile.open(sys.argv[2], 'r:gz') as out:
+    for m in out:
+        if not m.isfile():
+            continue
+        data = out.extractfile(m).read()
+        if HASH.search(data):
+            bad.append(m.name + ': password hash')
+        if any(a in data for a in DEVICE_BDADDRS):
+            bad.append(m.name + ': Bluetooth address')
+if bad:
+    os.remove(sys.argv[2])
+    sys.exit('scrub: STOPPED, ' + sys.argv[2] + ' deleted. Left after scrubbing:\n  ' + '\n  '.join(bad))
+print('scrubbed', n, 'file(s);', gone, 'entries left out; no password hash or reference address left')

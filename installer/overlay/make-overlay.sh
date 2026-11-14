@@ -31,7 +31,9 @@ if grep -E ' (private/var/root/fp|private/var/root/cam|private/var/mobile|privat
 	echo "personal data in the overlay: stopped" >&2
 	exit 1
 fi
-python3 scrub.py out/ov.tar out/sapphire-overlay.tar.gz   # secrets out (master.passwd hashes)
+# secrets out: hashes in master.passwd/passwd become '*', pwd.db/spwd.db are made again from that with
+# tools/mkpwdb (MKPWDB=path), bdaddr files become @BDADDR@; stops if any hash is left anywhere
+python3 scrub.py out/ov.tar out/sapphire-overlay.tar.gz
 rm -f out/ov.tar
 echo "$(wc -l < out/overlay-list.txt) entries"
 ls -la out/sapphire-overlay.tar.gz

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.sapphire.sshd-usb</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/var/jb/usr/sbin/sshd</string>
+		<string>-D</string>
+		<string>-o</string>
+		<string>ListenAddress=192.168.7.2</string>
+		<string>-o</string>
+		<string>UsePAM=no</string>
+		<string>-o</string>
+		<string>PasswordAuthentication=no</string>
+		<string>-o</string>
+		<string>KbdInteractiveAuthentication=no</string>
+		<string>-o</string>
+		<string>PermitRootLogin=prohibit-password</string>
+		<string>-E</string>
+		<string>/var/jb/var/log/sshd-usb.log</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>UserName</key>
+	<string>root</string>
+</dict>
+</plist>

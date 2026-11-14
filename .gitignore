@@ -1,7 +1,9 @@
 # device dumps: persist/modemst/fsg hold IMEI + calibration; live DT holds the serial
 backup/
 dtb/
-recovery/
+/recovery/
+# tools/mkpwdb.c built on the host (installer/overlay/scrub.py runs it)
+/tools/mkpwdb
 # third-party/Apple sources fetched for reading
 research/
 shim/out/
