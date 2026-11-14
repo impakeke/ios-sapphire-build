@@ -15,10 +15,11 @@ now here, with our changes for the Redmi Note 12 4G (topaz, SM6225 / Adreno 610)
 
 `xnu/patches/0900-*` and `0901-*` … `0947-*` contain, adapted and modified for topaz:
 
-*(Note 2026-11-14, fork giovannipodesta: there are no `09xx` patches in this repository; the numbers
-are probably those of the topaz tree this text came from (unverified). Here, the patches whose headers
-name HackiOS are 0149, 0150, 0155, 0156, 0200, 0301 and 0319 (`grep -il hackios xnu/patches/*`). Which
-patches carry `kern.exec_inject` and the minisandbox container path was not verified.)*
+*(This repository has no `09xx` patches; the numbers are probably those of the topaz tree this text came
+from, unverified. Here the patches that name HackiOS as the origin of their code are 0149, 0150, 0155, 0156,
+0200, 0301, 0319 and 0323; 0324 follows a HackiOS input filter with code of its own; 0321 and 0338-0350
+mention HackiOS's design or its Metal driver only as a reference or as the client they serve. Which patches carry
+`kern.exec_inject` and the minisandbox container path is not verified.)*
 `RedwoodGPU.cpp` (msm-style GPU client), the `MiniIOMobileFramebuffer` presentation ideas
 (SwapEnd handed to a presenter thread, vsync notification layout), `redwood_apple80211` /
 `redwood_sta` / `redwood_net` (Apple80211 for wifid), the `/dev/redwood-audio` interface, the
@@ -29,7 +30,15 @@ APSL 2.0; every patch records what we changed in its commit message.
 
 `userland/gpu/eagl.c`, `userland/gpu/gl_osmesa.c`, `userland/gpu/inject.c`,
 `userland/mesa/*` (freedreno Darwin patches, `redwood-drm`) and `userland/audio/*`
-(the RedwoodAudio HAL plug-in) are based on HackiOS user space:
+(the RedwoodAudio HAL plug-in) are based on HackiOS user space (the MIT licence below).
+
+### The Metal driver (MIT)
+
+The Metal driver that draws CoreAnimation, `HakiosMetal.bundle`, is HackiOS's `hakios-metal`
+(<https://github.com/oosexgang/hakios-xnu-kernel>, `hakios-metal/LICENSE`: MIT, Copyright (c) 2025-2026 the
+HakiOS authors) with the fork's A610 patches; it is built outside this repository
+(`dev-notes/investigacion/08`). The binary under `installer/update/files/` is the original author's build of
+his fork of the same source. HackiOS's user space licence:
 
 ```
 MIT License
@@ -58,5 +67,6 @@ SOFTWARE.
 ## Others
 
 - **ios-sweet** (dipa-studio): the XNU port this tree is built on.
-- **Mesa / freedreno**: the OpenGL ES driver for the Adreno.
+- **Mesa / freedreno**: the OpenGL ES driver for the Adreno, and the shader compiler (NIR, ir3) linked into the
+  Metal driver.
 - **blacktop/darwin-xnu-build**: the XNU build scripts.
