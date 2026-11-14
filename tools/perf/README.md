@@ -31,3 +31,13 @@ backboardd, que es `/dev/null`, y de ahí a `/dev/console`:
 | `ab-phone.sh ETIQUETA "ARGS"` | En el teléfono: escribe `metal.args` (`metal_fps=1` + ARGS), reinicia backboardd, captura la consola durante `swipetest.sh 5` |
 | `ab.sh ETIQUETA "ARGS"` | En la Mac: lanza el ensayo, trae los datos y los resume |
 | `ab-sum.py CONSOLA...` | Resume las líneas `fps:` de los periodos con movimiento (≥ 15 buffers/s) |
+
+## Capturas de pantalla
+
+`fbshot PREFIJO` (teléfono) vuelca las IOSurface de 750x1624 del doble buffer de la pantalla; `shot.sh NOMBRE`
+(Mac) las trae y las convierte a PNG (`raw2png.py`); `sheet.py` hace una hoja de contacto. Con el panel dormido
+no se dibuja nada y la captura es la del último frame: despertar antes con `hidtouch press 0`. Tras despertar,
+el panel se apaga a los ~6 s si sigue en la pantalla de bloqueo.
+
+`swipetest.sh` no desbloquea el teléfono en el estado actual (verificado con capturas): sus gestos actúan sobre
+la pantalla de bloqueo.

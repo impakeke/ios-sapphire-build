@@ -251,7 +251,10 @@ Datos: `logs-telefono/cpu-0334-023406/muestras.txt` (las horas del archivo son l
 ## M1 — Dónde se va el frame: perfil del hilo de render (2026-11-14, tarde)
 
 Kernel 0334 (`boot_a-0334.img`, ruta R), `sweetmetal=2`, `HakiosMetal` sha256 `13bbd782…` (el binario del
-repo). Carga: `swipetest.sh 5` (páginas del home a izquierda y derecha, abrir y cerrar el Centro de Control).
+repo). Carga: `swipetest.sh 5`. Capturas de pantalla (`tools/perf/fbshot.c`) muestran que el guion no llega al
+home: el teléfono sigue en la pantalla de bloqueo y lo que se anima es el Centro de Control abriéndose y
+cerrándose sobre ella, más los deslizamientos laterales del bloqueo. La carga es reproducible (M2: 23,5-23,8
+buffers/s en seis ensayos), pero no es el home.
 Herramientas: `tools/perf/` (`thrtop`, `psamp`, `symb.py`). Datos: `research/metal/medicion/`.
 
 **Observado.**
