@@ -17,3 +17,17 @@ scp psamp sapphire:/var/root/
 
 La carga reproducible es `userland/tests/swipetest.sh N` (deslizamientos del home y Centro de Control
 con `hidtouch`).
+
+## Contadores del driver Metal y ensayos A/B
+
+`HakiosMetal` añade el contenido de `/var/tmp/metal.args` a los boot-args que lee (`_hm_bootargs`), así que
+sus opciones (`metal_fps=1`, `metal_defer=1`, `metal_gmem_off=N`…) se cambian sin tocar la imagen de arranque;
+se aplican al reiniciar backboardd (`killall backboardd`). Sus líneas de diagnóstico van al stderr de
+backboardd, que es `/dev/null`, y de ahí a `/dev/console`:
+
+| Herramienta | Qué hace |
+|---|---|
+| `conscat SALIDA [SEGUNDOS]` | Toma la consola (`TIOCCONS` sobre un pty) y guarda lo que los procesos escriben en `/dev/console` |
+| `ab-phone.sh ETIQUETA "ARGS"` | En el teléfono: escribe `metal.args` (`metal_fps=1` + ARGS), reinicia backboardd, captura la consola durante `swipetest.sh 5` |
+| `ab.sh ETIQUETA "ARGS"` | En la Mac: lanza el ensayo, trae los datos y los resume |
+| `ab-sum.py CONSOLA...` | Resume las líneas `fps:` de los periodos con movimiento (≥ 15 buffers/s) |

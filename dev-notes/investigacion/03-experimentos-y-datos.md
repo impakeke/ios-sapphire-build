@@ -281,3 +281,34 @@ Herramientas: `tools/perf/` (`thrtop`, `psamp`, `symb.py`). Datos: `research/met
 no lo frena: el tiempo de frame lo fija el coste de CPU por draw del driver Metal (codificar el estado
 completo de cada draw y deduplicarlo contra una sombra de registros, validaciones, enlace y asignaciones
 de memoria por draw). El número de draws por frame no está medido aún.
+
+## M2 — Contadores del driver y A/B de sus opciones (2026-11-14, tarde)
+
+Mismo kernel y binario que M1. Opciones por `/var/tmp/metal.args`, `metal_fps=1` en todas; cada ensayo
+reinicia backboardd y ejecuta `swipetest.sh 5` (`tools/perf/ab.sh`). Datos: `research/metal/medicion/ab/`.
+Las cifras son los contadores del propio binario (sin verificar contra una medida independiente salvo el
+coste de CPU, coherente con M1). "Buffers/s" son command buffers confirmados por segundo en los periodos con
+movimiento; "a tiempo / tarde / paradas" son los huecos entre commits de ≤ 20 ms, ≤ 50 ms y > 50 ms.
+
+| Condición | n | Buffers/s | A tiempo | Tarde | Paradas | Draws/buffer | CPU/draw (hilo de render) | Hecho→commit | Commit→fin | GPU ocupada |
+|---|---|---|---|---|---|---|---|---|---|---|
+| (sin opciones) | 3 | 23,5-23,8 | 31-40 | 397-435 | 173-205 | 151-154 | 126-128 µs | 28,9-29,7 ms | 31,2-33,0 ms | 73-76 % |
+| `metal_defer=1` | 3 | 27,6-28,4 | 204-241 | 422-426 | 153-166 | 151-154 | 46-47 µs | 22,9-24,5 ms | 59,9-61,9 ms | 151-161 % |
+| `metal_defer=1 metal_gmem_off=8` | 3 | 26,0-27,5 | 153-238 | 367-420 | 155-183 | 151-155 | 44-46 µs | 23,3-26,8 ms | 54,8-63,4 ms | 127-161 % |
+| `metal_gmem_off=16` (sin binning) | 3 | 22,7-23,1 | 27-35 | 382-403 | 177-201 | 146-153 | 124-126 µs | 30,5-30,8 ms | 41,9-44,2 ms | 95-101 % |
+| `metal_gmem=0` | 3 | 23,7-24,3 | 33-43 | 443-456 | 184-194 | 151-152 | 126-127 µs | 28,9-29,0 ms | 30,9-32,4 ms | 72-78 % |
+
+Otras líneas del driver en la condición sin opciones: la pasada principal es `draw 750x1624 draws 108-132 in
+102 tiles` y tarda 20-24 ms de GPU (18 ms con 108 draws y la pantalla quieta); un buffer lleva 3-11 pasadas;
+`buffers: 0 made, 120 taken again from the pool`; el sombreador de CoreAnimation `fixed_frag_lph` queda en
+128-320 palabras de instrucción por variante tras especializarlo.
+
+**Interpretación.**
+
+- Hay dos límites por frame, los dos por encima de 16,7 ms: la CPU del hilo que codifica (≈ 150 draws ×
+  126 µs ≈ 19 ms, más el resto del compositor) y la GPU (20-24 ms la pasada principal).
+- La grabación diferida saca la codificación del hilo de render (126 → 46 µs por draw) y sube los buffers por
+  segundo un 18 %, pero el tiempo de commit a fin se duplica: el límite pasa al hilo de grabación y a la GPU.
+  El contador "GPU ocupada" supera el 100 % en esa condición, así que no mide solo GPU (sin verificar qué suma).
+- El binning por hardware reduce el trabajo de GPU (74 % → 97 % al quitarlo).
+- `metal_gmem=0` no cambia nada: GMEM está activo sin esa opción y la opción no lo apaga.
