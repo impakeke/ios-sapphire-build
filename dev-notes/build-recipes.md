@@ -107,3 +107,12 @@ Usa **`ioreg`**:
 ioreg -rc IOUSBHostDevice -l -w 0 | grep -A3 '"idVendor" = 4617'   # 4617 = 0x1209
 ifconfig -l | tr ' ' '\n' | grep '^en'                             # enX nueva = CDC-ECM
 ```
+
+## 6) Driver Metal (`HakiosMetal.bundle`) desde fuente
+
+El driver que dibuja CoreAnimation es `hakios-metal` del upstream de HackiOS (`63fc2b4`) con los parches A610 propios.
+Se compila en esta Mac sin Xcode (clang/LLD 18.1.8 de conda-forge, SDK de theos, Mesa 25.0.7), fuera de git, en
+`~/sapphire-angel/research/metal/rebuild/`: `receta.sh` hace todo desde cero. Dependencias, pasos y lo que no es
+obvio (LTO y `-mcpu=cortex-a73` en Mesa, firma con `--pagesize 4096` en un directorio vacío):
+[investigacion/08](investigacion/08-hakiosmetal-binario-vs-fuente.md) §6. Instalar y comprobar que está cargado:
+[OPERACION.md](OPERACION.md) §9.3.
