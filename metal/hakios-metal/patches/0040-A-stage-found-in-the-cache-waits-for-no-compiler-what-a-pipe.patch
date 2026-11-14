@@ -1,0 +1,420 @@
+Subject: A stage found in the cache waits for no compiler; what a pipeline's making cost is said
+
+compileStage took the one compiler before it looked in the stage cache. A
+render pipeline whose two stages were both on disk -- half a millisecond of
+reading -- then stood behind whatever another thread was compiling. On the
+phone that other thread is the plug-in's, compiling the uber shader for a
+configuration in the background (0.45 to 1.1 s each): in the frame traces
+pipelines made from cached stages take 173, 415, 423, 431, 433 ms each, three
+of them one after another in a frame of 1.3 s, and the first opening of the app
+switcher spends 173 of its 228 ms in one.
+
+The cache and its seeds are now looked in first, with no lock; only a
+compilation takes the compiler, and looks once more once it has it, for the
+stage another thread may have compiled while it waited. Nothing of what is
+compiled changes.
+
+CompileTimes (hakios_metal_compile_times) says, for the calling thread since it
+last asked, the stages asked for, those read from the cache and those compiled,
+and the time spent waiting for the compiler, reading and compiling. The
+plug-in's linked line carries it for every pipeline; the frame trace's pipe
+line gains stages, cached, compiled, wait_ms, load_ms and cc_ms, and its commit
+line what the driver's own work cost while the buffer was being encoded:
+textures made, textures over an IOSurface, buffers, uploads, pipelines, and the
+copies of surfaces the GPU cannot read where they lie, each as
+count/milliseconds/megabytes.
+
+The compiler is not in the host build: the change is compiled for iOS with the
+bundle; the host's stub answers zeros.
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/compiler.hpp b/hakios-metal/include/hakios-metal/compiler.hpp
+index 82a3323..deaab04 100644
+--- a/hakios-metal/include/hakios-metal/compiler.hpp
++++ b/hakios-metal/include/hakios-metal/compiler.hpp
+@@ -136,6 +136,15 @@ struct KnownBuffer {
+ };
+ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants = {},
+                                            uint32_t iboBase = 0, const KnownBuffer* known = nullptr);
++// What compileStage did for the calling thread since it last asked (the counts start again): the stages asked for,
++// those that came out of the cache or a seed and those compiled, and the time each part took -- waiting for the one
++// compiler while another thread compiled, reading cached stages, compiling. A stage found in the cache waits for
++// nobody: only a compilation takes the compiler.
++struct CompileTimes {
++    uint32_t stages = 0, cached = 0, compiled = 0;
++    double waitedUs = 0, loadedUs = 0, compiledUs = 0;
++};
++CompileTimes takeCompileTimes();
+ // compileStage's choice for a stage that spilled with ir3's preamble (WITH) and was compiled again without it (WITHOUT):
+ // the one that spills less, then the one with fewer registers; WITH on a tie. (CoreAnimation's fixed_frag_lph_cpf: 48
+ // registers and 512 bytes of spills with the preamble, 21 and none without; its draws 6.6 ms each so, 2.6 without.)
+diff --git a/hakios-metal/include/hakios-metal/hakios_metal.h b/hakios-metal/include/hakios-metal/hakios_metal.h
+index a7fcba1..ef4b80c 100644
+--- a/hakios-metal/include/hakios-metal/hakios_metal.h
++++ b/hakios-metal/include/hakios-metal/hakios_metal.h
+@@ -291,6 +291,11 @@ hakios_metal_program *hakios_metal_program_new_bitcode_constants(const void *vs_
+  * descriptor and sample count come with it. NULL with the reason. */
+ hakios_metal_program *hakios_metal_program_specialize(hakios_metal_program *base, const void *fs_bitcode, size_t fs_size,
+     const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned binding, const void *bytes, size_t length);
++/* What making programs cost the calling thread since it last asked (the counts start again): the stages asked for,
++ * those read from the stage cache and those compiled, and the microseconds spent waiting for the compiler while
++ * another thread compiled, reading cached stages, and compiling. Any pointer may be NULL. */
++void hakios_metal_compile_times(unsigned *stages, unsigned *cached, unsigned *compiled, double *waited_us, double *loaded_us,
++    double *compiled_us);
+ /* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to */
+ unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
+ /* what PROGRAM's fragment stage does that a frame trace reports (the plug-in's metal_trace=frame looks for it by name):
+diff --git a/hakios-metal/src/c_api.cpp b/hakios-metal/src/c_api.cpp
+index f676cb2..0ce284b 100644
+--- a/hakios-metal/src/c_api.cpp
++++ b/hakios-metal/src/c_api.cpp
+@@ -1268,6 +1268,16 @@ hakios_metal_program* hakios_metal_program_from_stages(const Stage& vs, const St
+ 
+ extern "C" {
+ 
++void hakios_metal_compile_times(unsigned* stages, unsigned* cached, unsigned* compiled, double* waitedUs, double* loadedUs, double* compiledUs) {
++    const CompileTimes t = takeCompileTimes();
++    if (stages != nullptr) *stages = t.stages;
++    if (cached != nullptr) *cached = t.cached;
++    if (compiled != nullptr) *compiled = t.compiled;
++    if (waitedUs != nullptr) *waitedUs = t.waitedUs;
++    if (loadedUs != nullptr) *loadedUs = t.loadedUs;
++    if (compiledUs != nullptr) *compiledUs = t.compiledUs;
++}
++
+ unsigned hakios_metal_program_stage_words(hakios_metal_program* p, unsigned stage) {
+     if (p == nullptr || stage > 1) return 0;
+     return (stage == 0 ? p->program->program.vs : p->program->program.fs).k.numWords;
+diff --git a/hakios-metal/src/compiler.cpp b/hakios-metal/src/compiler.cpp
+index f933fe4..e5c16cf 100644
+--- a/hakios-metal/src/compiler.cpp
++++ b/hakios-metal/src/compiler.cpp
+@@ -1,6 +1,7 @@
+ #include "hakios-metal/compiler.hpp"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -35,6 +36,8 @@ std::unique_ptr<CompiledStage> compileStage(const void*, size_t, std::string* wh
+     return nullptr;
+ }
+ 
++CompileTimes takeCompileTimes() { return {}; }
++
+ std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage>, std::shared_ptr<CompiledStage>, PixelFormat, std::string* why) {
+     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
+     return nullptr;
+@@ -1275,15 +1278,13 @@ std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
+ }
+ }  // namespace
+ 
+-std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
+-                                           const KnownBuffer* known) {
+-    std::lock_guard<std::mutex> g(gCompilerLock);
+-    if (theCompiler() == nullptr) {
+-        refuse(why, "ir3 has no compiler for chip 0x06030500");
+-        return nullptr;
+-    }
+-    const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
+-    const std::string cached = stageCacheWritable(name);
++namespace {
++thread_local CompileTimes tCompileTimes;
++double microsecondsSince(std::chrono::steady_clock::time_point t) {
++    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t).count();
++}
++// a stage of that name in the writable cache or in a seed, or nullptr
++std::unique_ptr<CompiledStage> stageCacheFind(const std::string& name, const std::string& cached) {
+     if (!cached.empty()) {
+         if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached)) return s;
+     }
+@@ -1297,6 +1298,48 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
+             if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name)) return s;
+         }
+     }
++    return nullptr;
++}
++}  // namespace
++
++CompileTimes takeCompileTimes() {
++    const CompileTimes t = tCompileTimes;
++    tCompileTimes = CompileTimes{};
++    return t;
++}
++
++std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
++                                           const KnownBuffer* known) {
++    // A stage compiled before is read from its file with the compiler left alone: the one compiler is taken for a
++    // compilation only. Taken first, a pipeline whose two stages were both in the cache -- half a millisecond of
++    // reading -- stood behind whatever another thread was compiling: 173 to 434 ms each on the phone, three of them
++    // one after another in one frame (1.3 s), behind the uber shader being compiled for a configuration in the
++    // background.
++    tCompileTimes.stages++;
++    const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
++    const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
++    const std::string cached = stageCacheWritable(name);
++    if (std::unique_ptr<CompiledStage> s = stageCacheFind(name, cached)) {
++        tCompileTimes.cached++;
++        tCompileTimes.loadedUs += microsecondsSince(began);
++        return s;
++    }
++    tCompileTimes.loadedUs += microsecondsSince(began);
++    const std::chrono::steady_clock::time_point asked = std::chrono::steady_clock::now();
++    std::lock_guard<std::mutex> g(gCompilerLock);
++    tCompileTimes.waitedUs += microsecondsSince(asked);
++    // (while this thread waited another may have compiled the very stage: its file is there now)
++    if (!cached.empty()) {
++        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached)) {
++            tCompileTimes.cached++;
++            return s;
++        }
++    }
++    const std::chrono::steady_clock::time_point compiling = std::chrono::steady_clock::now();
++    if (theCompiler() == nullptr) {
++        refuse(why, "ir3 has no compiler for chip 0x06030500");
++        return nullptr;
++    }
+     std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known);
+     std::unique_ptr<CompiledStage> chosen;
+     if (with == nullptr || with->stage.k.pvtmemSize == 0 || !theCompiler()->has_preamble) {
+@@ -1309,6 +1352,8 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
+         chosen = without != nullptr && preferWithoutPreamble(with->stage.k, without->stage.k) ? std::move(without) : std::move(with);
+     }
+     if (chosen != nullptr && !cached.empty()) stageCacheSave(cached, *chosen);
++    tCompileTimes.compiled++;
++    tCompileTimes.compiledUs += microsecondsSince(compiling);
+     return chosen;
+ }
+ 
+diff --git a/hakios-metal/tools/drawbench.cpp b/hakios-metal/tools/drawbench.cpp
+index f543d1d..9613b2e 100644
+--- a/hakios-metal/tools/drawbench.cpp
++++ b/hakios-metal/tools/drawbench.cpp
+@@ -228,6 +228,7 @@ FakeGpu::Stats gpuSince(const FakeGpu::Stats& a) {
+     d.cpWords = b.cpWords - a.cpWords, d.sdsWords = b.sdsWords - a.sdsWords, d.cpRegisters = b.cpRegisters - a.cpRegisters;
+     d.drawsSkipped = b.drawsSkipped - a.drawsSkipped, d.ibSkipped = b.ibSkipped - a.ibSkipped, d.groupsRun = b.groupsRun - a.groupsRun;
+     d.cpLoads = b.cpLoads - a.cpLoads, d.cpWaits = b.cpWaits - a.cpWaits;
++    for (int i = 0; i < 8; i++) d.groupRuns[i] = b.groupRuns[i] - a.groupRuns[i], d.groupWords[i] = b.groupWords[i] - a.groupWords[i];
+     return d;
+ }
+ void onSubmit(FakeGpu& gpu, uint64_t address, uint32_t words, void*) {
+@@ -1115,6 +1116,14 @@ int main(int argc, char** argv) {
+                         (unsigned long long)g.cpWords, (unsigned long long)g.sdsWords, (unsigned long long)g.cpRegisters, g.cpLoads, g.cpWaits, g.draws, g.drawsSkipped,
+                         g.groupsRun, g.passes, g.tiles, g.binnedDraws, double(g.loadedPixels) * 4 / 1e6, double(g.storedPixels) * 4 / 1e6, g.tileLoads, g.tileStores,
+                         g.tileClears);
++            // (the draw-state groups by id, gmem.hpp: barrier, pass, program, vertex, loads, raster, viewport, blend -- how
++            // often the tiles ran each and the words they ran of it)
++            if (g.groupsRun != 0) {
++                static const char* const names[8] = {"barrier", "pass", "program", "vertex", "loads", "raster", "viewport", "blend"};
++                std::printf("   groups:");
++                for (int i = 0; i < 8; i++) std::printf(" %s %u x %.0f", names[i], g.groupRuns[i], g.groupRuns[i] ? double(g.groupWords[i]) / g.groupRuns[i] : 0.0);
++                std::printf(" words; outside groups %llu words\n", (unsigned long long)(g.cpWords - g.sdsWords));
++            }
+         }
+         return 0;
+     }
+diff --git a/userland/src/HakiosMetalCA.m b/userland/src/HakiosMetalCA.m
+index 7e2df2e..83a1911 100644
+--- a/userland/src/HakiosMetalCA.m
++++ b/userland/src/HakiosMetalCA.m
+@@ -101,6 +101,7 @@
+ #include <mach/mach_time.h>
+ #include <os/lock.h>
+ #include <stdarg.h>
++#include <stdatomic.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -1493,7 +1494,43 @@ - (void)hakiosFtDebug:(const char *)what string:(NSString *)string;
+ } hm_ft = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, NULL };
+ 
+ /* a command buffer being recorded: its lines so far, and what its cb line will say */
++/* metal_trace=frame: what the driver's own work cost between a command buffer's making and its commit, by kind -- the
++ * textures made (of their own memory, and over an IOSurface), the buffers made, the uploads (-replaceRegion:), the
++ * render pipelines made, and the copies by this processor of a surface the GPU cannot read where it lies (rows off 64
++ * bytes, two-plane YCbCr). Counted for the whole process while the mode is on (one clock read at each end of a call);
++ * a recorded command buffer says what was added while it was being encoded, on its commit line. */
++enum { HM_FT_W_TEXTURE, HM_FT_W_SURFACE, HM_FT_W_BUFFER, HM_FT_W_UPLOAD, HM_FT_W_PIPELINE, HM_FT_W_COPY, HM_FT_W_KINDS };
++static struct {
++	_Atomic uint64_t n, ns, bytes;
++} hm_ft_work[HM_FT_W_KINDS];
++static BOOL hm_ft_mode(void);
++
++static double
++hm_ft_work_began(void)
++{
++	return hm_ft_mode() ? hm_now() : 0;
++}
++
++static void
++hm_ft_worked(int kind, double began, uint64_t bytes)
++{
++	if (began != 0) {
++		const double seconds = hm_now() - began;
++
++		atomic_fetch_add(&hm_ft_work[kind].n, 1);
++		atomic_fetch_add(&hm_ft_work[kind].ns, (uint64_t)(seconds > 0 ? seconds * 1e9 : 0));
++		atomic_fetch_add(&hm_ft_work[kind].bytes, bytes);
++	}
++}
++
++/* (what the last pipeline made on this thread cost its compiler: hakios_metal_compile_times, for its pipe line) */
++static __thread struct {
++	unsigned stages, cached, compiled;
++	double waitedUs, loadedUs, compiledUs;
++} hm_ft_cc;
++
+ struct hm_ft_rec {
++	uint64_t work0[HM_FT_W_KINDS][3];  /* hm_ft_work as it stood when the buffer was made */
+ 	pthread_mutex_t lock;              /* a parallel encoder's sub-encoders record from several threads */
+ 	char *buf;
+ 	size_t len, cap;
+@@ -1987,6 +2024,11 @@ - (void)hakiosFtDebug:(const char *)what string:(NSString *)string;
+ 		return NULL;
+ 	}
+ 	pthread_mutex_init(&ft->lock, NULL);
++	for (int k = 0; k < HM_FT_W_KINDS; k++) {
++		ft->work0[k][0] = atomic_load(&hm_ft_work[k].n);
++		ft->work0[k][1] = atomic_load(&hm_ft_work[k].ns);
++		ft->work0[k][2] = atomic_load(&hm_ft_work[k].bytes);
++	}
+ 	ft->capture = c;
+ 	ft->created = created;
+ 	ft->cap = 64 * 1024;
+@@ -2358,7 +2400,8 @@ - (void)hakiosFtDebug:(const char *)what string:(NSString *)string;
+ 	else strlcpy(fsWhere, fsFrom, sizeof(fsWhere));
+ 	hm_ft_cat(lines, size, &at, "pipe id=%llu label=%s vs=%s fs=%s vs_label=%s fs_label=%s vs_from=%s fs_from=%s vs_fc=%s fs_fc=%s vs_key=%08x "
+ 		  "fs_key=%08x prog=%s vs_words=%u fs_words=%u spec_slot=%d spec_len=%u fbfetch=%s discard=%s samples=%lu depth=%s stencil=%s vd=%s "
+-		  "created=%.6f compile_ms=%.3f\n", (unsigned long long)id, hm_ft_qs(q[0], sizeof(q[0]), [d label]),
++		  "created=%.6f compile_ms=%.3f stages=%u cached=%u compiled=%u wait_ms=%.3f load_ms=%.3f cc_ms=%.3f\n", (unsigned long long)id,
++		  hm_ft_qs(q[0], sizeof(q[0]), [d label]),
+ 		  hm_ft_qs(q[1], sizeof(q[1]), [vs name]), hm_ft_qs(q[2], sizeof(q[2]), fs != nil ? [fs name] : nil),
+ 		  hm_ft_qs(q[3], sizeof(q[3]), [vs respondsToSelector:@selector(label)] ? [vs label] : nil),
+ 		  hm_ft_qs(q[4], sizeof(q[4]), [fs respondsToSelector:@selector(label)] ? [fs label] : nil), hm_ft_q(q[5], sizeof(q[5]), vsWhere),
+@@ -2366,7 +2409,8 @@ - (void)hakiosFtDebug:(const char *)what string:(NSString *)string;
+ 		  hm_ft_q(q[9], sizeof(q[9]), hakios_metal_program_name(program)), hakios_metal_program_stage_words(program, 0),
+ 		  hakios_metal_program_stage_words(program, 1), specBinding, specLength, fb, discard, (unsigned long)[d rasterSampleCount],
+ 		  hm_ft_format((unsigned)[d depthAttachmentPixelFormat], tmp, sizeof(tmp)),
+-		  hm_ft_format((unsigned)[d stencilAttachmentPixelFormat], tmp2, sizeof(tmp2)), vd, began, (ended - began) * 1e3);
++		  hm_ft_format((unsigned)[d stencilAttachmentPixelFormat], tmp2, sizeof(tmp2)), vd, began, (ended - began) * 1e3, hm_ft_cc.stages,
++		  hm_ft_cc.cached, hm_ft_cc.compiled, hm_ft_cc.waitedUs / 1e3, hm_ft_cc.loadedUs / 1e3, hm_ft_cc.compiledUs / 1e3);
+ 	for (NSUInteger i = 0; i < 8; i++) {
+ 		MTLRenderPipelineColorAttachmentDescriptor *c = [[d colorAttachments] objectAtIndexedSubscript:i];
+ 		char mask[8];
+@@ -3688,11 +3732,16 @@ - (id)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count
+  * read for what cannot be given, so that a request for private storage is not silently given something else */
+ - (id)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
+ {
++	const double began = hm_ft_work_began();
++	id buffer;
++
+ 	if ((options & MTLResourceStorageModeMask) == MTLResourceStorageModePrivate) {
+ 		HM_ONCE("a buffer was asked for with private storage; every buffer here is shared memory, and that is what "
+ 			"is given (the GPU reads the same pages the processor maps)\n");
+ 	}
+-	return [[HakiosMetalBuffer alloc] initWithHakiosDevice:self length:length];
++	buffer = [[HakiosMetalBuffer alloc] initWithHakiosDevice:self length:length];
++	hm_ft_worked(HM_FT_W_BUFFER, began, buffer != nil ? (uint64_t)length : 0);
++	return buffer;
+ }
+ 
+ - (id)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options
+@@ -4270,6 +4319,9 @@ - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descri
+ 	hakios_metal_program *program;
+ 	unsigned format;
+ 	const double ftBegan = hm_ft_mode() ? hm_now() : 0;   /* metal_trace=frame: how long the pipeline took to make */
++	const double madeBegan = hm_now();                    /* ...and for the console's line, always */
++	unsigned ccStages = 0, ccCached = 0, ccCompiled = 0;
++	double ccWaited = 0, ccLoaded = 0, ccCompiling = 0;
+ 	char vsFrom[300] = "own", fsFrom[300] = "none";       /* ...and where each stage's code came from */
+ 
+ 	hm_describe_function([descriptor fragmentFunction]);
+@@ -4423,9 +4475,17 @@ - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descri
+ 				}
+ 			}
+ 		}
+-		hm_print("linked %s (%p) for pixel format %u: the vertex stage binds %u resources, the fragment stage %u; fragment constants not 0:%s\n",
++		/* what it took, and why: the stages read from the cache and those compiled, the wait for the compiler while another
++		 * thread had it, the compiling itself (hakios_metal_compile_times: this thread's since it last asked) */
++		hakios_metal_compile_times(&ccStages, &ccCached, &ccCompiled, &ccWaited, &ccLoaded, &ccCompiling);
++		hm_ft_cc.stages = ccStages, hm_ft_cc.cached = ccCached, hm_ft_cc.compiled = ccCompiled;
++		hm_ft_cc.waitedUs = ccWaited, hm_ft_cc.loadedUs = ccLoaded, hm_ft_cc.compiledUs = ccCompiling;
++		hm_print("linked %s (%p) for pixel format %u: the vertex stage binds %u resources, the fragment stage %u; fragment constants not 0:%s; "
++			 "made in %.1f ms (%u of %u stages from the cache in %.1f ms, %u compiled in %.1f ms after %.1f ms waiting for the compiler)\n",
+ 			 hakios_metal_program_name(program), (void *)program, format, hakios_metal_program_resource_count(program, 0),
+-			 hakios_metal_program_resource_count(program, 1), [set UTF8String]);
++			 hakios_metal_program_resource_count(program, 1), [set UTF8String], (hm_now() - madeBegan) * 1e3, ccCached, ccStages,
++			 ccLoaded / 1e3, ccCompiled, ccCompiling / 1e3, ccWaited / 1e3);
++		hm_ft_worked(HM_FT_W_PIPELINE, ftBegan, 0);
+ 	}
+ 	{
+ 		HakiosMetalRenderPipelineState *state = [[HakiosMetalRenderPipelineState alloc] initWithHakiosDevice:self program:program descriptor:descriptor];
+@@ -4981,12 +5041,20 @@ - (HakiosMetalTexture *)hakiosNewTextureWithDescriptor:(MTLTextureDescriptor *)d
+  * swizzle (-hakiosSwizzledBy:). */
+ - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+ {
+-	return [[self hakiosNewTextureWithDescriptor:descriptor] hakiosSwizzledBy:[descriptor swizzle]];
++	const double began = hm_ft_work_began();
++	id texture = [[self hakiosNewTextureWithDescriptor:descriptor] hakiosSwizzledBy:[descriptor swizzle]];
++
++	hm_ft_worked(HM_FT_W_TEXTURE, began, texture != nil ? hakios_metal_texture_allocated_bytes([(HakiosMetalTexture *)texture hakiosTexture]) : 0);
++	return texture;
+ }
+ 
+ - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
+ {
+-	return [[self hakiosNewTextureWithDescriptor:descriptor iosurface:surface plane:plane] hakiosSwizzledBy:[descriptor swizzle]];
++	const double began = hm_ft_work_began();
++	id texture = [[self hakiosNewTextureWithDescriptor:descriptor iosurface:surface plane:plane] hakiosSwizzledBy:[descriptor swizzle]];
++
++	hm_ft_worked(HM_FT_W_SURFACE, began, 0);
++	return texture;
+ }
+ 
+ /* The other resource kinds, each refused by name: the base class answers these with nil-stubs that say nothing. */
+@@ -5838,7 +5906,10 @@ - (BOOL)hakiosRegion:(MTLRegion)region level:(NSUInteger)level slice:(NSUInteger
+  * 6-argument forms. The same shape here, so that one implementation holds every rule. */
+ - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bytesPerRow
+ {
++	const double began = hm_ft_work_began();
++
+ 	[self replaceRegion:region mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:bytesPerRow bytesPerImage:0];
++	hm_ft_worked(HM_FT_W_UPLOAD, began, (uint64_t)bytesPerRow * region.size.height);
+ }
+ 
+ - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes
+@@ -7367,6 +7438,11 @@ - (void)enqueue
+ static void
+ hm_fps_shadow(BOOL in, double seconds)
+ {
++	if (hm_ft_mode()) {
++		/* (metal_trace=frame's count of the same copies) */
++		atomic_fetch_add(&hm_ft_work[HM_FT_W_COPY].n, 1);
++		atomic_fetch_add(&hm_ft_work[HM_FT_W_COPY].ns, (uint64_t)(seconds > 0 ? seconds * 1e9 : 0));
++	}
+ 	if (!hm_fps_on()) {
+ 		return;
+ 	}
+@@ -7650,7 +7726,19 @@ - (void)commit
+ 		char label[300];
+ 
+ 		ft->committed = _committedAt;
+-		hm_ft_line(ft, "commit t=%.6f label=%s\n", _committedAt, hm_ft_qs(label, sizeof(label), [self label]));
++		{
++			/* each kind as count/milliseconds/megabytes since the buffer was made */
++			char work[HM_FT_W_KINDS][48];
++
++			for (int k = 0; k < HM_FT_W_KINDS; k++) {
++				snprintf(work[k], sizeof(work[k]), "%llu/%.2f/%.2f", (unsigned long long)(atomic_load(&hm_ft_work[k].n) - ft->work0[k][0]),
++					 (double)(atomic_load(&hm_ft_work[k].ns) - ft->work0[k][1]) / 1e6,
++					 (double)(atomic_load(&hm_ft_work[k].bytes) - ft->work0[k][2]) / 1e6);
++			}
++			hm_ft_line(ft, "commit t=%.6f label=%s textures=%s surfaces=%s buffers=%s uploads=%s pipelines=%s copies=%s\n", _committedAt,
++				   hm_ft_qs(label, sizeof(label), [self label]), work[HM_FT_W_TEXTURE], work[HM_FT_W_SURFACE], work[HM_FT_W_BUFFER],
++				   work[HM_FT_W_UPLOAD], work[HM_FT_W_PIPELINE], work[HM_FT_W_COPY]);
++		}
+ 	}
+ 	/* each turned framebuffer drawn into, laid into its surface by the 2D engine after everything that drew it */
+ 	for (HakiosMetalTexture *t in _turned) {

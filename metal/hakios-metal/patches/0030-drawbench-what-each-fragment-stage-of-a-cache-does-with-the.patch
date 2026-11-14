@@ -1,0 +1,37 @@
+Subject: drawbench: what each fragment stage of a cache does with the pass's attachments
+
+DRAWBENCH_STAGE_INFO=1 with --stages: a line a fragment stage -- the colour outputs it has a register for, whether the
+second is a blend's second source, the attachments it reads through framebuffer fetch. The phone's cache: 43 variants
+of CoreAnimation's uber shader write outputs 0 to 2 and read attachments 0 and 1, 19 write attachment 1 alone, 7
+write 0 reading 1: the second attachment of its main pass is a target in its own right, and the 78 tiles of a pass
+that touches it are its due.
+
+
+---
+diff --git a/hakios-metal/tools/drawbench.cpp b/hakios-metal/tools/drawbench.cpp
+index be1396a..7ffdb76 100644
+--- a/hakios-metal/tools/drawbench.cpp
++++ b/hakios-metal/tools/drawbench.cpp
+@@ -840,6 +840,22 @@ void runStageScenes() {
+         std::printf("drawbench: no stages in %s\n", asked.stages.c_str());
+         return;
+     }
++    if (getenv("DRAWBENCH_STAGE_INFO") != nullptr) {
++        // (what each fragment stage of the cache does with the pass's colour attachments: the outputs it has a register
++        // for, whether its second output is a blend's second source, and the attachments it reads through fetch)
++        for (const auto& fs : fss) {
++            uint32_t outputs = 0, fetches = 0;
++            for (uint32_t i = 0; i < kMaxColorOutputs && i < fs->stage.numColorOutputs; i++) {
++                if (fs->stage.colorRegid[i] != a6xx::kRegidNone) outputs |= 1u << i;
++            }
++            for (uint32_t t = 0; t < kMaxTextureSlots && t < fs->stage.k.numTextureSlots; t++) {
++                if (fs->stage.k.textures[t].fbTarget != 0) fetches |= 1u << (fs->stage.k.textures[t].fbTarget - 1u);
++            }
++            std::printf("stage %s %s outputs %#x%s fetches %#x words %u\n", fs->file.substr(0, 8).c_str(), fs->name.c_str(), outputs,
++                        fs->stage.dualSrcBlend ? " (dual source)" : "", fetches, fs->stage.k.numWords);
++        }
++        return;
++    }
+     for (const char* letter : {"S", "T", "U"}) {
+         if (!wanted(letter)) continue;
+         CRig r;

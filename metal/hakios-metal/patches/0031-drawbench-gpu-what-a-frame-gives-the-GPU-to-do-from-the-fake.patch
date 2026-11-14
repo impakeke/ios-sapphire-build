@@ -1,0 +1,268 @@
+Subject: drawbench --gpu: what a frame gives the GPU to do, from the fake's counters
+
+Per scene, for the last measured frame: the words the fake's command processor
+fetched (and those inside draw-state groups), the registers it wrote, its
+CP_LOAD_STATE6 packets and waits for idle, the draws it ran and those a tile's
+visibility stream skipped, the groups run, the passes, tiles and binned draws,
+and the megabytes the tiles' loads and stores moved (FakeGpu::Stats gains
+loadedPixels beside storedPixels). --gmem-off BITS and --gmem-draws N pass the
+plug-in's metal_gmem_off and metal_gmem_draws, so the same scene can be read
+with a switch off (6080: the pass as it was before the draw-state groups) or
+with every pass tiled.
+
+Two scenes of a light frame, where the pass is seven layers the size of the
+screen: V (one attachment, fixed blending: sysmem with the default bar) and W
+(the second attachment bound, three of the draws reading their target: tiles).
+The golden files gain their two lines; no other line changes.
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/fake_gpu.hpp b/hakios-metal/include/hakios-metal/fake_gpu.hpp
+index 2dd244b..373f2ed 100644
+--- a/hakios-metal/include/hakios-metal/fake_gpu.hpp
++++ b/hakios-metal/include/hakios-metal/fake_gpu.hpp
+@@ -159,6 +159,7 @@ public:
+         uint32_t tileClears = 0;    // ...and clears in GMEM
+         uint32_t binningPasses = 0, binnedDraws = 0, binData = 0;   // binning passes, the draws in them, tiles told their streams
+         uint64_t storedPixels = 0;  // pixels the stores wrote: the whole target once, granule padding included, when the tiles tile it
++        uint64_t loadedPixels = 0;  // pixels the loads read into GMEM
+         // What the command processor read and ran, as the phone's microcode reads and runs it (the CP's state, below):
+         // every word it fetched -- the stream's, an indirect buffer's each time it was entered and as far as it was
+         // read, a draw-state group's each time it ran -- and of those the words inside draw-state groups; the draws a
+diff --git a/hakios-metal/src/fake_gpu.cpp b/hakios-metal/src/fake_gpu.cpp
+index 3222943..5ad7715 100644
+--- a/hakios-metal/src/fake_gpu.cpp
++++ b/hakios-metal/src/fake_gpu.cpp
+@@ -1224,8 +1224,10 @@ bool FakeGpu::eventBlit() {
+         memcpy(to, type == BLIT_EVENT_LOAD ? m : g, rowBytes);
+         for (uint64_t o = 0; swapBR && o < rowBytes; o += 4) std::swap(to[o], to[o + 2]);
+     }
+-    if (type == BLIT_EVENT_LOAD) stats_.tileLoads++;
+-    else {
++    if (type == BLIT_EVENT_LOAD) {
++        stats_.tileLoads++;
++        stats_.loadedPixels += uint64_t(x2 - x1 + 1) * (y2 - y1 + 1);
++    } else {
+         stats_.tileStores++;
+         stats_.storedPixels += uint64_t(x2 - x1 + 1) * (y2 - y1 + 1);
+     }
+diff --git a/hakios-metal/tests/golden/drawbench-a610.txt b/hakios-metal/tests/golden/drawbench-a610.txt
+index 30821da..c61625a 100644
+--- a/hakios-metal/tests/golden/drawbench-a610.txt
++++ b/hakios-metal/tests/golden/drawbench-a610.txt
+@@ -9,6 +9,8 @@ Q draws 108 refused 0 submits 1 words 764538 loads 13846 stream d698bc618ddb8101
+ R draws 108 refused 0 submits 1 words 4939 loads 432 stream acf5e230f050aa3e state f90a178aa327c3f2 names 34 1745727537486b27
+ G draws 1 refused 0 submits 1 words 602 loads 4 stream 70b09a33bff42227 state f7616e282bf666a6 names 6 5fa93d36f82a0959
+ H draws 1 refused 0 submits 1 words 654 loads 4 stream 03f40241a9bc8e8f state f7616e282bf666a6 names 6 5fa93d36f82a0959
++V draws 7 refused 0 submits 1 words 812 loads 28 stream 8109cdf8335272b7 state 40b4d36d85dac543 names 12 b76caaacc36efe2c
++W draws 7 refused 0 submits 1 words 38182 loads 774 stream 51532e0a6802940e state ecbafb20949de800 names 13 7577c36a0f68970a
+ J draws 20 refused 0 submits 1 words 1508 loads 76 stream 000c0e69e22f980d state 57cf1cdb921b5d8b names 29 e691fe78504f6547
+ K draws 110 refused 0 submits 1 words 1076337 loads 20540 stream b2756b1fb08745b9 state a942c0d9e9c42add names 43 16baf0bd0ce02d8d
+ L draws 110 refused 0 submits 1 words 5953 loads 404 stream 1100c23193797e7b state 32718647260908a1 names 42 edf0cac69d2bc050
+diff --git a/hakios-metal/tests/golden/drawbench-a635.txt b/hakios-metal/tests/golden/drawbench-a635.txt
+index 49b90aa..4947b8b 100644
+--- a/hakios-metal/tests/golden/drawbench-a635.txt
++++ b/hakios-metal/tests/golden/drawbench-a635.txt
+@@ -9,6 +9,8 @@ Q draws 108 refused 0 submits 1 words 231508 loads 4186 stream 986983411575be5c
+ R draws 108 refused 0 submits 1 words 4939 loads 432 stream 6d4ca98398d1275f state f90a178aa327c3f2 names 34 1745727537486b27
+ G draws 1 refused 0 submits 1 words 602 loads 4 stream d18aa5cbb430bc42 state f7616e282bf666a6 names 6 5fa93d36f82a0959
+ H draws 1 refused 0 submits 1 words 654 loads 4 stream a2837c99c813e12e state f7616e282bf666a6 names 6 5fa93d36f82a0959
++V draws 7 refused 0 submits 1 words 812 loads 28 stream 69af14fead36cbba state 40b4d36d85dac543 names 12 b76caaacc36efe2c
++W draws 7 refused 0 submits 1 words 11912 loads 234 stream dee6134a26e8994b state 8efb4d2eb3c0afbf names 13 7577c36a0f68970a
+ J draws 20 refused 0 submits 1 words 1508 loads 76 stream 8aaeef18eb048fa8 state 57cf1cdb921b5d8b names 29 e691fe78504f6547
+ K draws 110 refused 0 submits 1 words 300385 loads 5720 stream 7d20451085bdb274 state 7299c20495231099 names 43 16baf0bd0ce02d8d
+ L draws 110 refused 0 submits 1 words 5953 loads 404 stream f2223875097b5abe state 32718647260908a1 names 42 edf0cac69d2bc050
+diff --git a/hakios-metal/tools/drawbench.cpp b/hakios-metal/tools/drawbench.cpp
+index 7ffdb76..1ff67bc 100644
+--- a/hakios-metal/tools/drawbench.cpp
++++ b/hakios-metal/tools/drawbench.cpp
+@@ -78,6 +78,9 @@ struct Asked {
+     size_t coldBytes = 0;
+     std::string scenes, stages;
+     bool each = false;   // --each: every layer of a stage scene by itself (eachLayer)
++    bool gpu = false;    // --gpu: what the fake GPU's command processor and tiles did for the last measured frame
++    int gmemOff = 0;     // --gmem-off BITS: metal_gmem_off, as the plug-in passes it on (0, as with no boot-arg)
++    int gmemDraws = -1;  // --gmem-draws N: metal_gmem_draws (56 with no boot-arg)
+ } asked;
+ 
+ uint64_t nowNs() { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
+@@ -136,6 +139,7 @@ struct Result {
+     double allocsPerDraw = 0, allocBytesPerDraw = 0;
+     std::vector<double> commitUs;        // closing the last pass, the submission
+     golden::Sums sums;                   // the last measured frame's submissions
++    FakeGpu::Stats gpu;                  // ...and what the fake GPU did for them (--gpu): the counters' growth over the frame
+     uint32_t refused = 0;
+     std::string error;
+ };
+@@ -208,7 +212,25 @@ void histWalk(FakeGpu& gpu, uint64_t address, uint32_t count, int depth) {
+     }
+ }
+ golden::Sums gSums;
++// (the fake a submission went to: the C interface keeps its own to itself. Its counters are read between frames, never
++// from the hook, which runs under the fake's lock.)
++FakeGpu* gFake = nullptr;
++FakeGpu::Stats gpuNow() { return gFake != nullptr ? gFake->stats() : FakeGpu::Stats(); }
++// what a frame added to the counters that say how much the GPU was given to do
++FakeGpu::Stats gpuSince(const FakeGpu::Stats& a) {
++    FakeGpu::Stats b = gpuNow(), d;
++    d.submits = b.submits - a.submits, d.draws = b.draws - a.draws, d.passes = b.passes - a.passes, d.tiles = b.tiles - a.tiles;
++    d.fills = b.fills - a.fills, d.copies = b.copies - a.copies;
++    d.tileLoads = b.tileLoads - a.tileLoads, d.tileStores = b.tileStores - a.tileStores, d.tileClears = b.tileClears - a.tileClears;
++    d.loadedPixels = b.loadedPixels - a.loadedPixels, d.storedPixels = b.storedPixels - a.storedPixels;
++    d.binningPasses = b.binningPasses - a.binningPasses, d.binnedDraws = b.binnedDraws - a.binnedDraws;
++    d.cpWords = b.cpWords - a.cpWords, d.sdsWords = b.sdsWords - a.sdsWords, d.cpRegisters = b.cpRegisters - a.cpRegisters;
++    d.drawsSkipped = b.drawsSkipped - a.drawsSkipped, d.ibSkipped = b.ibSkipped - a.ibSkipped, d.groupsRun = b.groupsRun - a.groupsRun;
++    d.cpLoads = b.cpLoads - a.cpLoads, d.cpWaits = b.cpWaits - a.cpWaits;
++    return d;
++}
+ void onSubmit(FakeGpu& gpu, uint64_t address, uint32_t words, void*) {
++    gFake = &gpu;
+     golden::hook(gpu, address, words, &gSums);
+     if (asked.hist) histWalk(gpu, address, words, 0);
+ }
+@@ -220,6 +242,7 @@ struct Rig {
+     Rig() {
+         auto t = std::make_unique<FakeGpu>();
+         fake = t.get();
++        gFake = fake;
+         gpu = std::make_unique<Gpu>(std::move(t));
+         std::string why;
+         queue = CommandQueue::make(*gpu, &why);
+@@ -247,10 +270,10 @@ std::shared_ptr<CommandBuffer> pluginBuffer(Rig& r, bool gmem) {
+     cb->setSkipRefused(true);
+     cb->setProfile(false);
+     cb->setGmem(gmem);
+-    cb->setGmemMinDraws(gmem ? 56 : 0);
++    cb->setGmemMinDraws(gmem ? (asked.gmemDraws >= 0 ? uint32_t(asked.gmemDraws) : 56) : 0);
+     cb->setGmemBinning(true);
+     cb->setNullFsTextures(false);
+-    cb->setGmemOff(0);
++    cb->setGmemOff(uint32_t(asked.gmemOff));
+     cb->setGmemTuned(true);
+     cb->setProfileDraws(false);
+     return cb;
+@@ -268,6 +291,7 @@ struct Scene {
+     uint32_t commandBuffers; // the frame split over this many command buffers (the main pass in the last)
+     bool second = false;     // a second colour attachment the size of the first (DontCare/DontCare): CoreAnimation's main pass
+     uint32_t fetchEvery = 0; // every Nth textured draw reads its target instead (fetch and no-fetch draws interleaved)
++    bool whole = false;      // every draw covers the whole target (layers the size of the screen), not the first alone
+ };
+ 
+ void runCore(const Scene& s) {
+@@ -303,6 +327,7 @@ void runCore(const Scene& s) {
+     for (uint32_t frame = 0; frame < frames; frame++) {
+         Clock clock;
+         gSums.reset();
++        const FakeGpu::Stats before = gpuNow();
+         std::vector<std::shared_ptr<CommandBuffer>> cbs;
+         auto cb = pluginBuffer(r, s.gmem);
+         for (uint32_t i = 0; i < s.offscreen; i++) {
+@@ -336,8 +361,9 @@ void runCore(const Scene& s) {
+             Draw d;
+             d.vertexCount = 6;
+             // the first draw the wallpaper over everything, the rest icon-sized quads on a grid
+-            const double x = i == 0 ? 0 : 30 + 180 * (i % 4), y = i == 0 ? 0 : 60 + 200 * ((i / 4) % 7);
+-            d.viewport = Viewport{x, y, i == 0 ? double(W) : 120.0, i == 0 ? double(H) : 120.0, 0, 1};
++            const bool all = i == 0 || s.whole;
++            const double x = all ? 0 : 30 + 180 * (i % 4), y = all ? 0 : 60 + 200 * ((i / 4) % 7);
++            d.viewport = Viewport{x, y, all ? double(W) : 120.0, all ? double(H) : 120.0, 0, 1};
+             RenderPass p = pass;
+             if (i != 0) p.load = LoadAction::kLoad;   // (the plug-in spends the Clear on the first draw: hm_spend_clears)
+             Bindings fsb;
+@@ -373,6 +399,7 @@ void runCore(const Scene& s) {
+             res.allocsPerDraw = double(clock.allocs) / clock.draws;
+             res.allocBytesPerDraw = double(clock.allocBytes) / clock.draws;
+             res.sums = gSums;
++            res.gpu = gpuSince(before);
+         }
+         cbs.clear();
+         cb.reset();
+@@ -389,9 +416,11 @@ constexpr unsigned kBGRA8 = 80, kUsageRead = 1, kUsageTarget = 4, k2D = 2;
+ struct CRig {
+     hakios_metal_device* device = hakios_metal_open_fake();
+     hakios_metal_queue* queue = hakios_metal_queue_new(device);
++    CRig() { gFake = nullptr; }   // (known from this rig's first submission on)
+     ~CRig() {
+         hakios_metal_queue_free(queue);
+         hakios_metal_close(device);
++        gFake = nullptr;
+     }
+ };
+ 
+@@ -401,10 +430,10 @@ hakios_metal_cb* pluginCb(CRig& r, bool gmem) {
+     hakios_metal_cb_skip_refused(cb, 1);
+     hakios_metal_cb_set_profile(cb, 0);
+     hakios_metal_cb_set_gmem(cb, gmem ? 1 : 0);
+-    hakios_metal_cb_set_gmem_min_draws(cb, gmem ? 56 : 0);
++    hakios_metal_cb_set_gmem_min_draws(cb, gmem ? (asked.gmemDraws >= 0 ? asked.gmemDraws : 56) : 0);
+     hakios_metal_cb_set_gmem_binning(cb, 1);
+     hakios_metal_cb_set_null_fs_textures(cb, 0);
+-    hakios_metal_cb_set_gmem_off(cb, 0);
++    hakios_metal_cb_set_gmem_off(cb, asked.gmemOff);
+     hakios_metal_cb_set_gmem_tuned(cb, 1);
+     hakios_metal_cb_set_profile_draws(cb, 0);
+     return cb;
+@@ -480,6 +509,7 @@ void recordDraws(hakios_metal_cb* cb, Frame& f, Result& res, Clock* timed) {
+ void drawFrame(CRig& r, Frame& f, Result& res, bool measured) {
+     Clock clock;
+     gSums.reset();
++    const FakeGpu::Stats before = gpuNow();
+     hakios_metal_cb* cb = pluginCb(r, f.gmem);
+     recordDraws(cb, f, res, &clock);
+     const uint64_t c0 = nowNs();
+@@ -496,6 +526,7 @@ void drawFrame(CRig& r, Frame& f, Result& res, bool measured) {
+         res.allocsPerDraw = double(clock.allocs) / clock.draws;
+         res.allocBytesPerDraw = double(clock.allocBytes) / clock.draws;
+         res.sums = gSums;
++        res.gpu = gpuSince(before);
+     }
+ }
+ 
+@@ -1014,8 +1045,12 @@ int main(int argc, char** argv) {
+         else if (a == "--cold") asked.coldBytes = size_t(atoi(value())) * 1024;
+         else if (a == "--scene") asked.scenes = value();
+         else if (a == "--stages") asked.stages = value();
++        else if (a == "--gpu") asked.gpu = true;
++        else if (a == "--gmem-off") asked.gmemOff = atoi(value());
++        else if (a == "--gmem-draws") asked.gmemDraws = atoi(value());
+         else {
+-            std::printf("drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv] [--verify] [--long] | --golden [--long]\n");
++            std::printf("drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv] [--gpu] [--gmem-off BITS] [--gmem-draws N] [--verify] [--long]"
++                        " | --golden [--long]\n");
+             return 2;
+         }
+     }
+@@ -1036,6 +1071,8 @@ int main(int argc, char** argv) {
+         {"R", "the main pass of P recorded once, in sysmem (GMEM off)", 108, 0, 0, 0, false, false, 1, true, 0},
+         {"G", "one draw alone in a command buffer (the fixed cost of a pass and a submit)", 1, 0, 0, 0, false, true, 1},
+         {"H", "one draw into a pass whose load action is Clear", 1, 0, 0, 0, true, true, 1},
++        {"V", "a light frame of layers the size of the screen: 1 pass (Load) of 7 blended draws over all of one 750x1624 attachment", 7, 0, 0, 0, false, true, 1, false, 0, true},
++        {"W", "the same 7 draws with the second attachment bound (DontCare), 3 of them reading their target", 7, 3, 0, 0, false, true, 1, true, 0, true},
+     };
+     if (asked.each) {
+         runStageScenes();
+@@ -1057,6 +1094,24 @@ int main(int argc, char** argv) {
+         }
+         return 0;
+     }
++    if (asked.gpu) {
++        // What the GPU was given for a frame, as the fake's command processor read and ran it: the words the CP fetched
++        // (of them, inside draw-state groups), the registers it wrote and its CP_LOAD_STATE6 packets, the draws it ran
++        // (a tiled pass's: once a tile that sees them, and once more in the binning pass) and those a tile's visibility
++        // stream skipped, the groups run; and the memory the tiles moved: tiles, loads and stores, and the megabytes
++        // read into GMEM and written back at 4 bytes a pixel.
++        std::printf("drawbench --gpu: metal_gmem_off=%d metal_gmem_draws=%d; the last measured frame of each scene\n", asked.gmemOff, asked.gmemDraws < 0 ? 56 : asked.gmemDraws);
++        std::printf("%-2s %6s %7s %9s %9s %9s %7s %7s %8s %7s %6s %6s %6s %6s %8s %8s\n", "", "draws", "submits", "cp words", "in groups", "registers", "loads", "waits",
++                    "draws run", "skipped", "groups", "passes", "tiles", "binned", "load MB", "store MB");
++        for (const Result& r : gResults) {
++            const FakeGpu::Stats& g = r.gpu;
++            std::printf("%-2s %6u %7u %9llu %9llu %9llu %7u %7u %8u %7u %6u %6u %6u %6u %8.2f %8.2f  %u loads %u stores %u clears\n", r.letter.c_str(), r.draws, g.submits,
++                        (unsigned long long)g.cpWords, (unsigned long long)g.sdsWords, (unsigned long long)g.cpRegisters, g.cpLoads, g.cpWaits, g.draws, g.drawsSkipped,
++                        g.groupsRun, g.passes, g.tiles, g.binnedDraws, double(g.loadedPixels) * 4 / 1e6, double(g.storedPixels) * 4 / 1e6, g.tileLoads, g.tileStores,
++                        g.tileClears);
++        }
++        return 0;
++    }
+     if (asked.csv) {
+         std::printf("scene,draws,us_min,us_median,us_max,allocs_per_draw,alloc_bytes_per_draw,words_per_draw,commit_us_median,runs,cold_kb\n");
+         for (const Result& r : gResults) {

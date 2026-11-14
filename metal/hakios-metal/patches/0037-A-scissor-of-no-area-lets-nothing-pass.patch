@@ -1,0 +1,305 @@
+Subject: A scissor of no area lets nothing pass
+
+MTLScissorRect with a width or a height of 0 draws nothing. Through the C
+interface a rectangle of no width was the core's "width 0: the whole target"
+-- which is what no rectangle at all is -- so the draw covered the target; one
+of no height was refused, a draw left out with a line in the console.
+
+Draw::scissorEmpty says what such a rectangle is (the C interface sets it for
+either side 0; in the core a width with no height says the same). The draw is
+written like any other, with the screen scissor turnip writes for an empty one,
+the top left past the bottom right: (1, 1)-(0, 0) (tu_pipeline.cc:2669-2672).
+It opens its pass, Clear and all, touches no pixel (render::drawArea), and in a
+binned pass no tile's visibility stream lets it through. The fake takes that
+scissor for what it is, and a draw whose scissors leave it no pixel reaches no
+tile there.
+
+Two tests: the registers, a command buffer in sysmem and a binned pass of tiles
+(the tiles run the other draws and skip this one, each of them); and the C
+interface's rectangles of no width and of no height among others. The refusal's
+old expectation goes; the random frames, which ask for such scissors among
+their tweaks, now draw 230 draws more and refuse 230 fewer, the same from kept
+states as written whole. No golden stream of a scene changes.
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/render.hpp b/hakios-metal/include/hakios-metal/render.hpp
+index 1e56c7d..31c0797 100644
+--- a/hakios-metal/include/hakios-metal/render.hpp
++++ b/hakios-metal/include/hakios-metal/render.hpp
+@@ -359,6 +359,10 @@ struct Draw {
+     uint64_t indirectOffset = 0;
+     Viewport viewport{};
+     Scissor scissor{};                           // width 0: the whole target
++    // MTLScissorRect of no area (a width or a height of 0): no fragment passes. The draw is still a draw of its pass --
++    // it opens it, with its Clear -- and is written with the scissor turnip writes for an empty one, (1, 1)-(0, 0).
++    // (SCISSOR's height 0 with a width says the same.)
++    bool scissorEmpty = false;
+     float blendColor[4] = {0, 0, 0, 0};          // -setBlendColorRed:green:blue:alpha: (RB_BLEND_*_F32), read by the BlendColor/BlendAlpha factors
+     DepthState depth{};                          // -setDepthStencilState: (refused with a depth test and no depth attachment)
+     StencilState stencil{};                      // ...its stencil half (refused enabled with no stencil attachment)
+diff --git a/hakios-metal/src/c_api.cpp b/hakios-metal/src/c_api.cpp
+index acf0346..f676cb2 100644
+--- a/hakios-metal/src/c_api.cpp
++++ b/hakios-metal/src/c_api.cpp
+@@ -1543,7 +1543,10 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
+                               target != nullptr ? double(target->level(targetLevel).height) : 1.0, 0, 1};
+     }
+     if (scissor != nullptr) {
++        // (a rectangle of no area is one no fragment passes -- not the core's "width 0: the whole target", which is
++        // what no scissor at all is)
+         d.scissor = Scissor{scissor->x, scissor->y, scissor->width, scissor->height};
++        d.scissorEmpty = scissor->width == 0 || scissor->height == 0;
+     }
+     if (pass != nullptr) {
+         for (int i = 0; i < 4; i++) d.blendColor[i] = pass->blend_color[i];
+diff --git a/hakios-metal/src/fake_gpu.cpp b/hakios-metal/src/fake_gpu.cpp
+index 5ad7715..8932b00 100644
+--- a/hakios-metal/src/fake_gpu.cpp
++++ b/hakios-metal/src/fake_gpu.cpp
+@@ -1777,6 +1777,8 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
+         const uint32_t* sc = which == 0 ? d.screenScissor : d.viewportScissor;
+         // (in a tile the window scissor is the tile's and the draw's scissors are the target's, as on any pass: the
+         // window clips them, which is how a draw visits every tile)
++        // (the screen scissor of no area, as turnip writes one: (1, 1)-(0, 0). Nothing of the draw passes it.)
++        if (which == 0 && sc[0] == 1 && sc[1] == 1 && sc[2] == 0 && sc[3] == 0) continue;
+         if (sc[0] > sc[2] || sc[1] > sc[3] || (!inTile_ && (sc[2] > d.windowScissor[2] || sc[3] > d.windowScissor[3]))) {
+             fault(std::string(which == 0 ? "GRAS_SC_SCREEN_SCISSOR[0]" : "GRAS_SC_VIEWPORT_SCISSOR[0]") +
+                   text(" (%llu, %llu)-", sc[0], sc[1]) + text("(%llu, %llu) is not inside the window scissor", sc[2], sc[3]) +
+@@ -2006,7 +2008,8 @@ int FakeGpu::drawRuns(uint32_t word0, int depth) {
+         fault(text("draw %llu of a tile whose binning pass binned %llu: the streams name no such draw", n + 1, binnedDraws_.size()));
+         return -1;
+     }
+-    auto reaches = [&](const Binned& b) { return b.x0 <= tileBin_[2] && b.x1 >= tileBin_[0] && b.y0 <= tileBin_[3] && b.y1 >= tileBin_[1]; };
++    // (a draw whose scissors leave it no pixel reaches no tile)
++    auto reaches = [&](const Binned& b) { return b.x0 <= b.x1 && b.y0 <= b.y1 && b.x0 <= tileBin_[2] && b.x1 >= tileBin_[0] && b.y0 <= tileBin_[3] && b.y1 >= tileBin_[1]; };
+     if (reaches(binnedDraws_[n])) return 1;
+     stats_.drawsSkipped++;
+     bool more = false;
+diff --git a/hakios-metal/src/render.cpp b/hakios-metal/src/render.cpp
+index a2937d1..f74a528 100644
+--- a/hakios-metal/src/render.cpp
++++ b/hakios-metal/src/render.cpp
+@@ -318,6 +318,10 @@ bool pushedRanges(const Stage& s, const Bindings& b, PushedRanges* out, std::str
+     return true;
+ }
+ 
++// A scissor of no area as the registers say it: x and y 1, no width and no height, which the screen scissor's inclusive
++// corners (x, y)-(x + width - 1, y + height - 1) make (1, 1)-(0, 0)
++constexpr Scissor kEmptyScissor{1, 1, 0, 0};
++
+ // gl_vert_attrib's VERT_ATTRIB_GENERIC0 (Mesa shader_enums.h): a VS input at this slot + n is [[attribute(n)]]
+ constexpr uint32_t kVertAttribGeneric0 = 15;
+ 
+@@ -1666,10 +1670,12 @@ bool drawFacts(const Program& program, const RenderPass& pass, const Draw& draw,
+                                ") covers no pixel of the " + n(W) + " x " + n(H) + " target");
+     }
+     Scissor sc = draw.scissor;
+-    if (sc.width == 0) {
++    if (draw.scissorEmpty || (sc.width != 0 && sc.height == 0)) {
++        // no area: nothing passes. The corners are inclusive, and an empty rectangle is said as turnip says it, the
++        // top left past the bottom right (tu_pipeline.cc:2669-2672: min 1, max 0)
++        sc = kEmptyScissor;
++    } else if (sc.width == 0) {
+         sc = Scissor{0, 0, W, H};   // render.hpp: width 0 is the whole target
+-    } else if (sc.height == 0) {
+-        return refuse(why, "a scissor of " + n(sc.width) + " x 0 pixels: an empty scissor draws nothing (width 0 means the whole target)");
+     } else if (uint64_t(sc.x) + sc.width > W || uint64_t(sc.y) + sc.height > H) {
+         return refuse(why, "scissor (" + n(sc.x) + ", " + n(sc.y) + ", " + n(sc.width) + ", " + n(sc.height) + ") lies outside the " + n(W) + " x " + n(H) + " target");
+     }
+@@ -2625,6 +2631,7 @@ bool drawArea(const RenderPass& pass, const Draw& draw, uint32_t area[4]) {
+     uint32_t x0 = uint32_t(std::max(0.0, std::floor(vp.x))), y0 = uint32_t(std::max(0.0, std::floor(vp.y)));
+     uint32_t x1 = std::min(W, uint32_t(std::ceil(vp.x + vp.width))) - 1, y1 = std::min(H, uint32_t(std::ceil(vp.y + vp.height))) - 1;
+     const Scissor& sc = draw.scissor;
++    if (draw.scissorEmpty) return false;   // (it touches nothing)
+     if (sc.width != 0) {
+         if (sc.height == 0 || uint64_t(sc.x) + sc.width > W || uint64_t(sc.y) + sc.height > H) return false;
+         x0 = std::max(x0, sc.x);
+@@ -3730,9 +3737,11 @@ bool fastFacts(const ProgramState& ps, const PassCache& pc, const RenderPass& pa
+     if (!(vp.width > 0.0) || !(vp.height > 0.0)) return false;
+     if (vp.x >= double(W) || vp.y >= double(H) || vp.x + vp.width <= 0.0 || vp.y + vp.height <= 0.0) return false;
+     Scissor sc = draw.scissor;
+-    if (sc.width == 0) {
++    if (draw.scissorEmpty || (sc.width != 0 && sc.height == 0)) {
++        sc = kEmptyScissor;
++    } else if (sc.width == 0) {
+         sc = Scissor{0, 0, W, H};
+-    } else if (sc.height == 0 || uint64_t(sc.x) + sc.width > W || uint64_t(sc.y) + sc.height > H) {
++    } else if (uint64_t(sc.x) + sc.width > W || uint64_t(sc.y) + sc.height > H) {
+         return false;
+     }
+     f->sc = sc;
+diff --git a/hakios-metal/tests/draw_state_test.cpp b/hakios-metal/tests/draw_state_test.cpp
+index b3fa747..dc852d9 100644
+--- a/hakios-metal/tests/draw_state_test.cpp
++++ b/hakios-metal/tests/draw_state_test.cpp
+@@ -203,6 +203,26 @@ TEST(a_program_changed_by_the_c_interface_is_another_program_to_a_draw) {
+     hakios_metal_program_free(p);
+ }
+ 
++// Through the C interface a scissor rectangle of no width, or of no height, is a scissor nothing passes -- not the
++// core's "width 0: the whole target", which is what no rectangle at all (NULL) is. The draw is taken, among draws of
++// the same program that have their own rectangles, and the buffer completes with nothing left out.
++TEST(a_scissor_of_no_area_through_the_c_interface_is_drawn_as_one) {
++    CRig r;
++    hakios_metal_program* p = hakios_metal_program_from_stages(kernels::tri_flat_vs_air, kernels::tri_flat_fs_air, 70);
++    CHECK(p != nullptr);
++    if (p == nullptr) return;
++    hakios_metal_render_pass pass = r.pass();
++    hakios_metal_cb* cb = hakios_metal_cb_new(r.queue);
++    const hakios_metal_scissor some = {8, 8, 16, 16}, noWidth = {8, 8, 0, 16}, noHeight = {8, 8, 16, 0};
++    CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, &some, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
++    CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, &noWidth, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
++    CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, &noHeight, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
++    CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, &some, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
++    CHECK_EQ(hakios_metal_cb_skipped(cb, nullptr), 0u);
++    CHECK(done(cb) == HAKIOS_METAL_COMPLETED);
++    hakios_metal_program_free(p);
++}
++
+ // A draw the kept state cannot take is judged the long way and refused by the sentence it always was: a constant buffer
+ // not bound, after a draw that had it; a texture of the wrong class; a viewport outside the target. And the draw after,
+ // with what it needs, is drawn.
+diff --git a/hakios-metal/tests/golden/tests-a610.txt b/hakios-metal/tests/golden/tests-a610.txt
+index 1f319f1..ffb9ffa 100644
+--- a/hakios-metal/tests/golden/tests-a610.txt
++++ b/hakios-metal/tests/golden/tests-a610.txt
+@@ -138,11 +138,12 @@ a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround submits
+ a_programs_state_is_kept_by_the_queue_from_one_command_buffer_to_the_next submits 3 words 2895 draws 11 loads 22 stream 4ff66e4800bfa836 state 09bde857f6d3d994 names 13 38f44a1414b10600
+ a_program_made_by_hand_and_changed_in_place_is_drawn_as_it_is_now submits 1 words 760 draws 4 loads 8 stream 3124737029797cdf state 1b6f8d91e4c1b5b5 names 4 82e9056f7ae1d6e6
+ a_program_changed_by_the_c_interface_is_another_program_to_a_draw submits 1 words 882 draws 9 loads 18 stream 7ad80caa8188a98b state 3819d717c8bda6ac names 4 82e9056f7ae1d6e6
++a_scissor_of_no_area_through_the_c_interface_is_drawn_as_one submits 1 words 759 draws 4 loads 8 stream ca7926701597bfb7 state 1b6f8d91e4c1b5b5 names 4 82e9056f7ae1d6e6
+ a_draw_its_kept_state_cannot_take_is_refused_by_name_the_long_way submits 1 words 916 draws 6 loads 21 stream 7fc53092d23928bf state 6a704e6fd77244ca names 8 2e72016e06717bd7
+ a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full submits 6 words 71998 draws 480 loads 1560 stream 1754b8c0a4908115 state 46e525014b71eef1 names 98 4f1ea5a3e689aba6
+ the_groups_of_a_draw_write_registers_of_their_own submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+-       39692 draws taken, 26782 of them from a kept state; 6388 refused
+-random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 10398754 draws 83260 loads 234586 stream 70d3c763d432dab1 state f506fd40253001d9 names 39812 6b9eca66a105cc5a
++       39922 draws taken, 26981 of them from a kept state; 6158 refused
++random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 10432510 draws 83782 loads 235862 stream 298d25a9300bd191 state 65f71e5c645bea79 names 39820 9d8a0521e9fd6c52
+ more_programs_than_a_command_buffer_has_slots_for_are_each_drawn_as_themselves submits 2 words 41800 draws 1200 loads 3000 stream cff598f3a12f1875 state 21ac3e4de18e2525 names 50 ff709ab37b62cffe
+ end_only_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ fill_id_text_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+@@ -168,6 +169,7 @@ decode_round_trips_and_catches_bad_parity submits 0 words 0 draws 0 loads 0 stre
+ long_register_writes_are_cut submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ memcpy_layout_is_mesas submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ render_refuses_what_the_first_draw_does_not_serve_by_name submits 2 words 1380 draws 2 loads 8 stream 33b51a13d8703fc1 state 81caf134c68aec65 names 8 05d20adef5c3adcc
++an_empty_scissor_passes_no_fragment_and_is_no_refusal submits 3 words 20747 draws 124 loads 88 stream 805d332f4a09a18c state a42d27028b49be15 names 13 93db06bbb02e6679
+ render_encodes_the_first_triangles_registers submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ render_encodes_the_varying_link_of_tri_color submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ render_options_switch_each_group_and_each_alternative submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+diff --git a/hakios-metal/tests/golden/tests-a635.txt b/hakios-metal/tests/golden/tests-a635.txt
+index 7269f7a..be53a8b 100644
+--- a/hakios-metal/tests/golden/tests-a635.txt
++++ b/hakios-metal/tests/golden/tests-a635.txt
+@@ -138,11 +138,12 @@ a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround submits
+ a_programs_state_is_kept_by_the_queue_from_one_command_buffer_to_the_next submits 3 words 2895 draws 11 loads 22 stream 0b1b2ca465b80e3a state 09bde857f6d3d994 names 13 38f44a1414b10600
+ a_program_made_by_hand_and_changed_in_place_is_drawn_as_it_is_now submits 1 words 760 draws 4 loads 8 stream 17db46b630d582d5 state 1b6f8d91e4c1b5b5 names 4 82e9056f7ae1d6e6
+ a_program_changed_by_the_c_interface_is_another_program_to_a_draw submits 1 words 882 draws 9 loads 18 stream 6c62378d52407e41 state 3819d717c8bda6ac names 4 82e9056f7ae1d6e6
++a_scissor_of_no_area_through_the_c_interface_is_drawn_as_one submits 1 words 759 draws 4 loads 8 stream 3bc81e5c8a5b233d state 1b6f8d91e4c1b5b5 names 4 82e9056f7ae1d6e6
+ a_draw_its_kept_state_cannot_take_is_refused_by_name_the_long_way submits 1 words 916 draws 6 loads 21 stream e1fb977932e98a2d state 6a704e6fd77244ca names 8 2e72016e06717bd7
+ a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full submits 6 words 43886 draws 288 loads 936 stream f56ed7507d70c481 state f0b3fb98a3f3d879 names 98 4f1ea5a3e689aba6
+ the_groups_of_a_draw_write_registers_of_their_own submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+-       39692 draws taken, 26782 of them from a kept state; 6388 refused
+-random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 10404642 draws 83260 loads 234586 stream ff072de135564fed state 4eb3bfe1bcb9ac79 names 39812 6b9eca66a105cc5a
++       39922 draws taken, 26981 of them from a kept state; 6158 refused
++random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 10438494 draws 83782 loads 235862 stream ed8ad597c8e741b5 state baf162defab8d119 names 39820 9d8a0521e9fd6c52
+ more_programs_than_a_command_buffer_has_slots_for_are_each_drawn_as_themselves submits 2 words 41800 draws 1200 loads 3000 stream 52ca32fc2f9646cd state 21ac3e4de18e2525 names 50 ff709ab37b62cffe
+ end_only_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ fill_id_text_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+@@ -168,6 +169,7 @@ decode_round_trips_and_catches_bad_parity submits 0 words 0 draws 0 loads 0 stre
+ long_register_writes_are_cut submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ memcpy_layout_is_mesas submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ render_refuses_what_the_first_draw_does_not_serve_by_name submits 2 words 1380 draws 2 loads 8 stream 4087634dec79238d state 81caf134c68aec65 names 8 05d20adef5c3adcc
++an_empty_scissor_passes_no_fragment_and_is_no_refusal submits 3 words 7567 draws 40 loads 32 stream 4c9bc8763db2659d state 425d40b6b65398e5 names 13 93db06bbb02e6679
+ render_encodes_the_first_triangles_registers submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ render_encodes_the_varying_link_of_tri_color submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ render_options_switch_each_group_and_each_alternative submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+diff --git a/hakios-metal/tests/render_test.cpp b/hakios-metal/tests/render_test.cpp
+index 6ae5148..4288000 100644
+--- a/hakios-metal/tests/render_test.cpp
++++ b/hakios-metal/tests/render_test.cpp
+@@ -618,13 +618,81 @@ TEST(render_refuses_what_the_first_draw_does_not_serve_by_name) {
+         x = d;
+         x.scissor = Scissor{32, 0, 33, 64};
+         refused(r, p, pass, x, "scissor (32, 0, 33, 64) lies outside the 64 x 64 target");
+-        x = d;
+-        x.scissor = Scissor{0, 0, 5, 0};
+-        refused(r, p, pass, x, "a scissor of 5 x 0 pixels: an empty scissor draws nothing (width 0 means the whole target)");
++        // (a scissor of no area is no refusal: an_empty_scissor_passes_no_fragment_and_is_no_refusal)
+     }
+     CHECK_EQ(r.fake->stats().submits, 0u);
+ }
+ 
++// MTLScissorRect of no area -- a width or a height of 0 -- lets no fragment pass. It was taken for no scissor at all
++// when its width was 0 (the layer drawn over the whole target) and refused when its height was. It is a draw like any
++// other, written with the screen scissor turnip writes for an empty one, the top left past the bottom right: (1, 1)-(0,
++// 0) (tu_pipeline.cc:2669-2672). It opens its pass, Clear and all; it touches no pixel (render::drawArea), so the tiles
++// of a pass are laid for the other draws alone, and in a binned pass no tile's visibility stream lets it through.
++TEST(an_empty_scissor_passes_no_fragment_and_is_no_refusal) {
++    using namespace a6xx;
++    Rig r;
++    auto t = target(r);
++    RenderPass pass;
++    pass.color0 = t.get();
++    const Program p = flatProgram();
++    const uint32_t tl = regGrasScScreenScissor(REG_A6XX_GRAS_SC_SCREEN_SCISSOR_TL, 0);
++    for (int how = 0; how < 2; how++) {
++        Draw d = wholeDraw(3);
++        if (how == 0) d.scissorEmpty = true;            // (the C interface's: a rectangle given, with no width or no height)
++        else d.scissor = Scissor{0, 0, 5, 0};           // (a width and no height)
++        Encoded e(r, p, pass, d);
++        CHECK(e.ok);
++        if (!e.ok) std::printf("       %s\n", e.error.c_str());
++        CHECK_EQ(e.reg(tl), scissorXY(1, 1));
++        CHECK_EQ(e.reg(tl + 1), scissorXY(0, 0));
++        uint32_t area[4];
++        if (how == 0) CHECK(!render::drawArea(pass, d, area));
++    }
++    {
++        Draw whole = wholeDraw(3);
++        Encoded e(r, p, pass, whole);
++        CHECK(e.ok && e.reg(tl) == scissorXY(0, 0) && e.reg(tl + 1) == scissorXY(63, 63));   // (no scissor: the whole target, as ever)
++    }
++    // in a command buffer, first in its pass and after a draw of the same program (from its kept state), in sysmem
++    for (int after = 0; after < 2; after++) {
++        auto cb = r.queue->commandBuffer();
++        Draw d = wholeDraw(3);
++        d.scissorEmpty = true;
++        if (after) CHECK(cb->draw(p, pass, wholeDraw(3), Bindings{}, Bindings{}));
++        CHECK(cb->draw(p, pass, d, Bindings{}, Bindings{}));
++        if (after) CHECK(cb->draw(p, pass, wholeDraw(3), Bindings{}, Bindings{}));
++        cb->commit();
++        cb->waitUntilCompleted();
++        CHECK(cb->status() == CommandBuffer::kCompleted);
++        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
++        CHECK_EQ(r.fake->stats().faults, 0u);
++    }
++    // in a binned pass of tiles: the tiles run the two whole draws and none of them the empty one
++    {
++        Rig big;
++        auto screen = target(big, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
++        RenderPass a;
++        a.color0 = screen.get();
++        render::Options binned;
++        binned.gmemBinning = true;
++        auto cb = big.queue->commandBuffer();
++        Draw none = wholeDraw(3, 750, 1624);
++        none.scissorEmpty = true;
++        CHECK(cb->draw(p, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}, binned));
++        CHECK(cb->draw(p, a, none, Bindings{}, Bindings{}, binned));
++        CHECK(cb->draw(p, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}, binned));
++        cb->commit();
++        cb->waitUntilCompleted();
++        const auto s = big.fake->stats();
++        CHECK(cb->status() == CommandBuffer::kCompleted);
++        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), s.lastFault.c_str());
++        CHECK_EQ(s.faults, 0u);
++        CHECK(s.tiles != 0 && s.binnedDraws == 3);
++        CHECK_EQ(s.drawsSkipped, s.tiles);             // the empty one, by every tile
++        CHECK_EQ(s.draws, 2 * s.tiles);                // the two whole ones, a tile (the binning pass's three are binnedDraws)
++    }
++}
++
+ // --- the words, against the literals worked out by hand (a6xx-draw.md; tests/a6xx_test.cpp) ---------------------------------
+ 
+ TEST(render_encodes_the_first_triangles_registers) {

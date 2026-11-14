@@ -1,8 +1,10 @@
-# 13 — Driver Metal: coste de CPU por draw (etapas A y B de 10 §2.7), 2026-11-14
+# 13 — Driver Metal: coste de CPU por draw (etapas A y B de 10 §2.7) y conformidad con lo que pide CoreAnimation, 2026-11-14
 
 Informe fechado de implementación. Alcance: el núcleo C++ de `hakios-metal` y lo que el plug-in ObjC hace en cada
 draw, sobre la base upstream de HackiOS `63fc2b4` + parches A610 propios + opcionales (08 §5), y la fusión de la rama
-`gpu-pass` (14) en esta. El diagnóstico de partida es 10 §2; los datos del teléfono, 03 M1, M2, M6 y M11.
+`gpu-pass` (14) en esta. El diagnóstico de partida es 10 §2; los datos del teléfono, 03 M1, M2, M6 y M11. Desde la
+fusión la rama lleva también las correcciones de lo que el driver hacía distinto de lo que Metal exige y CoreAnimation
+pide (lista de 19 §2.9), guiadas por trazas de frames reales: §10.
 
 Convención de evidencia, la de 10: **[O]** observación propia (código con `archivo:línea` o medida reproducible),
 **[M]** medida del teléfono tomada por el coordinador (archivo citado), **[H]** hipótesis sin medir.
@@ -16,16 +18,21 @@ la rama que §7 nombra. Herramientas y resultados fuera de git: `rebuild/cpu-too
 
 | | Base (`propio-args`, `620950c`) | Rama `cpu-draw` |
 |---|---|---|
-| Teléfono, CPU por draw en el hilo que llama [M] | 142 µs (130-172) | 59 µs con `cpu-A-wip`; 17-20 µs con `merge-2` y el kernel 0350 (§6) |
+| Teléfono, CPU por draw en el hilo que llama [M] | 142 µs (130-172) | 59 µs con `cpu-A-wip`; 16-20 µs con `merge-2`, `merge-3` y `merge-4` y el kernel 0350 en adelante (§6) |
 | Teléfono, buffer hecho → commit [M] | 24,9 ms | 13,6 ms (`cpu-A-wip`); 4,0-6,0 ms (`merge-2`, kernel 0350) |
+| Teléfono, pasada principal del home en la GPU [M] | — | 10,5-11,4 ms guardando el segundo attachment (`merge-2`, `merge-3`); 9,6-11,2 ms sin guardarlo (`merge-4`, §10.2) |
 | Host, escena T (interfaz C, stages del teléfono, sysmem), µs por draw [O] | 10,88 | 3,40 (mínimo 2,82) |
 | Host, asignaciones de heap por draw, escena T [O] | 38,3 | 0,2 |
 | Palabras PM4 que recibe el procesador de comandos | — | las mismas, palabra por palabra, en todo lo que la rama `gpu-pass` no cambia a propósito (§4) |
 
-- El objetivo de < 10 µs por draw en el teléfono **no se alcanza**: 17-20 µs [M]. Qué queda y por qué: §6 y §9.
+- El objetivo de < 10 µs por draw en el teléfono **no se alcanza**: 16-20 µs [M]. Qué queda y por qué: §6 y §9.
 - La etapa B tal como la describe 10 §2.7 (cargas de estado elididas cuando no cambian) **no está hecha**: choca con
-  cómo `gpu-pass` convierte los draws de un pase en grupos de estado (§9.1). Lo que sí cambia el stream está en §3.9.
-- Bundles en `rebuild/out/`: `cpu-A-wip`, `merge-1`, `merge-2` medidos en el teléfono; el de la punta, §7.
+  cómo `gpu-pass` convierte los draws de un pase en grupos de estado (§9.1). Lo que sí cambia el stream está en §3.9
+  y §10.2.
+- Con la CPU en 16 µs por draw el límite es la GPU. §10 recoge lo que las trazas de frames reales muestran que el
+  driver hacía de más o distinto de lo pedido, lo corregido (ocho no conformidades, cada una con su prueba de host
+  donde el código es del núcleo) y lo que queda.
+- Bundles en `rebuild/out/`: `cpu-A-wip`, `merge-1` a `merge-4` medidos en el teléfono; `merge-5` y el de la punta, §7.
 
 ## 1. Punto de partida medido
 
@@ -287,6 +294,14 @@ salvo donde hay dos archivos):
 | `ab-k350-idle0-10354` | `merge-1` | 0350, `kern.sweet_idle_cache=0` | 44,0 | 122 | 26 µs | 5,6 ms |
 | `ab-k350-merge2-b` | `merge-2` (`6d3f273`) | 0350, `idle_cache=0` | 47,8 | 143 | 20 µs | 6,0 ms |
 | `ab-k350-merge2-passes` | `merge-2`, `metal_fps=passes` | 0350, `idle_cache=0` | 51,6 | 126 | 17 µs | 4,0 ms |
+| `ab-k352-merge3-a` | `merge-3` (`4e0a51a`) | 0352 | 49,0 | — | 16 µs | 4,8 ms |
+| `ab-k353-merge4-a` | `merge-4` (`81dd364`), `metal_fps=passes` | 0353, escalado directo por el DPU | 48,9 | — | 16 µs | — |
+
+[M] Entre ensayos idénticos de `merge-3` la base varía de 38,7 a 46,3 buffers/s (`ab-k352-m3b-*`): las diferencias
+entre filas de menos de ~15 % no dicen nada con n=1. Dos A/B del coordinador sobre `merge-3` que sí separan:
+`metal_gmem_off=64` (el cuerpo del pase sin grupos de estado, cada tile repite el estado de todos los draws) baja a
+35,3 buffers/s y sube commit→fin de ~28 a 43,8 ms: el trabajo del procesador de comandos por bin pesa;
+`metal_gmem_draws=6` no cambia nada medible en el home (44,2 y 48,2 buffers/s).
 
 ### 6.1 Por qué el teléfono iba ~13× más lento por draw que el host
 
@@ -312,8 +327,8 @@ y cada ms es tiempo de GPU entre el inicio de la pasada y el final de su cola, p
 39 draws; `tiles 42 touched 0x101`, 3,34 ms con 73 draws; `tiles 42 touched 0x301`, 2,39 ms con 52 draws; 3 sysmem de
 20 draws, 0,56 ms. El byte bajo 0x03 dice que en las pasadas de 78 tiles algún draw escribe o lee de verdad el segundo
 attachment; cuando solo se toca el primero salen 42 tiles. Esas pasadas cuestan ~0,10 ms por draw frente a ~0,046.
-[H] Qué draws tocan el segundo attachment y si lo escriben o solo lo leen no está medido (el campo `wrote`/`read` de
-§3.8 lo separa en la siguiente captura).
+[M] Con `merge-3` la pasada principal sale `wrote 0x3 read 0x3` (`ab-k352-merge3-b.txt`): el segundo attachment se
+escribe y se lee. Qué es y qué draws lo usan: §10.1.
 
 ## 7. Cómo construir y medir
 
@@ -418,9 +433,160 @@ a consultas de capacidades.
 
 ### 9.4 Tiempo de GPU
 
-La pasada principal en 78 tiles cuando se toca el segundo attachment (§6.2) es lo que domina el envío. Saber si se
-escribe o solo se lee, y qué draws, es el siguiente dato a capturar (`metal_fps=passes` con el bundle de la punta;
-`metal_fps=draws` sin `metal_gmem` para el desglose por draw).
+La pasada principal en 78 tiles (§6.2) domina el envío del home, y en las transiciones dominan las pasadas a
+pantalla completa que quedan en sysmem. Qué las compone, qué se ha quitado y qué falta: §10.
+
+## 10. Lo que pide un frame real y lo que el driver hacía distinto
+
+Con la CPU fuera del camino, lo que queda se ve en trazas de frames reales. El modo `metal_trace=frame` del estudio
+19 §5.3 está portado a la rama (`8707158`): al tocar `/var/tmp/metal.trace` el plug-in vuelca K command buffers
+enteros (attachments con sus acciones, texturas con su memoria, pipelines con el origen del código de cada etapa,
+draws con área, vértices transformados y enlaces, y cada pasada del núcleo con su modo, tiles y tiempo de GPU).
+Capturas del coordinador con el bundle de traza sobre `merge-1`, kernel 0352 a 820 MHz, en
+`~/sapphire-angel/research/metal/ios-graficos/trace/capturas/`: `metal-trace-2079-1.txt` (home, 12 command buffers) y
+`metal-trace-2079-2.txt` (abrir la app Tiempo, 90). Lector: `../trace-frame.py`.
+
+### 10.1 Qué muestran las trazas [M]
+
+- **La pasada principal del home** (`cb1/enc0`): 106 draws más uno que no se dibujaba, 100 % de la pantalla, c0 la
+  superficie de pantalla con `load`/`store`, y c1 una textura `storage=memoryless`
+  (`com.apple.coreanimation.memoryless-texture`) con `load=dontcare store=store`. Empieza con cuatro rellenos opacos a
+  pantalla completa (`PBGRAXm_A2Xhf`) y el fondo en capas mezcladas casi completas; el resto son iconos (tres
+  pipelines por icono: sombra de la etiqueta con mezcla en el shader `TcimBdsoA2Xhf_Ialp`, etiqueta, imagen).
+- **Para qué sirve c1.** CoreAnimation lo usa como memoria de trabajo dentro del pase: un draw con `S1`
+  (`fc_dest_index` 1) escribe en c1 — `TimgA2S1Xhf_IsrcM0` copia a c1 el fondo que hay en c0, leyéndolo por
+  framebuffer fetch — y un draw posterior lo lee por fetch como imagen (`TbdsA2Xhf_Isup_IsrcM1`: devuelve el fondo
+  guardado fuera de la máscara de esquinas continuas de un widget; `TcimA2Xhf_IsrcM1`: compone un grupo). Nada lee lo
+  que queda en c1 después del pase: cada pase lo sobrescribe (tabla «Resultados que nadie lee» del lector).
+- **El draw que no se dibujaba** es el último de cada frame: `std_vert1_lph+luma_boost_lph` a pantalla completa,
+  `res="left out: luma_boost"`, en 12 de 12 y 90 de 90 command buffers. Lee `[[color(0)]]` y suma
+  `edr·scale·LUT(luma)`; con los uniformes de la traza, scale = 0,05.
+- **El home quieto se redibuja cada 100,0 ms** por el segundero del icono del Reloj: entre frames solo cambia la
+  geometría de un draw de una textura de 6×85 dentro del icono (411,37; 770,69 → 411,41; 769,63 → 411,44; 769,10).
+- **Al abrir una app**, de 906 ms de GPU en pasadas, 450 ms son de 244 pasadas a 750×1624 en sysmem (8,4 draws de
+  media, 1,85 ms cada una). Las más caras tienen 23-25 draws y cuestan 8-11,7 ms: dos rellenos opacos completos, otro
+  del 90 % y una imagen mezclada completa, es decir ~2,7 ms por capa completa a través de memoria. Quedan en sysmem
+  porque la regla de apertura mira el número de draws (§10.4).
+- **Pipelines sustituidos**: ocho en esas trazas, todos creados por CoreAnimation en ejecución (los que su pipeline
+  library no nombra; llegan con sus funciones etiquetadas `com.apple.coreanimation.frag.<constantes>`), cada uno
+  compilado de «la variante más cercana»: `TimgA2S1Xhf_Ixrg` como `…Xhfcx_Ixrg`, `TmuaA2S1Xhf_Ixrg_Isqr` como
+  `…Xhfcx_Isrc_Isqr`, `TimgBdsoA2Xhfn_Isrc` como `…Xhfcn_Isrc`, `TimgA2Xhfn_IsrcN3Oc3mtc4` sin el ruido.
+- En la consola (`medicion/ab/`), los únicos draws rechazados en uso normal son rangos de constantes: «reads 64 bytes
+  at 0 of constant buffer 2; 16 are bound and 16 mapped behind the offset» y el equivalente de
+  `downsample_blur_vert_lph` con 48.
+- No hay en esas trazas texturas YCbCr, ni superficies distintas de las de pantalla, ni targets muestreados antes de
+  escribirse, ni command buffers en error.
+
+### 10.2 Lo corregido
+
+Cada fila es un commit de `cpu-draw`. «Prueba» es la de host que falla sin el cambio; donde el código es solo del
+plug-in no hay prueba de host (no se construye en host) y se dice. Los golden cambian solo en las líneas que cada
+commit nombra.
+
+| No conformidad (19 §2.9) | Qué hacía | Qué hace | Commit · prueba | En el teléfono [M] o a la vista |
+|---|---|---|---|---|
+| Memoryless guardada | La textura memoryless de c1 tenía memoria como cualquiera y se obedecía su `store` (el valor por defecto de un colour attachment): cada tile de la pasada principal guardaba 128×128 píxeles que nadie lee | `Texture::setMemoryless`: los tiles ni la cargan ni la guardan; solo cuando un pase de Metal queda en dos del núcleo (un draw que no puede unirse, con Load en todos los attachments) la primera mitad la guarda y la segunda la carga (`closePass` recibe el pase del draw que lo cierra). Conserva filas para los pases en sysmem | `050c059` · `a_memoryless_attachment_is_neither_loaded_nor_stored_by_the_tiles` | `merge-4`: la pasada principal sale `loaded 0x1 stored 0x1` |
+| N-03 | Un rango de constantes que ir3 rellena a vec4 enteros (16 B de color → 64) y pasa de las páginas del buffer: draw rechazado y omitido | Se carga directo: los bytes que hay, leídos al codificar, y ceros detrás. El procesador de comandos sigue sin leer fuera de las páginas. Igual en dispatch | `c571fcd` · `a_constant_range_running_past_its_buffers_pages_is_loaded_with_what_is_there` | `merge-4`: 0 líneas `refused` |
+| N-01 | Pipeline creado en ejecución → variante «cercana» de la library, con otras constantes | Se compilan los módulos propios de las funciones con las constantes de CoreAnimation; las variantes de la library solo cuando son la misma función por los nombres de CoreAnimation (etiqueta de la función, o pipeline de la library por su etiqueta), y las dos etapas del mismo origen. Si el compilador rechaza lo pedido, y solo entonces, compila la variante cercana y lo dice con el motivo (backboardd aborta al segundo fallo de un pipeline); `metal_strict` da el rechazo | `81dd364` · sin prueba de host | `merge-4`: 0 `stands in for it`, 4 pipelines «its own module» |
+| N-24, N-08 | `luma_boost` omitido en todos los frames; `luma_boost`/`edr_scale` sustituidos por `inplace_copy` | Se dibuja; las funciones pedidas son las que se compilan | `81dd364` · sin prueba de host | El `(+1 no)` desaparece; un draw más a pantalla completa con fetch por frame |
+| N-18 | Un draw que lee su target en sysmem se ordenaba solo con la barrera previa: entre las primitivas del propio draw, nada | `GRAS_SC_CNTL.SINGLE_PRIM_MODE = FLUSH_PER_OVERLAP_AND_OVERWRITE`, como los dos drivers de Mesa (`fd6_emit.cc:564-570`, `tu_pipeline.cc:3373-3376`); la barrera se queda. Se apaga con `metal_gmem_off=8192` | `4c3a83d` · `a_draw_that_reads_its_target_gets_the_target_as_a_texture_and_a_barrier_before_it` | `merge-5`, sin medir |
+| N-04 | Scissor de anchura 0 = «sin scissor» (el draw cubría el target); de altura 0, draw rechazado | No deja pasar nada: se escribe como turnip un scissor vacío, (1,1)-(0,0) (`tu_pipeline.cc:2669-2672`); el draw abre su pase y no toca ningún bin | `4cf8232` · `an_empty_scissor_passes_no_fragment_and_is_no_refusal`, `a_scissor_of_no_area_through_the_c_interface_is_drawn_as_one` | `merge-5`, sin medir |
+| N-07 | El dispositivo no declaraba la alineación de 64 B que necesitan las filas de una textura sobre IOSurface o buffer | `iosurfaceTextureAlignmentBytes`, `iosurfaceReadOnlyTextureAlignmentBytes`, `linearTextureAlignmentBytes`, `deviceLinear(ReadOnly)TextureAlignmentBytes` y `minimumLinearTextureAlignmentForPixelFormat:` contestan 64 (los selectores existen en el Metal de 20H392) | `e22b881` · sin prueba de host | Sin medir. Solo alcanza a las superficies que crea backboardd |
+| N-14 | Swizzle del descriptor: nil en texturas propias, ignorado sobre IOSurface | La textura se crea igual y se lee a través del swizzle, como una vista con swizzle | `e22d7bf` · sin prueba de host del plug-in | Sin medir |
+
+Qué mide el host del cambio de memoryless (escena S de `drawbench`: los programas del teléfono, 110 draws, dos
+attachments, 78 tiles): 78 cargas y 156 guardados (4,88 MB leídos, 9,77 MB escritos) pasan a 78 y 78 (4,88 y
+4,88 MB). Los 78 tiles no cambian: la pasada escribe y lee c1, y 128 KiB de GMEM entre 8 B por píxel son bins de
+128×128.
+
+### 10.3 Medidas de host del trabajo que recibe la GPU
+
+`drawbench --gpu [--gmem-off BITS] [--gmem-draws N] [--no-memoryless]` (`c2c2b24`) imprime, del último frame medido
+de cada escena, lo que el procesador de comandos del fake leyó y ejecutó y lo que movieron los tiles. El fake no
+rasteriza: fragmentos y mezcla no salen de aquí. A610, la punta frente a `--gmem-off 6080` (el pase como antes de
+`gpu-pass`):
+
+| Escena | tiles | palabras del CP | registros | `CP_LOAD_STATE6` | MB cargados + guardados |
+|---|---|---|---|---|---|
+| S, programas del teléfono, 2 attachments | 78 (antes 102) | 897 K (1 275 K) | 413 K | 29,0 K (102,9 K) | 4,88 + 4,88 |
+| P, 108 draws, c1 sin tocar | 42 (102) | 76 K (490 K) | 18 K | 1,3 K (55,6 K) | 4,88 + 4,88 |
+| Q, P con fetch cada 4 draws | 42 (102) | 159 K (780 K) | 58 K | 2,1 K (58,3 K) | 4,88 + 4,88 |
+| U, 5 pasadas de 22 draws | 234 (sysmem) | 531 K (13,6 K) | 249 K | 13,9 K | 19,5 + 19,5 |
+| V, 7 capas a pantalla completa | sysmem; 39 con `--gmem-draws 6` | 812; 26 K | 321; 11 K | 35; 920 | 0; 4,88 + 4,88 |
+
+De las 897 K palabras de S, 737 K están en grupos de estado: programa 2 661 ejecuciones × 136 palabras, cargas
+3 232 × 51, viewport 3 232 × 21, rasterizador 1 841 × 28, vértices 1 185 × 34, mezcla 873 × 33, pase 237 × 69. Fuera
+de grupos, 160 K: cada tile lee los `CP_SET_DRAW_STATE` y el paquete de draw de los 110 draws aunque se salte 70 de
+ellos por visibilidad. CoreAnimation cambia de pipeline en casi cada draw (tres por icono), así que el grupo de
+programa corre casi en cada draw ejecutado. [M] Que ese trabajo pesa lo dice el A/B de §6 con `metal_gmem_off=64`.
+
+### 10.4 Tiles o sysmem: lo que hace turnip y lo que hace el driver
+
+[O] turnip (Mesa 25.0.7, `tu_autotune.cc:541-640`, `tu_pass.cc:673-699`, `tu_pipeline.cc:2850-2886`) elige sysmem si
+`cleared·px + D ≤ (11·(loaded + stored)·px + D)/10`, con D = muestras del pase × bytes por muestra (el cpp de cada
+attachment escrito, doble si mezcla). Las muestras son las que ese pase pasó la última vez, medidas con dos
+instantáneas `ZPASS_DONE` del contador de muestras, al empezar y al acabar (`:642-733`). Sin historia, sysmem solo con
+5 draws o menos (`:504-517`); con un draw que lee su target, GMEM siempre (`:548-554`).
+
+[O] `render::gmemWorth` (`src/render.cpp`, `include/hakios-metal/render.hpp`) usa la misma desigualdad con D supuesto
+proporcional al número de draws y calibrado por `metal_gmem_draws=56`: supone ~1/23 de pantalla por draw, cierto para
+un home de iconos y 20 veces corto para capas a pantalla completa. Además la regla de apertura deja en sysmem, sin
+grabar para tiles, todo pase cuyo «semejante» tuvo menos de 28 draws en sus últimas 16 veces, sin saber si lleva un
+draw con fetch. Consecuencias medidas: las pasadas de 23-25 draws de §10.1 (8-11,7 ms en sysmem; por la fórmula de
+turnip con sus ~4 pantallas de muestras irían a tiles) y el pase final sobre la pantalla, que desde que se dibuja
+`luma_boost` lleva un fetch a pantalla completa y sale unas veces en 42 tiles y otras en sysmem según la historia de
+draws (`ab-k353-merge4-a.txt`: `draws 7 tiles 42 … touched 0x301` y `draws 11 … sysmem: its like had 11 draws`).
+
+Lo que corresponde, y no está hecho: medir las muestras de cada pase como turnip (el contador ya se usa para las
+consultas de oclusión, `src/render.cpp`, con la espera que el A610 necesita), guardar la historia por clase de pase en
+la cola y decidir con D medido tanto al cerrar como al abrir.
+
+### 10.5 `metal_all=1`: por qué no se puede dar Metal a todo proceso por defecto
+
+Solo backboardd recibe el dispositivo; `metal_all=1` lo da a todos. La puerta es del plug-in
+(`-initWithAcceleratorPort:`) y su razón escrita (abortos por pipeline libraries sin `default.metallib`) no está
+confirmada. Lo que lo impide está en el servicio del kernel (`SapphireGpu.cpp`, árbol `xnu-0350` de
+`~/sapphire-angel/research/metal/display/work/`, igual a aplicar la serie de `xnu/patches`), leído sin probar nada:
+
+- [O] Un solo espacio de direcciones de GPU para todos los clientes (un banco SMMU, un TTBR0 con ASID 0, `:1965`; el
+  comentario de `:4188` lo dice: «one address space for all clients, no register protection»). Un envío es un
+  `CP_INDIRECT_BUFFER` al buffer del cliente sin validar (`:6431-6434`) y no hay tabla `CP_PROTECT`. [H] Un cliente
+  puede leer y escribir por dirección la memoria de GPU de otro, y el pool con el ring, las fences y las tablas de
+  páginas está en ese mismo espacio.
+- [O] La recuperación es global (una espera de 2 s reinicia la GPU y da por terminado lo de todos), hay una sola
+  secuencia de fences sin prioridades, no hay cuotas (pool de 1 GB compartido) ni comprobación al abrir el servicio.
+  El borrado de memoria nueva sí es correcto por defecto (`gpu_zero=1`).
+- [O] En usuario: `/var/tmp/metal.args` gobierna el driver de cualquier proceso; la caché de stages es un directorio
+  compartido y escribible, con clave no criptográfica y carga sin validar; cada proceso compila sus shaders y guarda
+  hasta 32 MB de buffers libres y 64 MB de programas.
+
+Para que sea seguro hace falta, por este orden: tabla de páginas por cliente con cambio de TTBR0 por envío y
+`CP_PROTECT` (como el driver msm de Linux: `a6xx_gpu.c:103-147`, `:479-502`); recuperación con culpa por envío;
+fences y colas por cliente con prioridad al servidor de ventanas; cuotas; caché de stages privada por proceso con una
+semilla del sistema de solo lectura. No determinado: qué procesos abrieron el dispositivo en la tanda de prueba, si
+alguno aborta con él, y el coste real por proceso.
+
+### 10.6 Qué queda
+
+- **Parpadeo del widget de Tiempo cuando algo se le superpone** [M, observación del usuario con `merge-4`]. Sin causa
+  establecida. Hipótesis, todas [H]: el mismo pase sale unas veces en tiles y otras en sysmem (§10.4) y los dos lados
+  no dan lo mismo (N-18 es un candidato); el degradado del widget (`TimgA2Xhfn_IsrcN3Oc3mtc4`) es uno de los
+  pipelines que ahora se compilan del módulo propio; `luma_boost`; la copia por CPU de superficies con filas no
+  múltiplo de 64 B (N-06; 2 848 B = 712 px, el ancho de un widget mediano). Lo decide: si ocurre con `merge-3`; con
+  `merge-4`, `metal_skip=luma_boost`, `metal_gmem_draws=1` y `metal_gmem=0` uno a uno; `merge-5` con y sin
+  `metal_gmem_off=8192`; y una traza de 40 command buffers con el parpadeo en pantalla.
+- **Destellos de colores al abrir apps**: la traza no tiene nada mal formado; candidatos a la vista son los pipelines
+  sustituidos (corregido), la imagen de lanzamiento en ASTC 4×4 de 750×1624 y un relleno blanco opaco del 90 % bajo
+  una textura de 752×1626 mezclada durante 20 frames. Hace falta una captura de pantalla del frame del destello.
+- **Elección tiles/sysmem por muestras medidas** (§10.4).
+- **N-02** (command buffer `Completed` con trabajo omitido): con N-03 servido no queda ningún rechazo en uso normal;
+  marcar `Error` por defecto pide saber antes qué hace CoreAnimation con un command buffer en error. **N-09** (un
+  estado rechazado envenena el encoder): no aparece en ninguna consola.
+- **N-05, N-06** (YCbCr y superficies no alineadas por copia de CPU al enlazar): lo conforme es leerlas en la GPU al
+  ejecutar, con una pasada propia antes del pase que las muestrea; no está hecho. N-07 solo alinea lo que crea
+  backboardd.
+- **Memoria de las texturas memoryless**: siguen teniendo filas (4,9 MB cada una a pantalla completa) para los pases
+  en sysmem; asignarlas solo cuando un pase en sysmem las necesita no está hecho.
 
 ## Estado al cerrar
 

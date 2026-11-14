@@ -5,8 +5,8 @@ directamente en la GPU, a través del servicio `SapphireGPU` del kernel. Se cons
 
 - **Base:** [oosexgang/hakios-xnu-kernel](https://github.com/oosexgang/hakios-xnu-kernel) en el commit `63fc2b4`
   (hakios-metal y su plug-in `userland/src/HakiosMetalCA.m`, licencia MIT).
-- **Serie del port:** `patches/`, 29 parches que se aplican en orden con `git apply` sobre ese commit y dan
-  exactamente el árbol del que sale el binario del instalador (`4e0a51a` en el árbol de trabajo). Contienen el
+- **Serie del port:** `patches/`, 42 parches que se aplican en orden con `git apply` sobre ese commit y dan
+  exactamente el árbol del que sale el binario del instalador (`96d9bac` en el árbol de trabajo). Contienen el
   soporte del A610 escrito desde Mesa 25.0.7 y el kernel del port, la lectura de opciones de
   `/var/tmp/metal.args`, el coste de CPU por draw (estado guardado por programa, sin asignaciones en el camino
   de draw) y las pasadas en tiles (grupos de draw state, bins de turnip, elección de tiles o sysmem por contenido).

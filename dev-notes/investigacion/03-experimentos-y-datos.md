@@ -769,3 +769,21 @@ Kernel 0353, `kern.sweet_fb_scanout=1` desde M17, varias horas de uso con reinic
 la copia: el plano alterna entre escalado y sin escalar varias veces por segundo, y como los dos caminos no colocan
 la imagen en el mismo sitio, cada cambio se ve como un salto. Hay dos defectos: el pool que se agota y el encuadre
 distinto de los dos caminos (18).
+
+## M23 — `merge-7` (2026-11-14)
+
+Kernel 0353 a 820 MHz, salida por copia con las superficies en el pool (`kern.sweet_fb_scanout=2`), parciales
+activas. `merge-7` (96d9bac) cargado. n=1.
+
+- Capturas de home, vista de widgets y Centro de Control con `merge-5` y con `merge-7`
+  (`medicion/shots/hoja-vistas-m5.png`, `hoja-vistas-m7.png`; `tools/perf/vistas.sh`): con `merge-7` se ven el widget
+  de Calendario del home y los cuatro widgets de la vista lateral, como con `merge-5`.
+- `homeswipe.sh 8`: 50,7 buffers/s, 74,6 draws por buffer, 19 µs por draw, commit→fin 16,0 ms.
+- Tras reiniciar backboardd, primera apertura del Centro de Control: codificación máxima de un frame 68,8 ms, GPU
+  media 14,9 ms (máximo 34,5); primera vez en la vista de widgets: 56,7 ms, GPU media 10,9 ms (máximo 25,5)
+  (`trace/capturas-merge7/`).
+- La pérdida de widgets de `merge-6` (M21) venía de declarar la alineación de 64 B: con ella CoreAnimation entrega sus
+  imágenes como buffers sin copia sobre su propia memoria, y el driver copia esos buffers al crearlos, así que lo que
+  el otro proceso escribe después no se ve (13). En `merge-7` esa declaración queda tras `metal_align` y apagada.
+
+Queda instalado `merge-7`; el instalador lleva ese build y `metal/hakios-metal/patches/` su serie (42 parches).

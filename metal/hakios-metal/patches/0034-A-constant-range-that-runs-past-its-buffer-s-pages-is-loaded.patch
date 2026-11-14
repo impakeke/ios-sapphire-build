@@ -1,0 +1,262 @@
+Subject: A constant range that runs past its buffer's pages is loaded with what is there
+
+ir3 pushes a stage's constant ranges in whole vec4 and padded: a 16-byte colour
+is a range of 64 bytes. The command processor reads all of it, the function
+only what it uses, and Metal has the draw drawn whatever length was bound. A
+range that ran past the bound object's pages was a refusal -- on the phone
+"fixed_frag_lph_cph reads 64 bytes at 0 of constant buffer 2; 16 are bound and
+16 mapped behind the offset" and "downsample_blur_vert_lph reads 64 bytes at 0
+of constant buffer 3; 48 are bound and 48 mapped", each a layer or a blur stage
+left out of a frame whose command buffer still ended Completed.
+
+Such a range is now loaded direct: the bytes that are there, read when the
+draw is encoded (as a range bound off 16 bytes already is), and zeros after
+them. The command processor is still never let read past the pages. A draw
+with such a range is not taken from its program's kept state (fastRanges
+declines it) and is written whole. The same for a dispatch's ranges. A buffer
+mapped nowhere for this processor is still refused, by name.
+
+The refusal's two tests now expect the work done: the draw's constants are the
+colour that was bound and zeros, first in its pass or after draws of the same
+program from a kept state; the dispatch completes. Their golden lines change
+with them, and no other line.
+
+
+---
+diff --git a/hakios-metal/src/compute.cpp b/hakios-metal/src/compute.cpp
+index 9ea5c21..804792e 100644
+--- a/hakios-metal/src/compute.cpp
++++ b/hakios-metal/src/compute.cpp
+@@ -378,16 +378,27 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
+             return refuse(why, std::string(k.name) + ": a constant range of " + n(r.sizeDwords) + " dwords, not a whole number of vec4");
+         }
+         // The range is ir3's, in whole vec4 and padded: fill_id reads 4 bytes of its constant and the range is 64. The
+-        // GPU reads the padding too, so the read must stay inside the object's pages, where nothing faults -- not
+-        // inside the length the program bound. Metal binds 4 bytes by -setBytes:length:atIndex: to such a kernel as
+-        // a matter of course (the plug-in's test on the phone, 28 October), and a refusal here failed that dispatch.
+-        if (uint64_t(r.startDword) * 4 + uint64_t(r.sizeDwords) * 4 > mapped) {
+-            return refuse(why, std::string(k.name) + " reads " + n(r.sizeDwords * 4) + " bytes at " + n(r.startDword * 4) + " of constant buffer " + n(r.block) +
+-                                   "; " + n(bytes) + " are bound and " + n(mapped) + " mapped behind the offset");
+-        }
++        // GPU reads the padding too, which inside the object's pages is harmless -- Metal binds 4 bytes by
++        // -setBytes:length:atIndex: to such a kernel as a matter of course (the plug-in's test on the phone, 28
++        // October). Past the pages it cannot be let read: the range is loaded direct, what is there and zeros after
++        // it (render.cpp: pushedRanges).
+         if (r.offsetVec4 + r.sizeDwords / 4 > k.constlen) {
+             return refuse(why, std::string(k.name) + ": constant buffer " + n(r.block) + "'s range at vec4 " + n(r.offsetVec4) + " runs past its constlen");
+         }
++        if (uint64_t(r.startDword) * 4 + uint64_t(r.sizeDwords) * 4 > mapped) {
++            const Binding& x = buffers[r.block];
++            if (x.buffer->contents() == nullptr) {
++                return refuse(why, std::string(k.name) + " reads " + n(r.sizeDwords * 4) + " bytes at " + n(r.startDword * 4) + " of constant buffer " + n(r.block) +
++                                       "; " + n(bytes) + " are bound and " + n(mapped) + " mapped behind the offset, in a buffer mapped nowhere to read them from");
++            }
++            Range g{r.offsetVec4, r.sizeDwords / 4, 0, std::vector<uint32_t>(r.sizeDwords, 0u)};
++            const uint64_t start = 4ull * r.startDword;
++            if (start < mapped) {
++                memcpy(g.words.data(), static_cast<const uint8_t*>(x.buffer->contents()) + x.offset + start, size_t(std::min<uint64_t>(mapped - start, 4ull * r.sizeDwords)));
++            }
++            ranges.push_back(std::move(g));
++            continue;
++        }
+         Range g{r.offsetVec4, r.sizeDwords / 4, address + 4ull * r.startDword, {}};
+         if (g.from % 16 != 0) {
+             const Binding& x = buffers[r.block];
+diff --git a/hakios-metal/src/render.cpp b/hakios-metal/src/render.cpp
+index 15a639f..594c8b6 100644
+--- a/hakios-metal/src/render.cpp
++++ b/hakios-metal/src/render.cpp
+@@ -251,9 +251,12 @@ struct PushedRanges {
+     PushedRange* end() { return r + count; }
+ };
+ 
+-// The stage's pushed ranges against its own [[buffer(n)]] table, by compute's rules (compute.cpp: the range is ir3's,
+-// in whole vec4 and padded -- a 16-byte float4 is pushed as 64 bytes -- so the read must stay inside the bound object's
+-// pages, not inside the length bound; it must land inside the stage's constlen). False with *why naming the stage.
++// The stage's pushed ranges against its own [[buffer(n)]] table. The range is ir3's, in whole vec4 and padded -- a
++// 16-byte float4 is pushed as 64 bytes -- so what the command processor reads is more than the function does, and may
++// run past the length bound: inside the bound object's pages that is harmless, the function reads none of it. Past the
++// pages the processor cannot be let read: such a range is loaded direct instead, the bytes that are there as they are
++// when the draw is encoded and zeros after them (CoreAnimation binds 16 bytes of colour at the end of a buffer for a
++// function whose range is 64). It must land inside the stage's constlen. False with *why naming the stage.
+ bool pushedRanges(const Stage& s, const Bindings& b, PushedRanges* out, std::string* why) {
+     const Kernel& k = s.k;
+     auto name = [&s]() { return std::string(stageName(s)); };   // (built only for a refusal: a string a draw is an allocation a draw)
+@@ -285,13 +288,25 @@ bool pushedRanges(const Stage& s, const Bindings& b, PushedRanges* out, std::str
+         if (r.sizeDwords == 0 || r.sizeDwords % 4 != 0) {
+             return refuse(why, name() + ": a constant range of " + n(r.sizeDwords) + " dwords, not a whole number of vec4");
+         }
+-        if (uint64_t(r.startDword) * 4 + uint64_t(r.sizeDwords) * 4 > mapped) {
+-            return refuse(why, name() + " reads " + n(r.sizeDwords * 4) + " bytes at " + n(r.startDword * 4) + " of constant buffer " + n(r.block) + "; " +
+-                                   n(bytes) + " are bound and " + n(mapped) + " mapped behind the offset");
+-        }
+         if (r.offsetVec4 + r.sizeDwords / 4 > k.constlen) {
+             return refuse(why, name() + ": constant buffer " + n(r.block) + "'s range at vec4 " + n(r.offsetVec4) + " runs past its constlen of " + n(k.constlen));
+         }
++        if (uint64_t(r.startDword) * 4 + uint64_t(r.sizeDwords) * 4 > mapped) {
++            // (past the object's pages: what is there, read here, and zeros)
++            if (x.buffer->contents() == nullptr) {
++                return refuse(why, name() + " reads " + n(r.sizeDwords * 4) + " bytes at " + n(r.startDword * 4) + " of constant buffer " + n(r.block) + "; " +
++                                       n(bytes) + " are bound and " + n(mapped) + " mapped behind the offset, in a buffer mapped nowhere to read them from");
++            }
++            const PushedRange p{r.offsetVec4, r.sizeDwords / 4, 0, uint32_t(out->words.size()), r.sizeDwords, false, 0, nullptr, 0, nullptr};
++            out->words.resize(out->words.size() + r.sizeDwords, 0u);
++            const uint64_t start = 4ull * r.startDword;
++            if (start < mapped) {
++                memcpy(out->words.data() + p.wordsAt, static_cast<const uint8_t*>(x.buffer->contents()) + x.offset + start,
++                       size_t(std::min<uint64_t>(mapped - start, 4ull * r.sizeDwords)));
++            }
++            out->r[out->count++] = p;
++            continue;
++        }
+         PushedRange p{r.offsetVec4, r.sizeDwords / 4, x.buffer->gpuAddress() + x.offset + 4ull * r.startDword, 0, 0, false, 0, nullptr, 0, nullptr};
+         if (p.from % 16 != 0) {
+             p.copy = true;
+diff --git a/hakios-metal/tests/compute_test.cpp b/hakios-metal/tests/compute_test.cpp
+index 86df362..906e470 100644
+--- a/hakios-metal/tests/compute_test.cpp
++++ b/hakios-metal/tests/compute_test.cpp
+@@ -327,10 +327,16 @@ TEST(a_constant_shorter_than_its_pushed_range_is_read_from_the_objects_pages) {
+         CHECK_EQ(r.fake->stats().faults, 0u);
+     }
+     {
++        // ...and bound where the padded range runs off the object's pages: dispatched all the same, the range loaded
++        // direct with the bytes that are there and zeros after them
+         auto page = buffer(r, 16384, 0x1234);   // exactly one page of GPU memory
+         auto cb = r.queue->commandBuffer();
+-        CHECK(!cb->dispatch(kernels::fill_id_air, kGroups16, local, {Binding{out.get(), 0}, Binding{page.get(), 16384 - 32}}));
+-        CHECK(cb->error().find("reads 64 bytes at 0 of constant buffer 1; 32 are bound and 32 mapped") != std::string::npos);
++        CHECK(cb->dispatch(kernels::fill_id_air, kGroups16, local, {Binding{out.get(), 0}, Binding{page.get(), 16384 - 32}}));
++        CHECK(cb->error().empty());
++        cb->commit();
++        cb->waitUntilCompleted();
++        CHECK(cb->status() == CommandBuffer::kCompleted);
++        CHECK_EQ(r.fake->stats().faults, 0u);
+     }
+ }
+ 
+diff --git a/hakios-metal/tests/golden/tests-a610.txt b/hakios-metal/tests/golden/tests-a610.txt
+index 9f8095e..352d8d7 100644
+--- a/hakios-metal/tests/golden/tests-a610.txt
++++ b/hakios-metal/tests/golden/tests-a610.txt
+@@ -107,7 +107,7 @@ an_indirect_dispatch_reads_its_counts_when_it_runs submits 1 words 178 draws 0 l
+ a_dispatch_of_fill_id_holds_together_and_the_fake_does_not_run_it submits 1 words 109 draws 0 loads 2 stream 9fc4f61a00b1bad6 state 73d60166aefc2a51 names 3 56e6c080795c4956
+ a_dispatch_of_end_only_needs_no_buffers submits 1 words 92 draws 0 loads 1 stream 60bd94169b40a116 state fcfa8434f89a7626 names 2 701a44c9b971dc94
+ a_dispatch_of_the_air_kernel_uploads_what_ir3_asks_for submits 1 words 133 draws 0 loads 3 stream 0e1b26f03b9f97ac state 8c52fffceb2b5e22 names 4 62d909887d830c99
+-a_constant_shorter_than_its_pushed_range_is_read_from_the_objects_pages submits 1 words 133 draws 0 loads 3 stream 0e1b26f03b9f97ac state 3d0dc67eca1b1a1c names 4 62d909887d830c99
++a_constant_shorter_than_its_pushed_range_is_read_from_the_objects_pages submits 2 words 282 draws 0 loads 5 stream 89d424af25422a1b state 8655e73ee2957dfa names 8 db389de64df694f1
+ a_refused_dispatch_is_left_out_when_the_buffer_skips_refusals submits 1 words 109 draws 0 loads 2 stream 143fbeea2691e626 state 73d60166aefc2a51 names 3 56e6c080795c4956
+ a_dispatch_that_does_not_fit_is_refused_before_anything_reaches_the_gpu submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ the_fake_refuses_a_program_preload_of_128_units submits 1 words 4 draws 0 loads 1 stream e509d397f8d2ce75 state eaed796d1368fce3 names 0 0000000000000000
+@@ -185,6 +185,7 @@ the_fake_refuses_a_draw_with_msaa_without_the_ccu_cntl_or_without_its_flushes su
+ the_fake_refuses_the_packets_a_draw_stream_may_not_carry submits 10 words 5889 draws 10 loads 20 stream f2e62705b3582071 state fc783749c5379831 names 0 0000000000000000 (unread)
+ a_draw_pushes_a_fragment_constant_range_out_of_the_bound_buffer submits 1 words 688 draws 1 loads 3 stream 0c15e9a56d036b92 state 2a4251f1a42f82b4 names 5 15ee241ca19a0b56
+ a_pushed_range_off_16_bytes_is_copied_by_the_gpu submits 2 words 1384 draws 2 loads 6 stream 025f5c98dd2d175c state 9fa69486849bc4f7 names 10 2bdc4839433416ac
++a_constant_range_running_past_its_buffers_pages_is_loaded_with_what_is_there submits 2 words 1462 draws 4 loads 10 stream 5c2bf08b24decb23 state c1eb18db830aec81 names 11 7ac6c21a55507769
+ a_draw_refuses_a_constant_range_it_cannot_serve_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ a_fragment_stage_that_writes_no_colour_is_drawn_with_nothing_written submits 2 words 1292 draws 2 loads 4 stream 1d6a12ba3c1e5631 state 355edb16f056659d names 6 40a6fd1ebafabbc4
+ a_stage_that_wants_private_memory_gets_the_queues submits 1 words 676 draws 1 loads 2 stream 6c38e368a6edc627 state fec70d1c3dce25f1 names 4 d4c1856640f88cb3
+diff --git a/hakios-metal/tests/golden/tests-a635.txt b/hakios-metal/tests/golden/tests-a635.txt
+index af1070d..3e237c6 100644
+--- a/hakios-metal/tests/golden/tests-a635.txt
++++ b/hakios-metal/tests/golden/tests-a635.txt
+@@ -107,7 +107,7 @@ an_indirect_dispatch_reads_its_counts_when_it_runs submits 1 words 181 draws 0 l
+ a_dispatch_of_fill_id_holds_together_and_the_fake_does_not_run_it submits 1 words 112 draws 0 loads 2 stream efb1320aababb718 state 73d60166aefc2a51 names 3 56e6c080795c4956
+ a_dispatch_of_end_only_needs_no_buffers submits 1 words 95 draws 0 loads 1 stream c24ff6d18a99ab80 state fcfa8434f89a7626 names 2 701a44c9b971dc94
+ a_dispatch_of_the_air_kernel_uploads_what_ir3_asks_for submits 1 words 136 draws 0 loads 3 stream 449c19db9735da7e state 8c52fffceb2b5e22 names 4 62d909887d830c99
+-a_constant_shorter_than_its_pushed_range_is_read_from_the_objects_pages submits 1 words 136 draws 0 loads 3 stream 449c19db9735da7e state 3d0dc67eca1b1a1c names 4 62d909887d830c99
++a_constant_shorter_than_its_pushed_range_is_read_from_the_objects_pages submits 2 words 288 draws 0 loads 5 stream 5b358c3b02ab681f state 8655e73ee2957dfa names 8 db389de64df694f1
+ a_refused_dispatch_is_left_out_when_the_buffer_skips_refusals submits 1 words 112 draws 0 loads 2 stream ee153db4dd4e1278 state 73d60166aefc2a51 names 3 56e6c080795c4956
+ a_dispatch_that_does_not_fit_is_refused_before_anything_reaches_the_gpu submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ the_fake_refuses_a_program_preload_of_128_units submits 1 words 4 draws 0 loads 1 stream e509d397f8d2ce75 state eaed796d1368fce3 names 0 0000000000000000
+@@ -185,6 +185,7 @@ the_fake_refuses_a_draw_with_msaa_without_the_ccu_cntl_or_without_its_flushes su
+ the_fake_refuses_the_packets_a_draw_stream_may_not_carry submits 10 words 5889 draws 10 loads 20 stream c559de18b66db3d5 state fc783749c5379831 names 0 0000000000000000 (unread)
+ a_draw_pushes_a_fragment_constant_range_out_of_the_bound_buffer submits 1 words 688 draws 1 loads 3 stream d7cc710f48bc405c state 2a4251f1a42f82b4 names 5 15ee241ca19a0b56
+ a_pushed_range_off_16_bytes_is_copied_by_the_gpu submits 2 words 1384 draws 2 loads 6 stream 3cf7c60365cf8db8 state 9fa69486849bc4f7 names 10 2bdc4839433416ac
++a_constant_range_running_past_its_buffers_pages_is_loaded_with_what_is_there submits 2 words 1462 draws 4 loads 10 stream e1a5e94e01d04a3b state c1eb18db830aec81 names 11 7ac6c21a55507769
+ a_draw_refuses_a_constant_range_it_cannot_serve_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ a_fragment_stage_that_writes_no_colour_is_drawn_with_nothing_written submits 2 words 1292 draws 2 loads 4 stream 0ed4c278dc20d085 state 355edb16f056659d names 6 40a6fd1ebafabbc4
+ a_stage_that_wants_private_memory_gets_the_queues submits 1 words 676 draws 1 loads 2 stream 75d7cb3e37eed4cd state fec70d1c3dce25f1 names 4 d4c1856640f88cb3
+diff --git a/hakios-metal/tests/render_test.cpp b/hakios-metal/tests/render_test.cpp
+index 0142d6b..2d2eef5 100644
+--- a/hakios-metal/tests/render_test.cpp
++++ b/hakios-metal/tests/render_test.cpp
+@@ -2084,6 +2084,65 @@ TEST(a_pushed_range_off_16_bytes_is_copied_by_the_gpu) {
+     }
+ }
+ 
++// A constant buffer bound with fewer bytes behind it than the stage's pushed range, at the very end of its pages:
++// CoreAnimation binds 16 bytes of colour there for a function whose range ir3 pads to 64 ("reads 64 bytes at 0 of
++// constant buffer 2; 16 are bound and 16 mapped behind the offset", the phone's refusal, and a layer gone from the
++// frame). Metal draws it: the function reads the bytes that are bound. Here the command processor is not let read
++// past the pages: the range is loaded direct, the bound bytes and zeros after them -- and the draw is drawn, with the
++// colour it was given, whether it comes first in its pass or after draws of the same program whose state is kept.
++TEST(a_constant_range_running_past_its_buffers_pages_is_loaded_with_what_is_there) {
++    using namespace a6xx;
++    Rig r;
++    auto t = target(r);
++    RenderPass pass;
++    pass.color0 = t.get();
++    const Program p{kernels::tri_flat_vs_air, kernels::tri_cflat_fs_air, Linkage{}, "tri_cflat"};
++    std::string why;
++    auto colour = newBuffer(*r.gpu, 16, &why);
++    auto page = newBuffer(*r.gpu, colour->bo().size(), &why);
++    auto* bytes = static_cast<uint8_t*>(page->contents());
++    const float rgba[4] = {0.25f, 0.5f, 0.75f, 1.0f};
++    memset(bytes, 0xee, page->bo().size());
++    memcpy(bytes + page->bo().size() - 16, rgba, 16);
++    Bindings tail;
++    tail.buffers = {Binding{page.get(), page->bo().size() - 16}};
++    {
++        Encoded e(r, p, pass, wholeDraw(), render::Options{}, Bindings{}, tail);
++        CHECK(e.ok);
++        if (!e.ok) std::printf("       %s\n", e.error.c_str());
++        const size_t at = e.ok ? e.findLoad(CP_LOAD_STATE6_FRAG, ST6_CONSTANTS, SB6_FS_SHADER) : size_t(-1);
++        CHECK(at != size_t(-1));
++        if (at != size_t(-1)) {
++            const auto& w = e.stream.words();
++            CHECK(((w[at + 1] & CP_LOAD_STATE6_0_STATE_SRC__MASK) >> CP_LOAD_STATE6_0_STATE_SRC__SHIFT) == SS6_DIRECT);
++        }
++    }
++    // in a command buffer, after two draws of the same program from a whole buffer (the second from the kept state)
++    float whole[16] = {9, 9, 9, 9};
++    auto wide = newBuffer(*r.gpu, 64, &why);
++    memcpy(wide->contents(), whole, sizeof whole);
++    Bindings ok;
++    ok.buffers = {Binding{wide.get(), 0}};
++    for (int kept = 0; kept < 2; kept++) {
++        auto cb = r.queue->commandBuffer();
++        for (int i = 0; i < 2 * kept; i++) CHECK(cb->draw(p, pass, wholeDraw(), Bindings{}, ok));
++        CHECK(cb->draw(p, pass, wholeDraw(), Bindings{}, tail));
++        cb->commit();
++        cb->waitUntilCompleted();
++        CHECK(cb->status() == CommandBuffer::kCompleted);
++        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
++        const auto s = r.fake->stats();
++        CHECK_EQ(s.faults, 0u);
++        CHECK(!s.lastDraw.fsConsts.empty() && s.lastDraw.fsConsts[0].words.size() >= 16);
++        if (!s.lastDraw.fsConsts.empty() && s.lastDraw.fsConsts[0].words.size() >= 16) {
++            float got[4];
++            memcpy(got, s.lastDraw.fsConsts[0].words.data(), 16);
++            CHECK(memcmp(got, rgba, 16) == 0);                                              // the colour that was bound
++            for (uint32_t d = 4; d < 16; d++) CHECK_EQ(s.lastDraw.fsConsts[0].words[d], 0u);   // and nothing after it
++        }
++    }
++}
++
+ TEST(a_draw_refuses_a_constant_range_it_cannot_serve_by_name) {
+     Rig r;
+     auto t = target(r);
+@@ -2104,11 +2163,7 @@ TEST(a_draw_refuses_a_constant_range_it_cannot_serve_by_name) {
+     Bindings odd;
+     odd.buffers = {Binding{colour.get(), 2}};
+     refusedWith(p, odd, "tri_cflat_fs_air: buffer 0: offset 2 is not a multiple of 4 inside it");
+-    // the padded 64-byte range running off the object's pages: a buffer as long as its pages, bound 16 bytes before the end
+-    auto page = newBuffer(*r.gpu, colour->bo().size(), &why);
+-    Bindings tail;
+-    tail.buffers = {Binding{page.get(), page->bo().size() - 16}};
+-    refusedWith(p, tail, "tri_cflat_fs_air reads 64 bytes at 0 of constant buffer 0; 16 are bound and 16 mapped behind the offset");
++    // (the padded 64-byte range running off the object's pages is no refusal: the next test)
+     // a range past the stage's constlen (the twin of the constlen the fixture carries)
+     Program short_ = p;
+     short_.fs.k.constlen = 0;
