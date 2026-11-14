@@ -1,38 +1,27 @@
-# 07 — Plan: CPU y stutter antes de atacar Metal (pendiente, 2026-11-14)
+# 07 — CPU y tirones al deslizar: qué se midió
 
-**Pregunta del usuario.** El deslizamiento del home "debería" ir a 20-35 fps según Angel, pero se siente mucho peor y con tirones (stutter). El teléfono no se calienta. Antes de tocar Metal hay que descartar la CPU.
+Pregunta: ¿la CPU es la causa de que el deslizamiento del home vaya lento y a tirones? Respuesta medida: sí, y no
+por falta de núcleos o de frecuencia. El hilo de render de CoreAnimation estaba saturado de CPU en la ruta de draw
+del driver Metal, y los A73 trabajaban casi sin L2 porque XNU la vaciaba antes de cada WFI. Con eso corregido, el
+límite pasa a la GPU. El estado de gráficos y el siguiente trabajo están en [INDICE.md](INDICE.md) y en
+[../../GPU-ROADMAP.md](../../GPU-ROADMAP.md).
 
-**Criterio.** Mismo método que con el USB: medir antes de suponer, n≥3 y separar observación de hipótesis.
-
-## Lo que ya se sabe (observado, sin analizar)
-
-- Kernel: `SWEET FB: 5 s: 0 direct frames …, 0 composed by the CPU, 131 by the GPU`, es decir ~26 fps de media en 5 s. La media no mide stutter: hace falta la **distribución del intervalo entre frames** (p50/p95/p99, frames de más de 33 ms o más de 50 ms).
-- `SWEET CPUFREQ: gold perf state 8 -> 8 (2803 MHz), silver perf state 6 -> 6 (1900 MHz)` al arrancar: ¿la frecuencia queda fija o cambia después? Boot-args relevantes:
-  - `cpus=8`;
-  - `sweetsched=15` (¿qué hace? buscarlo en los parches);
-  - `sweetfb_hz=120`;
-  - `gpu_mhz=1260`;
-  - `glwait=0`.
-- Muestreo de 10 min (20 muestras cada 30 s) tras arrancar con 0334 (03, CPU-0334; `~/sapphire-angel/research/logs-telefono/cpu-0334-023406/`): load de 1 min 4,8 en la primera muestra y **1,1-2,6 en reposo** (8 núcleos); ningún proceso de usuario dominante (cfprefsd 6-12 % y notifyd 4-7 % durante todo el muestreo). **No hay carga de fondo constante.** Falta medir *durante* el deslizamiento (picos/latencia), que es lo que importa para el stutter.
-- El kernel actual (0334) sale de CI con **Xcode 16**; el expG que el usuario usaba antes, de Apple clang 21. El usuario nota el teléfono más fluido hoy, sin medición. Candidatos: el compilador, las cachés de shaders ya completas tras muchos arranques, o percepción.
-
-## Hipótesis a discriminar
-
-| # | Hipótesis | Qué la confirma | Qué la descarta |
+| # | Hipótesis | Resultado | Evidencia |
 |---|---|---|---|
-| H1 | Los hilos de dibujo (backboardd/SpringBoard/CA render) caen en los núcleos silver o compiten con otros | tiempo en cpu silver / migraciones durante el deslizamiento; mejora fijando afinidad o cambiando `sweetsched` | no hay correlación núcleo↔frame lento |
-| H2 | La frecuencia no sube o hay throttling por software (no térmico) | perf state o MHz reales durante la carga por debajo del máximo | MHz al máximo durante el stutter |
-| H3 | Picos de CPU periódicos (algún hilo del kernel o daemon) roban ciclos | picos en `top` (o `kern.*` stats) alineados con los frames lentos | carga plana durante el stutter |
-| H4 | Es pacing de presentación/vsync (pantalla 120 Hz, `sweetfb_hz=120`, `glwait=0`), no CPU | intervalos múltiplos de 8,3/16,7 ms con la CPU ociosa | — |
-| H5 | El driver USB v2 gira hasta 50 µs por vuelta mientras hay tráfico (0330) | stutter peor con tráfico USB que sin cable | igual con y sin cable |
-| H6 | Diferencia de compilador (Xcode 16 vs clang 21) en el kernel | fps/stutter distintos entre expG y 0334 con el mismo protocolo | iguales |
+| H1 | Los hilos de dibujo caen en los núcleos pequeños o compiten | **Descartada para el hilo de render**: prioridad fija 54, corre el 100 % en los A73. `sweetsched=15` manda a los A53 los hilos de QoS por defecto; el A/B 15 frente a 13 no separa (n=3) | [16](16-planificador-e-hilos.md) §2.4, §3.2-3.3 |
+| H2 | La frecuencia no sube | **Descartada**: A73 a 2786-2803 MHz y A53 a 1854-1901 MHz medidos | 16 §3.1; [03](03-experimentos-y-datos.md) M10 (`kern.sweet_gpu_clocks`) |
+| H3 | Picos de CPU de otros hilos | **El coste está en el propio hilo de render**: 84-90 % de CPU, la mitad en la ruta de draw del driver (126 µs por draw, ~150 draws por frame). Los hilos del kernel que sondean despiertan a los A73 3600-4100 veces por segundo, y cada entrada en reposo vaciaba la L2 del cluster: quitar ese vaciado (`kern.sweet_idle_cache=0`, 0344) baja el driver de 62-68 a 25-26 µs por draw y sube los buffers por segundo un 50 % (n=2) | 03 M1, M2, M10; 16 §1, §4 |
+| H4 | Ritmo de presentación | **Contribuía**: el 10,6-13,8 % de los frames dibujados se pisaba antes de llegar al panel; la cola de 0340 lo deja en 0 | 03 M6, M7; [15](15-kernel-cache-y-presentacion.md) §0.1 |
+| H5 | El driver USB v2 gira mientras hay tráfico | Sin medir | — |
+| H6 | El compilador del kernel (Xcode 16 frente a Apple clang 21) | Sin medir | — |
 
-## Protocolo propuesto
+Lo que se sabía antes y no se sostiene:
 
-1. **Instrumentar sin recompilar primero.** Ver qué exponen los sysctl y logs que ya existen (`SWEET FB`, `SWEET MEM`, `SWEET CPUFREQ`, `kern.sweet_*`) y si `top -l` / `ps` dan uso por núcleo. Si falta algo, escribir un parche **diagnóstico** (como 0329): histograma de intervalos de frame en el kernel de FB, más un muestreo de perf state y MHz por cluster.
-2. **Carga reproducible.** Un deslizamiento automático del home, mediante una entrada sintética si existe un camino (el driver de touch `SWEET HID`), o un script fijo hecho por el usuario.
-3. **A/B con n≥3 arranques cada uno** con `~/adb-bridge/exp-loop.sh`:
-   - expG frente a 0334 (H6);
-   - con y sin cable USB (H5);
-   - variantes de `sweetsched` o afinidad (H1).
-4. Solo después de descartar o confirmar la CPU, auditar Metal. Aviso: `HakiosMetal.bundle` está en el repo **sin código fuente** (04), así que primero hay que averiguar de dónde sale y si existe la fuente.
+- `SWEET FB: 5 s … N by the GPU` no mide frames mostrados: cuenta swaps, y con `sweetfb_scale=2` sus tiempos salen
+  siempre a 0 ([09](09-auditoria-kernel-gpu.md) §1). Los frames que llegan al panel los da `kern.sweet_fb_diag` (0336).
+- `gpu_mhz=1260` sin `gpu_vco2=1` deja el núcleo de la GPU a 630 MHz (03 M3).
+- El teléfono sí se calienta: en calma, iOS está unos 20 °C por encima del reposo de Android
+  ([17](17-gpu-escalado-termica-ddr.md) §4.4).
+- El driver Metal tiene fuente publicada y se compila en la Mac ([08](08-hakiosmetal-binario-vs-fuente.md)).
+
+Datos de reposo (CPU-0334 en 03): load de 1 min 1,1-2,6 con 8 núcleos tras arrancar, sin un proceso dominante.
