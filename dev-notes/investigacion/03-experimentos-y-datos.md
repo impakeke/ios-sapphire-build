@@ -354,3 +354,30 @@ MHz** en las 3 muestras, con los dos contadores.
   `boot_a-0334-noradio.img` (`modem=0 wifi=0 ipa=0`) y `boot_a-43603985878-radio.img` (control) están
   construidas y sin probar. `CalendarWidgetExtension` consume ~57 % de un núcleo durante la prueba en todas las
   condiciones.
+
+## M6 — Pruebas cortas a 1260 MHz (2026-11-14, tarde)
+
+Mismo arranque que M4 (kernel 43612053690, `gpu_vco2=1 gpu_mhz=1260`). n=1 por condición: orientativo.
+
+**Observado.**
+
+- `kern.sweet_gpu_pll`: `speed bin 0`, `RPM votes of this driver: CX 464 MX 416`. Las líneas `SapphireGpu` del
+  arranque ya no estaban en `dmesg` a los 9 min.
+- Bundle `propio-args` (`tools/perf/ab.sh`): sin opciones, 19,7 buffers/s, 157 µs de CPU por draw, hecho→commit
+  30,4 ms, commit→fin 21,5 ms, GPU ocupada 42 %; pasada principal en GMEM `draws 99-124 in 102 tiles`
+  15,6-16,5 ms; pasadas `draws 39 in sysmem` 20,4-23,3 ms. Con `metal_defer=1` solo salió un periodo con
+  movimiento (17,5 buffers/s, 81 µs por draw).
+- Con el binario heredado a 1260 MHz la consola no recogió ninguna línea `fps:` en dos ensayos (archivo de 0
+  bytes; causa sin mirar). La pantalla pinta bien (captura `medicion/shots/fin-0.png`).
+- `kern.sweet_fb_diag` acumulado desde el arranque (~15 min): `swaps 6758 flips 5689 … overwritten 931`: el
+  13,8 % de los frames entregados se pisó en el buffer trasero sin llegar al panel.
+- `kern.sweet_gpu_diag` acumulado: 5 520 submits; 8,91 s dentro de la llamada, de ellos 8,64 s en limpieza de
+  caché (28,0 GB en 5 675 limpiezas: 1,5 ms y ~4,9 MB por submit); 6 575 `GEM_NEW` (1,44 s borrando, 0,79 s
+  mapeando); 13 358 TLB flush (0,97 s; 13 251 durmieron); 5 501 esperas de fence, 95,6 s dormidas en 405 034
+  miradas.
+
+**Interpretación.** Doblar el reloj baja la pasada principal de 20-24 ms (M2, binario heredado) a ~16 ms, no
+a la mitad: una parte de esa pasada no va al ritmo del reloj. Los buffers por segundo no suben porque el
+límite es ahora la CPU del driver (hecho→commit 30 ms; el bundle propio, sin las tablas del port, gasta 157 µs
+por draw frente a 126). En el kernel hay dos costes medidos por primera vez: 1,5 ms de limpieza de caché por
+submit dentro del candado, y uno de cada siete frames pisado.
