@@ -516,3 +516,24 @@ CPU 4-7, 24-28 µs. `kern.sweet_cpuregs`: CPU 0-3 MIDR 411fd090 (A73), CCSIDR de
 quitarlo baja el driver de 62-68 a 25-26 µs por draw y sube los buffers por segundo un 50 %, hasta que manda la
 GPU (commit→fin 23-27 ms). Subir la GPU a 1260 MHz da poco más (48 buffers/s). Falta saber qué limita ahora la
 GPU, y si las incidencias dependen del gobernador, de 1260 MHz o de `idle_cache=0`.
+
+## M11 — Dónde se va el frame con el driver fusionado y la L2 viva (2026-11-14)
+
+Kernel 0350 a 820 MHz fijos, `sweet_fb_queue=1`, `sweet_gpu_flush=1`, `sweet_idle_cache=0`; driver `merge-1`
+cargado. Carga `homeswipe.sh 8` (≈ 45 buffers/s en M10). n=1.
+
+- **Tiempo real de GPU** (`kern.sweet_gpu_marks=1`: marcas del contador always-on de 19,2 MHz antes y después de
+  cada trabajo, en una ventana de 1 268 submits y 1 266 copias al panel):
+  - submits del driver: media 8,3 ms (874 entre 4 y 8 ms, 198 entre 8 y 12, 166 entre 12 y 16, 30 por encima);
+  - copia escalada al panel (kernel): media 4,15 ms (421 entre 3 y 4 ms, 843 entre 4 y 6 ms).
+- **Perfil del hilo de render** (`psamp`, 12 890 muestras; `medicion/perfil-merge1-l2.txt`): 61,8 % en modo
+  usuario; 23,1 % esperando en el run loop de CoreFoundation; 7,6 % dentro de la llamada de IOMobileFramebuffer
+  (la retención de `SwapEnd` de 0340); 3,5 % en llamadas al kernel desde malloc. Del tiempo de usuario: QuartzCore
+  52,7 %, HakiosMetal 24,7 % (ruta de draw 27 % inclusive; `closePass` 6,4 %), malloc 9,3 %, memmove/memset 6,5 %.
+
+**Interpretación.** El hilo de render ya no está saturado: pasa casi un cuarto del tiempo esperando su siguiente
+tick. Por frame (a 45 buffers/s) gasta unos 13,7 ms de CPU, de ellos ~7,2 de QuartzCore y ~3,4 del driver, y la
+GPU gasta 8,3 ms en dibujar más 4,15 ms en la copia escalada del kernel: 12,5 ms, por encima de un intervalo de
+120 Hz (8,33 ms) y por debajo de dos. Un tercio del tiempo de GPU por frame es la copia al panel. Lo que fija
+ahora los frames por segundo es cómo se encadenan CPU, GPU, copia y presentación (ritmo y esperas), no un único
+recurso saturado.
