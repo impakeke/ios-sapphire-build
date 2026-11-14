@@ -1,0 +1,173 @@
+Subject: Closing a tiled pass asks the heap for nothing it had last time
+
+render::drawStates made its eight groups' lists, its barrier and the words of every fragment from nothing at each
+closing, and each fragment once in a list of its own and again among the others; closePass made a stream for the
+tiles, one for the tail, a copy of the draws and a DrawStates for each pass. With the phone's frames of eight passes
+that was some 180 requests to the heap a tiled pass (scene U of drawbench: 5.6 a draw).
+
+- drawStates works in a thread's own Work, emptied at each call, and writes a fragment where it stays; what it
+  made is swapped into the caller's DrawStates, whose old memory it keeps for the next pass.
+- closePass writes the tiles, the tail, the moved draws and the groups into the command buffer's DrawCache (which
+  the queue hands from one command buffer to the next).
+
+The words made are the same: golden three ways, both chips. drawbench U (110 draws in five passes, A610
+constants): 5.6 -> 1.1 heap allocations a draw, 3448 -> 173 bytes asked for a draw, 7.60 -> 7.23 us a draw.
+
+
+---
+diff --git a/hakios-metal/src/gmem.cpp b/hakios-metal/src/gmem.cpp
+index f16000f..253d624 100644
+--- a/hakios-metal/src/gmem.cpp
++++ b/hakios-metal/src/gmem.cpp
+@@ -101,6 +101,31 @@ struct Group {
+     }
+ };
+ 
++// What drawStates works with, a thread's own and kept from one pass's closing to the next: eight groups' lists, the
++// barrier's packets and the words made so far all grew from nothing at every closing, a doubling at a time -- some
++// 180 requests to the heap a tiled pass.
++struct Work {
++    Group groups[kDsGroups];
++    std::vector<uint32_t> barrier;
++    DrawStates made;
++    void begin() {
++        for (Group& g : groups) {
++            g.regs.clear();
++            g.loads.clear();
++            g.loadsBefore.clear();
++            g.wrote.clear();
++            g.changed = g.invalidates = g.invalidatesBefore = g.set = false;
++            g.invalidate = g.invalidateBefore = g.at = g.words = 0;
++        }
++        barrier.clear();
++        made.prologue.clear();
++        made.blobs.clear();
++        made.list.clear();
++        made.relocs.clear();
++        made.draws = made.entries = made.fragments = made.barriers = 0;
++    }
++};
++
+ // registers into a stream as type-4 packets, the runs of consecutive ones together
+ void writeRegs(std::vector<uint32_t>& to, const std::vector<std::pair<uint32_t, uint32_t>>& regs, const std::vector<uint32_t>* only) {
+     for (size_t i = 0; i < regs.size();) {
+@@ -131,9 +156,11 @@ void DrawStates::place(uint64_t blobsAddress) {
+ }
+ 
+ bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates* out, uint8_t twin, uint32_t fetch) {
+-    DrawStates s;
+-    Group groups[kDsGroups];
+-    std::vector<uint32_t> fragment, barrier;   // (BARRIER: the draw's barrier packets, as recorded)
++    static thread_local Work work;
++    work.begin();
++    DrawStates& s = work.made;
++    Group* const groups = work.groups;
++    std::vector<uint32_t>& barrier = work.barrier;   // (the draw's barrier packets, as recorded)
+     bool copies = false, pending = false;   // a copy went to the prologue; state or a barrier waits for its draw
+     bool armed = false;                     // the barrier's group is set and not yet let go
+     uint32_t barrierAt = 0, barrierWords = 0;   // the barrier's fragment (one for the pass: they are all alike)
+@@ -212,7 +239,9 @@ bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates*
+                 const bool differs = !G.set || G.changed || G.loads != G.loadsBefore || G.invalidates != G.invalidatesBefore ||
+                                      (G.invalidates && G.invalidate != G.invalidateBefore);
+                 if (differs && (!G.regs.empty() || !G.loads.empty() || G.invalidates)) {
+-                    fragment.clear();
++                    // (written where it stays, after the fragments made so far)
++                    std::vector<uint32_t>& fragment = s.blobs;
++                    const size_t from = fragment.size();
+                     if (G.invalidates) {
+                         fragment.push_back(pm4::type4(REG_A6XX_HLSQ_INVALIDATE_CMD, 1));
+                         fragment.push_back(G.invalidate);
+@@ -220,11 +249,10 @@ bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates*
+                     // (twin 1: only what the draw itself wrote -- right until a tile skips the draw that wrote the rest)
+                     writeRegs(fragment, G.regs, twin == 1 ? &G.wrote : nullptr);
+                     fragment.insert(fragment.end(), G.loads.begin(), G.loads.end());
+-                    if (fragment.empty() || fragment.size() > CP_SET_DRAW_STATE__0_COUNT__MASK) return false;
+-                    G.at = uint32_t(s.blobs.size());
+-                    G.words = uint32_t(fragment.size());
++                    if (fragment.size() == from || fragment.size() - from > CP_SET_DRAW_STATE__0_COUNT__MASK) return false;
++                    G.at = uint32_t(from);
++                    G.words = uint32_t(fragment.size() - from);
+                     G.set = true;
+-                    s.blobs.insert(s.blobs.end(), fragment.begin(), fragment.end());
+                     s.fragments++;
+                     sent[count++] = g;
+                 }
+@@ -283,7 +311,15 @@ bool drawStates(const uint32_t* body, size_t words, uint32_t modes, DrawStates*
+         s.prologue.push_back(pm4::type7(pm4::kWaitMemWrites, 0));
+         s.prologue.push_back(pm4::type7(pm4::kWaitForMe, 0));
+     }
+-    *out = std::move(s);
++    // (the caller's takes the words; this thread keeps the memory they were made in for the next pass)
++    out->prologue.assign(s.prologue.begin(), s.prologue.end());
++    out->blobs.swap(s.blobs);
++    out->list.swap(s.list);
++    out->relocs.swap(s.relocs);
++    out->draws = s.draws;
++    out->entries = s.entries;
++    out->fragments = s.fragments;
++    out->barriers = s.barriers;
+     return true;
+ }
+ 
+diff --git a/hakios-metal/src/render.cpp b/hakios-metal/src/render.cpp
+index dde8c22..1ce26fb 100644
+--- a/hakios-metal/src/render.cpp
++++ b/hakios-metal/src/render.cpp
+@@ -3455,6 +3455,9 @@ struct DrawCache {
+     ProgramFacts pf, pfSys;
+     DrawFacts facts, factsSys;
+     pm4::Stream scratch, head, headSys;
++    // (closePass's: a tiled pass's draws with registers rewritten, and its draw-state groups)
++    std::vector<uint32_t> moved;
++    DrawStates groups;
+     std::vector<uint8_t> staticKey;
+     // A command buffer that is done hands this to the queue's next one (CommandQueue::Spare): the frame after draws
+     // with the programs of the frame before, and finds each state here without asking the queue under its lock. What
+@@ -5126,7 +5129,10 @@ void CommandBuffer::closePass() {
+         // with every component masked off keeps the slot's bin to itself, whatever the RB does with a masked write.
+         render::GmemPlan plan = open_->plan;
+         const auto [W, H] = render::windowOf(open_->pass);
+-        std::vector<uint32_t> moved;   // the draws' words with those registers rewritten, when any is
++        // (the lists and streams this makes are the command buffer's own between passes: render.cpp, DrawCache)
++        if (drawCache_ == nullptr) drawCache_ = std::make_shared<render::DrawCache>();
++        std::vector<uint32_t>& moved = drawCache_->moved;   // the draws' words with those registers rewritten, when any is
++        moved.clear();
+         {
+             uint32_t attached = 0, touched = 0, named = 0;
+             for (size_t i = 0; i < w.size();) {
+@@ -5166,7 +5172,7 @@ void CommandBuffer::closePass() {
+         // (binned when the queue's streams have not overrun and the plan's pipes can name their bins)
+         uint32_t perPipeX = 1, perPipeY = 1;
+         const bool binned = (open_->options.gmemBinning || gmemBinning_) && queue_.binningOk() && render::gmemPipes(plan, &perPipeX, &perPipeY);
+-        render::DrawStates groups;
++        render::DrawStates& groups = drawCache_->groups;
+         const uint32_t fetchBy = gmemOff_ & kGmemAllOrdered ? render::kDsFetchOrdered : gmemOff_ & kGmemInlineBarriers ? render::kDsFetchInline : render::kDsFetchGroup;
+         const bool grouped = binned && !(gmemOff_ & kGmemPlainBody) &&
+                              render::drawStates(body.data(), body.size(), a6xx::CP_SET_DRAW_STATE__0_BINNING | a6xx::CP_SET_DRAW_STATE__0_GMEM, &groups,
+@@ -5211,7 +5217,8 @@ void CommandBuffer::closePass() {
+             keep(v);
+             vsc = v->gpuAddress();
+         }
+-        pm4::Stream tiles;
++        pm4::Stream& tiles = drawCache_->scratch;
++        tiles.clear();
+         // (the copies the draws' loads read, once for every tile and for the binning pass: DrawStates::prologue)
+         if (grouped) {
+             const std::vector<uint32_t>& pro = groups.prologue;
+@@ -5239,9 +5246,13 @@ void CommandBuffer::closePass() {
+                                                 (load == 0 ? kPassNoLoad : 0u));
+         }
+     }
+-    pm4::Stream tail;
+-    render::encodeEnd(tail, open_->pass, open_->table, open_->options);
+-    appendStream(stream_, tail);
++    {
++        pm4::Stream local;
++        pm4::Stream& tail = drawCache_ != nullptr ? drawCache_->head : local;
++        tail.clear();
++        render::encodeEnd(tail, open_->pass, open_->table, open_->options);
++        appendStream(stream_, tail);
++    }
+     stampEnd();
+     open_.reset();
+ }

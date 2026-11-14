@@ -1,0 +1,361 @@
+Subject: A kept group that changes is compared with the one before it, not asked of the shadow register by register
+
+When a draw's program is not the last draw's, its kept groups (the stages' configuration, each stage's registers,
+the vertex fetch, the link, the blend) went through the register shadow whole: some 350 lookups in a hashed table,
+each its own line of memory, to find the few dozen registers that differ. On the phone that table is as cold as
+the rest between two draws.
+
+The cursor knows the words the stream last held for each group. For a group that is plain -- register packets
+alone, no register twice, not HLSQ_INVALIDATE_CMD -- those words are what its registers hold, so the next group's
+words are compared with them: a register both write is written when the two words differ, the shadow not asked;
+one the last group did not write is the shadow's to say and to learn; one the last group wrote and this one does
+not goes back to the shadow. Two groups of the same packets are compared word for word. The shadow is brought up
+to date (Cursor::settle) before a draw written the long way asks it about every register, and the tests' check
+compares against a copy so settled.
+
+What this stands on -- that a kept group's registers are written by no other group of a draw -- is held to for every
+program at the time its state is made (buildState): the kept groups, the pass's own and the ones made anew for each
+draw are encoded and their registers compared; a program that fails is drawn the long way, always.
+
+The streams are the same: golden three ways, the random frames, both chips. Host, A610 constants, least of 36
+frames, us a draw: T 2.96 -> 2.77, K 3.19 -> 2.94, U 9.23 -> 8.36; with 16 MiB touched before each draw T 10.96 ->
+10.46, S 14.90 -> 13.78 (cpu-tools/ab-host.sh; the machine was busy: the least frame is the number).
+
+
+---
+diff --git a/hakios-metal/src/render.cpp b/hakios-metal/src/render.cpp
+index 3c07c72..1d4950c 100644
+--- a/hakios-metal/src/render.cpp
++++ b/hakios-metal/src/render.cpp
+@@ -3219,6 +3219,43 @@ void planStage(const Stage& s, uint64_t program, StagePlan* p) {
+     p->numSsbos = k.numSsbos;
+ }
+ 
++// A run of registers a kept group's words write: COUNT of them from REG, their values from word AT of the group
++struct KeptSeg {
++    uint32_t reg;
++    uint16_t count, at;
++};
++
++// The packets of a kept group's WORDS, as SEGS gets them in the order of the words, and whether the group is plain:
++// register packets alone, no register written twice, none of them HLSQ_INVALIDATE_CMD (which is written whatever it
++// holds). Of a plain group the stream last held, every register holds the value the group's words give it -- which
++// is what emitFast compares the next group's words with, register by register, instead of asking the shadow.
++// BY_REG gets the same segments in the order of their registers (a plain group's do not overlap).
++bool packetsOf(const uint32_t* w, uint32_t n, std::vector<KeptSeg>* segs, std::vector<KeptSeg>* byReg) {
++    bool plain = n <= 0xffff;
++    uint64_t seen[1024] = {};   // a bit a register (16 bits of them)
++    const size_t from = segs->size();
++    segs->reserve(from + 32);
++    for (uint32_t i = 0; plain && i < n;) {
++        const pm4::Header h = pm4::decode(w[i]);
++        if (h.kind != pm4::Header::kRegisters) {
++            plain = false;
++            break;
++        }
++        segs->push_back(KeptSeg{h.reg, uint16_t(h.count), uint16_t(i + 1)});
++        for (uint32_t k = 0; plain && k < h.count; k++) {
++            const uint32_t r = h.reg + k;
++            if (r > 0xffff || r == REG_A6XX_HLSQ_INVALIDATE_CMD || ((seen[r >> 6] >> (r & 63)) & 1)) plain = false;
++            else seen[r >> 6] |= 1ull << (r & 63);
++        }
++        i += 1 + h.count;
++    }
++    if (!plain) segs->resize(from);
++    byReg->resize(from);
++    byReg->insert(byReg->end(), segs->begin() + from, segs->end());
++    std::sort(byReg->begin() + from, byReg->end(), [](const KeptSeg& a, const KeptSeg& b) { return a.reg < b.reg; });
++    return plain;
++}
++
+ }  // namespace
+ 
+ // What a program comes to in one kind of pass. Made once, read by any thread after.
+@@ -3247,8 +3284,11 @@ struct ProgramState {
+     uint32_t depthRegid = 0;
+     // the words of the groups that are the program's: register packets, but for the two stages' loads
+     std::vector<uint32_t> words;
++    std::vector<KeptSeg> segs, byReg;   // ...and each plain group's packets, as the words have them and by register (packetsOf)
+     struct Frag {
+         uint32_t at = 0, n = 0;
++        uint32_t segsAt = 0, packets = 0;
++        bool plain = false;
+     };
+     Frag invalidate, config, vsRegs, vsLoads, fsRegs, fsLoads, vfd, link, blend;
+     const uint32_t* at(const Frag& f) const { return words.data() + f.at; }
+@@ -3303,6 +3343,10 @@ struct Cursor {
+     struct Last {
+         const uint32_t* at = nullptr;
+         uint32_t n = 0;
++        // (a plain group's: its packets by register, for the next group's words to be compared with)
++        const KeptSeg* byReg = nullptr;
++        uint32_t packets = 0;
++        bool plain = false;
+     } last[kSlots];
+     bool rastSet = false, viewportSet = false, blendSet = false, vfdSet = false;
+     uint32_t rast = 0;
+@@ -3342,7 +3386,21 @@ struct Cursor {
+             return true;
+         }
+     } vfd;
+-    // (a packet that changes registers behind the stream's back, or a draw encoded the long way: nothing is known)
++    // What the plain groups last held here gave their registers, told to REGS: of those registers the cursor is what
++    // knows the value, not the shadow (emitFast compares a group's words with the last one's and tells the shadow only
++    // what leaves the group), so whoever is about to ask the shadow about every register -- a draw written the long
++    // way, the tests' check -- has the shadow brought up to date first.
++    void settle(CommandBuffer::RegShadow& regs) const {
++        for (const Last& l : last) {
++            if (!l.plain || l.at == nullptr) continue;
++            for (uint32_t p = 0; p < l.packets; p++) {
++                const KeptSeg& x = l.byReg[p];
++                for (uint32_t k = 0; k < x.count; k++) regs.hold(x.reg + k, l.at[x.at + k]);
++            }
++        }
++    }
++    // (a packet that changes registers behind the stream's back, or a draw encoded the long way: nothing is known.
++    // After settle(), when the shadow is to go on being used.)
+     void forget() { *this = Cursor{}; }
+ };
+ 
+@@ -3360,6 +3418,8 @@ struct PassCache {
+     struct Frag {
+         uint32_t sig;
+         std::vector<uint32_t> words;
++        std::vector<KeptSeg> segs, byReg;
++        bool plain;
+     };
+     std::vector<std::unique_ptr<Frag>> frags;
+     // a framebuffer fetch's descriptor of each attachment: [0] where it lies in memory, [1] its bin in GMEM
+@@ -3447,8 +3507,10 @@ std::shared_ptr<ProgramState> buildState(const Program& program, uint32_t keyId,
+     auto frag = [&](uint32_t groups) {
+         st.clear();
+         emitDraw(st, f, program, pass, draw, vsb, fsb, vsProgram, fsProgram, 0, o, nullptr, false, groups);
+-        ProgramState::Frag r{uint32_t(s->words.size()), uint32_t(st.words().size())};
++        ProgramState::Frag r{uint32_t(s->words.size()), uint32_t(st.words().size()), uint32_t(s->segs.size()), 0, false};
+         s->words.insert(s->words.end(), st.words().begin(), st.words().end());
++        r.plain = packetsOf(st.words().data(), r.n, &s->segs, &s->byReg);
++        r.packets = uint32_t(s->segs.size()) - r.segsAt;
+         return r;
+     };
+     s->invalidate = frag(kGInvalidate);
+@@ -3461,6 +3523,39 @@ std::shared_ptr<ProgramState> buildState(const Program& program, uint32_t keyId,
+     s->vfd = frag(kGVfdStatic);
+     s->link = frag(kGVpc | kGFsInputs | kGFsOutputs);
+     s->blend = frag(kGBlendStatic);
++    // What taking a draw from this state stands on: the registers of each kept group are that group's alone -- no other
++    // kept group's, not the pass's own groups', not those of the groups made anew for each draw. It is how emitDraw is
++    // written; it is held to it here, for this program, and a state that fails is one every draw of which goes the long way.
++    {
++        uint64_t owned[1024] = {};   // a bit a register
++        bool apart = true;
++        auto walk = [&](const uint32_t* w, size_t n, bool own) {
++            for (size_t i = 0; i < n;) {
++                const pm4::Header h = pm4::decode(w[i]);
++                for (uint32_t k = 0; h.kind == pm4::Header::kRegisters && k < h.count; k++) {
++                    const uint32_t r = h.reg + k;
++                    if (r > 0xffff) {
++                        apart = false;
++                    } else if ((owned[r >> 6] >> (r & 63)) & 1) {
++                        apart = false;
++                    } else if (own) {
++                        owned[r >> 6] |= 1ull << (r & 63);
++                    }
++                }
++                i += 1 + h.count;
++            }
++        };
++        for (const ProgramState::Frag* fr : {&s->config, &s->vsRegs, &s->fsRegs, &s->vfd, &s->link, &s->blend}) walk(s->at(*fr), fr->n, true);
++        for (const uint32_t groups : {uint32_t(kGZs | kGMrt | kGMsaa | kGRenderCntl | kGLrz),
++                                      uint32_t(kGBarrier | kGVsConsts | kGDriverParams | kGFsConsts | kGFsTex | kGVsTex | kGVfdDynamic | kGRast | kGViewport |
++                                               kGBlendDynamic | kGDraw | (vs.k.numSsbos != 0 || fs.k.numSsbos != 0 ? uint32_t(kGIbos) : 0u))}) {
++            st.clear();
++            emitDraw(st, f, program, pass, draw, vsb, fsb, vsProgram, fsProgram, 0, o, nullptr, false, groups);
++            // (the pass's own groups are kept too, by the pass: theirs are owned as the program's are)
++            walk(st.words().data(), st.words().size(), (groups & kGZs) != 0);
++        }
++        if (!apart) s->fast = false;
++    }
+     return s;
+ }
+ 
+@@ -3782,20 +3877,100 @@ void emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, cons
+         emitDraw(sink, f, program, pass, draw, vsb, fsb, ps.vsProgram, ps.fsProgram, table, o, gmem, afterFetch, pending);
+         pending = 0;
+     };
+-    auto kept = [&](uint32_t slot, const uint32_t* w, uint32_t count) {
++    auto kept = [&](uint32_t slot, const uint32_t* w, uint32_t count, const KeptSeg* segs, const KeptSeg* byReg, uint32_t packets, bool plain) {
+         Cursor::Last& l = cur.last[slot];
+         if (l.n == count && (l.at == w || count == 0 || memcmp(l.at, w, 4ull * count) == 0)) {
+             l.at = w;
++            l.byReg = byReg;
++            l.packets = packets;
++            l.plain = plain;
+             return;
+         }
+         flush();
+-        for (uint32_t i = 0; i < count;) {
+-            const pm4::Header h = pm4::decode(w[i]);
+-            sink.registers(h.reg, w + i + 1, h.count);
+-            i += 1 + h.count;
++        // The registers of the plain group the stream last held here hold what that group's words gave them, and it is
++        // the cursor that knows it: the shadow is not told while a register stays in the group. (A group's registers
++        // are its own -- buildState holds every kept state to that -- and nothing has made the shadow forget since, or
++        // the cursor would be empty.) So of the new group's words: a register the last group wrote too is written if
++        // the two words differ, the shadow not asked; one the last group did not write is the shadow's to say, and
++        // to learn; and a register the last group wrote that this one does not goes back to the shadow, which knows
++        // it from then on. The writes go out as the runs they form in their packet, as DedupSink cuts them.
++        if (plain && l.plain && l.at != nullptr) {
++            const uint32_t* const x = l.at;
++            const KeptSeg* const xs = l.byReg;
++            const uint32_t nx = l.packets;
++            const bool sameShape = nx == packets && l.n == count && memcmp(xs, byReg, packets * sizeof(KeptSeg)) == 0;
++            for (uint32_t p = 0; p < packets; p++) {
++                const KeptSeg& y = segs[p];
++                uint32_t runStart = 0, runLen = 0;
++                if (sameShape) {
++                    // (the same packets: word for word)
++                    for (uint32_t k = 0; k < y.count; k++) {
++                        if (x[y.at + k] != w[y.at + k]) {
++                            if (runLen == 0) runStart = k;
++                            runLen++;
++                        } else if (runLen != 0) {
++                            to.registers(y.reg + runStart, w + y.at + runStart, runLen);
++                            runLen = 0;
++                        }
++                    }
++                } else {
++                    // the last group's first run of registers that ends past this packet's first
++                    uint32_t lo = 0, hi = nx;
++                    while (lo < hi) {
++                        const uint32_t mid = (lo + hi) / 2;
++                        if (xs[mid].reg + xs[mid].count <= y.reg) lo = mid + 1;
++                        else hi = mid;
++                    }
++                    for (uint32_t k = 0; k < y.count; k++) {
++                        const uint32_t r = y.reg + k, value = w[y.at + k];
++                        while (lo < nx && xs[lo].reg + xs[lo].count <= r) lo++;
++                        const bool same = lo < nx && xs[lo].reg <= r ? x[xs[lo].at + (r - xs[lo].reg)] == value : regs.hold(r, value);
++                        if (!same) {
++                            if (runLen == 0) runStart = k;
++                            runLen++;
++                        } else if (runLen != 0) {
++                            to.registers(y.reg + runStart, w + y.at + runStart, runLen);
++                            runLen = 0;
++                        }
++                    }
++                }
++                if (runLen != 0) to.registers(y.reg + runStart, w + y.at + runStart, runLen);
++            }
++            if (!sameShape) {
++                // what the last group wrote and this one does not: the shadow's from now on
++                uint32_t j = 0;
++                for (uint32_t i = 0; i < nx; i++) {
++                    const KeptSeg& o = xs[i];
++                    for (uint32_t k = 0; k < o.count; k++) {
++                        const uint32_t r = o.reg + k;
++                        while (j < packets && byReg[j].reg + byReg[j].count <= r) j++;
++                        if (!(j < packets && byReg[j].reg <= r)) regs.hold(r, x[o.at + k]);
++                    }
++                }
++            }
++        } else {
++            // (the shadow's way: every register of the group the stream last held back to it first, when that one's were
++            // the cursor's to know)
++            if (l.plain && l.at != nullptr) {
++                for (uint32_t i = 0; i < l.packets; i++) {
++                    const KeptSeg& o = l.byReg[i];
++                    for (uint32_t k = 0; k < o.count; k++) regs.hold(o.reg + k, l.at[o.at + k]);
++                }
++            }
++            for (uint32_t i = 0; i < count;) {
++                const pm4::Header h = pm4::decode(w[i]);
++                sink.registers(h.reg, w + i + 1, h.count);
++                i += 1 + h.count;
++            }
+         }
+         l.at = w;
+         l.n = count;
++        l.byReg = byReg;
++        l.packets = packets;
++        l.plain = plain;
++    };
++    auto keptOf = [&](uint32_t slot, const ProgramState::Frag& fr) {
++        kept(slot, ps.at(fr), fr.n, ps.segs.data() + fr.segsAt, ps.byReg.data() + fr.segsAt, fr.packets, fr.plain);
+     };
+     auto asIs = [&](const ProgramState::Frag& fr) {
+         if (fr.n == 0) return;
+@@ -3817,23 +3992,25 @@ void emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, cons
+             scratch.clear();
+             emitDraw(scratch, f, program, pass, draw, vsb, fsb, ps.vsProgram, ps.fsProgram, table, o, gmem, afterFetch,
+                      kGZs | kGMrt | kGMsaa | kGRenderCntl | kGLrz);
+-            pc.frags.push_back(std::make_unique<PassCache::Frag>(PassCache::Frag{sig, scratch.words()}));
++            auto made = std::make_unique<PassCache::Frag>(PassCache::Frag{sig, scratch.words(), {}, {}, false});
++            made->plain = packetsOf(made->words.data(), uint32_t(made->words.size()), &made->segs, &made->byReg);
++            pc.frags.push_back(std::move(made));
+             fr = pc.frags.back().get();
+         }
+-        kept(Cursor::kPass, fr->words.data(), uint32_t(fr->words.size()));
++        kept(Cursor::kPass, fr->words.data(), uint32_t(fr->words.size()), fr->segs.data(), fr->byReg.data(), uint32_t(fr->segs.size()), fr->plain);
+     }
+     asIs(ps.invalidate);
+-    kept(Cursor::kConfig, ps.at(ps.config), ps.config.n);
++    keptOf(Cursor::kConfig, ps.config);
+     if (ps.vs.numSsbos != 0 || ps.fs.numSsbos != 0) pending |= kGIbos;
+-    kept(Cursor::kVsRegs, ps.at(ps.vsRegs), ps.vsRegs.n);
++    keptOf(Cursor::kVsRegs, ps.vsRegs);
+     asIs(ps.vsLoads);
+     if (!ps.vs.ranges.empty() || ps.vs.numUbos != 0) pending |= kGVsConsts;
+     if (ps.driverParams) pending |= kGDriverParams;
+-    kept(Cursor::kFsRegs, ps.at(ps.fsRegs), ps.fsRegs.n);
++    keptOf(Cursor::kFsRegs, ps.fsRegs);
+     asIs(ps.fsLoads);
+     if (!ps.fs.ranges.empty() || ps.fs.numUbos != 0) pending |= kGFsConsts;
+     pending |= kGFsTex | kGVsTex;
+-    kept(Cursor::kVfd, ps.at(ps.vfd), ps.vfd.n);
++    keptOf(Cursor::kVfd, ps.vfd);
+     {
+         Cursor::VfdIn in;
+         in.n = 0;
+@@ -3856,7 +4033,7 @@ void emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, cons
+             cur.vfdSet = true;
+         }
+     }
+-    kept(Cursor::kLink, ps.at(ps.link), ps.link.n);
++    keptOf(Cursor::kLink, ps.link);
+     {
+         const bool ordered = ps.fbRead && o.fbReadOrdered && gmem != nullptr;
+         const uint32_t in = draw.cullMode | draw.winding << 2 | (ordered ? 8u : 0u) | (draw.indexBuffer != nullptr ? 16u : 0u);
+@@ -3879,7 +4056,7 @@ void emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, cons
+             cur.viewportSet = true;
+         }
+     }
+-    kept(Cursor::kBlend, ps.at(ps.blend), ps.blend.n);
++    keptOf(Cursor::kBlend, ps.blend);
+     {
+         Cursor::BlendIn in;
+         memcpy(in.color, draw.blendColor, sizeof in.color);
+@@ -4453,8 +4630,13 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+             RegShadow before, beforeSys;
+             const size_t mark = into.size(), markSys = open_->sysStream.size();
+             if (verify) {
++                // (copies of the shadows as the long way would find them: with what the cursors know told to them)
+                 before = shadow;
+-                if (open_->dual) beforeSys = open_->regs;
++                cursor.settle(before);
++                if (open_->dual) {
++                    beforeSys = open_->regs;
++                    open_->cache->cur[0].settle(beforeSys);
++                }
+             }
+             into.packet(pm4::kNop, nullptr, 0);
+             render::emitFast(into, shadow, cursor, *ps, *open_->cache, f, program, pass, d, vsBindings, fsBindings, table.gpuAddress(), encodeOptions, tiled,
+@@ -4485,6 +4667,9 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+                 }
+             }
+         } else {
++            // (every register through the shadow: what the cursors knew of the kept groups' goes to it first)
++            cursor.settle(shadow);
++            if (open_->dual) open_->cache->cur[0].settle(open_->regs);
+             into.packet(pm4::kNop, nullptr, 0);
+             render::DedupSink sink(into, shadow);
+             render::emitDraw(sink, f, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(), encodeOptions, tiled, afterFetch, render::kGAll);

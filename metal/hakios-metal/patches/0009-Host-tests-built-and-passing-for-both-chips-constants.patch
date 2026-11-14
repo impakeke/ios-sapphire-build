@@ -1,0 +1,419 @@
+Subject: Host tests: built and passing for both chips' constants
+
+The tests ran with the A635's constants alone: `make test` has no -DHAKIOS_CHIP_A610, which is what the phone's
+bundle is built with (make ios CHIP=a610). Built with it, 42 checks of 19 tests failed -- none of them the
+driver's doing:
+
+- tests that state the chip as a number (the instruction cache, the fibers an SP, RB_CCU_CNTL in sysmem, the magic
+  registers, the chip id, the GMEM plan's bins, a preload's cap) stated the A635's. Each now states the A610's
+  beside it under HAKIOS_CHIP_A610, worked out from Mesa 25.0.7's row for GPUId(610) (freedreno_devices.py:
+  a6xx_gen1_low, lines 353-369, and the entry at 445-478) and tu_device.cc:1426-1457, not read off the code tested.
+- tests of what only a chip with LPAC has (HLSQ_CS_CTRL_REG1, the SP's copies of the id registers:
+  fd6_compute.cc:119-127) and of the cubic filter (a6xx_gen3 and gen4's) say what a chip without them does:
+  no such register written, the sampler refused by name.
+- the fake GPU judged a framebuffer fetch's descriptor in a tile as if GMEM began at GPU address 0. It begins at
+  kGmemBase (0x100000 on the A610, as the kernel and Linux have it; turnip's gmem_base + gmem_offset), which the
+  descriptor carries since the A610 patch: every fetch in a GMEM pass was a fault of the model.
+
+The fake GPU also held every constant load of a submission to the constlen of each later draw, whatever program
+the constants had been loaded for: a frame whose stages differ in constlen -- any compositor's -- faulted at the
+first draw of a shorter stage after a longer one's. A stage's constants are now held to the program they were
+loaded after (its preload begins another set).
+
+c_api.cpp: chipKnown is unused on a host without the kernel's GPU, which -Werror refused with Apple clang 21
+(`make test` did not build on macOS).
+
+261 tests, 0 failed checks, with either chip's constants.
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/fake_gpu.hpp b/hakios-metal/include/hakios-metal/fake_gpu.hpp
+index fbc45d4..713f94d 100644
+--- a/hakios-metal/include/hakios-metal/fake_gpu.hpp
++++ b/hakios-metal/include/hakios-metal/fake_gpu.hpp
+@@ -232,6 +232,7 @@ private:
+         uint64_t programFrom = 0;
+         uint32_t programUnits = 0;
+         std::vector<ConstLoad> consts;
++        uint64_t constsFor = 0;            // the program (its preload's source) CONSTS were loaded after
+         bool sampLoaded = false, texLoaded = false;
+         uint64_t sampFrom = 0, texFrom = 0;
+         uint32_t sampUnits = 0, texUnits = 0;
+diff --git a/hakios-metal/src/c_api.cpp b/hakios-metal/src/c_api.cpp
+index 5872e6b..dd2891f 100644
+--- a/hakios-metal/src/c_api.cpp
++++ b/hakios-metal/src/c_api.cpp
+@@ -215,7 +215,8 @@ const char* hakios_metal_error(void) { return lastError.c_str(); }
+ // Tiles, GMEM offsets and the shader compiler are built for one chip (a6xx.hpp). A kernel that does not say (0) is taken at its
+ // word that it is that one: only a chip it names as another is refused, so that the window server stays on OpenGL ES there.
+ bool hakios_metal_chip_known(uint32_t chip) { return chip == 0 || chip == a6xx::kChipId; }
+-static bool chipKnown(uint32_t chip) { return hakios_metal_chip_known(chip); }
++// (only hakios_metal_open's kernel path asks: unused, and so marked, on a host without one)
++[[maybe_unused]] static bool chipKnown(uint32_t chip) { return hakios_metal_chip_known(chip); }
+ 
+ static hakios_metal_device* deviceOn(std::unique_ptr<Transport> t) {
+     auto* d = new hakios_metal_device;
+diff --git a/hakios-metal/src/fake_gpu.cpp b/hakios-metal/src/fake_gpu.cpp
+index 72e33e6..679b68f 100644
+--- a/hakios-metal/src/fake_gpu.cpp
++++ b/hakios-metal/src/fake_gpu.cpp
+@@ -410,6 +410,14 @@ bool FakeGpu::loadState(uint32_t opcode, const uint32_t* p, uint32_t count) {
+         (xs ? xs->programLoaded : cs_.programLoaded) = true;
+         (xs ? xs->programFrom : cs_.programFrom) = from;
+         (xs ? xs->programUnits : cs_.programUnits) = units;
++        // A graphics stage's constants are held to the constlen of the program they were loaded for (checkStageProgram):
++        // another program's preload begins another set. Kept across the whole submission, a frame whose stages differ in
++        // constlen -- a compositor's -- faulted on the first draw of a shorter stage after a longer one's, for constants
++        // that stage never reads. (The same program preloaded again keeps them: a draw's loads follow its preload.)
++        if (xs != nullptr && xs->constsFor != from) {
++            xs->consts.clear();
++            xs->constsFor = from;
++        }
+         break;
+     case ST6_CONSTANTS:
+         {
+@@ -526,7 +534,9 @@ bool FakeGpu::check2d(const uint32_t* d, const char* what, uint32_t i, bool samp
+         const uint32_t ccu = reg(REG_A6XX_RB_CCU_CNTL);
+         const uint64_t cache = uint64_t(fieldOf(ccu, A6XX_RB_CCU_CNTL_COLOR_OFFSET__MASK, A6XX_RB_CCU_CNTL_COLOR_OFFSET__SHIFT)) << A6XX_RB_CCU_CNTL_COLOR_OFFSET__SCALE |
+                                uint64_t(fieldOf(ccu, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__MASK, A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI__SHIFT)) << 21;
+-        if (pitch != uint64_t(binW) * bpp || base + uint64_t(binW) * binH * bpp > cache ||
++        // (the descriptor's address is a GPU address: GMEM's own plus the bin's place in it, turnip's gmem_base +
++        // gmem_offset, tu_cmd_buffer.cc:1946 -- 0 on the A635, 0x100000 on the A610)
++        if (pitch != uint64_t(binW) * bpp || base < kGmemBase || base - kGmemBase + uint64_t(binW) * binH * bpp > cache ||
+             fieldOf(d[2], A6XX_TEX_CONST_2_TYPE__MASK, A6XX_TEX_CONST_2_TYPE__SHIFT) != A6XX_TEX_2D ||
+             fieldOf(d[5], A6XX_TEX_CONST_5_DEPTH__MASK, A6XX_TEX_CONST_5_DEPTH__SHIFT) != 1) {
+             fault(who + text(": a GMEM read of pitch %llu at %#llx: ", pitch, base) + text("not the %llu-pixel bin's rows, ", binW) +
+diff --git a/hakios-metal/tests/a6xx_test.cpp b/hakios-metal/tests/a6xx_test.cpp
+index d46ceaa..ceb04fc 100644
+--- a/hakios-metal/tests/a6xx_test.cpp
++++ b/hakios-metal/tests/a6xx_test.cpp
+@@ -110,8 +110,14 @@ TEST(a6xx_load_state6_word_0) {
+     // one IBO descriptor: ST6_IBO (3) << 14 = 0xc000 | 0x20000 | 0x340000 | 1 << 22 = 0x400000
+     CHECK_EQ(loadState6_0(0, ST6_IBO, SS6_INDIRECT, SB6_CS_SHADER, 1), 0x0076c000u);
+     // the shader preload is capped at the instruction cache, and that fits the 10-bit NUM_UNIT
++#if defined(HAKIOS_CHIP_A610)
++    // (the A610: Mesa 25.0.7 freedreno_devices.py a6xx_gen1_low, instr_cache_size = 64)
++    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 64u << 22);
++    CHECK_EQ(kInstrCacheSize, 64u);
++#else
+     CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 127u << 22);
+     CHECK_EQ(kInstrCacheSize, 127u);
++#endif
+     // the source address: the low word keeps bits 31:2, the high word is whole
+     CHECK_EQ(CP_LOAD_STATE6_1_EXT_SRC_ADDR(0x1000), 0x1000u);
+     CHECK_EQ(CP_LOAD_STATE6_1_EXT_SRC_ADDR(0x1003), 0x1000u);
+@@ -282,10 +288,18 @@ TEST(a6xx_private_memory_fields_are_scaled) {
+     CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(0x3ffff000), 0x3ffffu);
+     CHECK_EQ(A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(0x800), 1u);
+     CHECK_EQ(A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(0x10000), 0x20u);
++#if defined(HAKIOS_CHIP_A610)
++    // the A610 (freedreno_devices.py GPUId(610): fibers_per_sp = 128 * 16, num_ccu = 1): 2048 fibers per SP, 1 SP; a
++    // 512-byte private memory per fiber is 1 MiB, 256 pages of 4 KiB
++    CHECK_EQ(kFibersPerSp, 2048u);
++    CHECK_EQ(kNumSpCores, 1u);
++    CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(512 * kFibersPerSp), 256u);
++#else
+     // this chip: 4096 fibers per SP, 2 SPs; a 512-byte private memory per fiber is 2 MiB per SP, 4 MiB in all
+     CHECK_EQ(kFibersPerSp, 4096u);
+     CHECK_EQ(kNumSpCores, 2u);
+     CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(512 * kFibersPerSp), 512u);
++#endif
+ }
+ 
+ TEST(a6xx_dispatch_words) {
+@@ -333,7 +347,15 @@ TEST(a6xx_batch_start_words) {
+     // RB_CCU_CNTL for rendering to memory on this chip: depth cache at 0, color cache after it at
+     // num_ccu (2) * 64 KiB = 0x20000 bytes, in 4 KiB units: 0x20 << 23 = 0x10000000; both cache sizes FULL (0);
+     // the chip has fast clear (bit 0 clear) and no concurrent resolve (bit 2 clear)
++#if defined(HAKIOS_CHIP_A610)
++    // (the A610: one CCU whose caches are 8 KiB each -- num_ccu = 1, sysmem_per_ccu_*_cache_size = 8 * 1024 in
++    // a6xx_gen1_low -- so the colour cache sits at 0x2000 after the depth cache's 8 KiB, 2 << 23 = 0x01000000; and no
++    // fast clear, has_gmem_fast_clear = False: GMEM_FAST_CLEAR_DISABLE, bit 0. tu_device.cc:1426-1437 for the offset,
++    // tu6_emit_ccu_cntl for the word)
++    CHECK_EQ(rbCcuCntlSysmem(), 0x01000001u);
++#else
+     CHECK_EQ(rbCcuCntlSysmem(), 0x10000000u);
++#endif
+     CHECK_EQ(A6XX_RB_CCU_CNTL_COLOR_OFFSET(0x20000), 0x10000000u);
+     CHECK_EQ(A6XX_RB_CCU_CNTL_DEPTH_OFFSET(0x1000), 0x1000u);
+     CHECK_EQ(A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI(1), 0x200u);
+@@ -365,11 +387,19 @@ TEST(a6xx_batch_start_words) {
+     CHECK_EQ(kStaticState[1].reg, REG_A6XX_SP_FLOAT_CNTL);
+     CHECK_EQ(kStaticState[1].value, 0x8u);
+     CHECK_EQ(kStaticState[5].reg, REG_A6XX_TPL1_DBG_ECO_CNTL);
++#if defined(HAKIOS_CHIP_A610)
++    CHECK_EQ(kStaticState[5].value, 0u);            // (the A610's magic_regs: TPL1_DBG_ECO_CNTL = 0, freedreno_devices.py:459-477)
++#else
+     CHECK_EQ(kStaticState[5].value, 0x05008000u);
++#endif
+     CHECK_EQ(kStaticState[19].reg, REG_A6XX_SP_MODE_CONTROL);
+     CHECK_EQ(kStaticState[19].value, 0x5u);
+     CHECK_EQ(kStaticState[23].reg, REG_A6XX_PC_MODE_CNTL);
++#if defined(HAKIOS_CHIP_A610)
++    CHECK_EQ(kStaticState[23].value, 0xfu);         // (PC_MODE_CNTL = 0xf)
++#else
+     CHECK_EQ(kStaticState[23].value, 0x1fu);
++#endif
+     CHECK_EQ(kStaticState[49].reg, REG_A6XX_SP_TP_MODE_CNTL);
+     CHECK_EQ(kStaticState[49].value, 0xa2u);
+     CHECK_EQ(kStaticState[n - 1].reg, REG_A6XX_VFD_MULTIVIEW_CNTL);
+@@ -386,11 +416,21 @@ TEST(a6xx_batch_start_words) {
+     for (const RegWrite& w : kStaticState) {
+         CHECK(w.reg >= 0x0e12 && w.reg <= 0xbe04);
+     }
++#if defined(HAKIOS_CHIP_A610)
++    // (the A610's row, freedreno_devices.py:459-477: TPL1_DBG_ECO_CNTL 0, RB_DBG_ECO_CNTL 0x04100000, VPC_DBG_ECO_CNTL 0,
++    // SP_CHICKEN_BITS 0, UCHE_CLIENT_PF 4)
++    CHECK_EQ(kMagicTpl1DbgEcoCntl, 0u);
++    CHECK_EQ(kMagicRbDbgEcoCntl, 68157440u);
++    CHECK_EQ(kMagicVpcDbgEcoCntl, 0u);
++    CHECK_EQ(kMagicSpChickenBits, 0u);
++    CHECK_EQ(kMagicUcheClientPf, 4u);
++#else
+     CHECK_EQ(kMagicTpl1DbgEcoCntl, 83918848u);
+     CHECK_EQ(kMagicRbDbgEcoCntl, 68157440u);
+     CHECK_EQ(kMagicVpcDbgEcoCntl, 33554432u);
+     CHECK_EQ(kMagicSpChickenBits, 5120u);
+     CHECK_EQ(kMagicUcheClientPf, 132u);
++#endif
+     CHECK_EQ(kBorderColorBytes, 32768u);
+ }
+ 
+@@ -744,7 +784,11 @@ TEST(a6xx_first_draw_program_words) {
+     CHECK_EQ(hlsqFsCntl0(THREAD128, true), 0x3u);
+     CHECK_EQ(hlsqFsCntl0(THREAD64, false), 0u);
+     // the stage loads: NUM_UNIT is capped at the instruction cache, as compute's is
++#if defined(HAKIOS_CHIP_A610)
++    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 64u << 22);
++#else
+     CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 127u << 22);
++#endif
+     // the private memory words are the compute ones' twins (same scales)
+     CHECK_EQ(A6XX_SP_VS_PVT_MEM_PARAM_MEMSIZEPERITEM(512), 1u);
+     CHECK_EQ(A6XX_SP_FS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(0x1000), 1u);
+diff --git a/hakios-metal/tests/c_api_test.cpp b/hakios-metal/tests/c_api_test.cpp
+index 3865b45..47af709 100644
+--- a/hakios-metal/tests/c_api_test.cpp
++++ b/hakios-metal/tests/c_api_test.cpp
+@@ -58,7 +58,12 @@ TEST(c_api_copy_and_callbacks) {
+     hakios_metal_queue_free(q);
+     hakios_metal_close(d);
+     CHECK(hakios_metal_open() == nullptr);      // no kernel GPU on this machine
++#if defined(HAKIOS_CHIP_A610)
++    CHECK(hakios_metal_chip_known(0x06010001));  // this phone's: the A610 as this port's kernel answers MSM_PARAM_CHIP_ID
++    CHECK(!hakios_metal_chip_known(0x06030500)); // the A635 these tables were first written for
++#else
+     CHECK(hakios_metal_chip_known(0x06030500));  // this phone's
++#endif
+     CHECK(hakios_metal_chip_known(0));           // a kernel that does not say
+     CHECK(!hakios_metal_chip_known(0x06060000)); // another Adreno: the tables here would hang it
+     CHECK(strlen(hakios_metal_error()) > 0);
+diff --git a/hakios-metal/tests/compute_test.cpp b/hakios-metal/tests/compute_test.cpp
+index c7f9c6f..86df362 100644
+--- a/hakios-metal/tests/compute_test.cpp
++++ b/hakios-metal/tests/compute_test.cpp
+@@ -180,7 +180,12 @@ TEST(a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets)
+     Encoded big(r, kernels::fill_id, kGroups16, nullptr, tg);
+     CHECK(big.ok);
+     CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_SP_CS_CTRL_REG1)]), 7u);
+-    CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1)]), 7u);
++    // (the HLSQ's copy is a chip with LPAC's alone, fd6_compute.cc:119-127: the A610 has none, and none is written)
++    if (a6xx::kHasLpac) {
++        CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1)]), 7u);
++    } else {
++        CHECK(big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1) == size_t(-1));
++    }
+     tg.sharedBytes = 32 * 1024 + 1;
+     Encoded over(r, kernels::fill_id, kGroups16, nullptr, tg);
+     CHECK(!over.ok);
+@@ -532,6 +537,12 @@ TEST(the_fake_refuses_id_registers_whose_two_copies_differ) {
+         }
+         i += 1 + h.count;
+     }
++    // (the SP's copies are a chip with LPAC's alone, fd6_compute.cc:119-127: on the A610 there is no second copy to
++    // differ, and the stream writes none)
++    if (!a6xx::kHasLpac) {
++        CHECK(!changed);
++        return;
++    }
+     CHECK(changed);
+     Raw raw(r);
+     CHECK_EQ(raw.submit(words), ETIMEDOUT);
+@@ -1187,10 +1198,14 @@ TEST(a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround) {
+     {
+         Encoded e(r, kernels::chain160_air, kGroups16, local, b);
+         CHECK(e.ok);
+-        CHECK(e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) == size_t(-1));
++        // (its 96 units fit the A635's instruction cache of 127 and get none of it; the A610's holds 64, and there it
++        // is a kernel longer than the cache like the other)
++        const bool fits = kernels::chain160_air.instrlen <= a6xx::kInstrCacheSize;
++        CHECK_EQ(kernels::chain160_air.instrlen, 96u);
++        CHECK((e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) == size_t(-1)) == fits);
+         size_t before = 0, after = 0;
+         labels(e, &before, &after);
+-        CHECK_EQ(before + after, size_t(0));
++        CHECK_EQ(before + after, fits ? size_t(0) : size_t(2));
+         // the same kernel with its preload cut below its length is fetched past the preload, and gets it
+         compute::Options cut;
+         cut.preloadCap = 64;
+diff --git a/hakios-metal/tests/render_test.cpp b/hakios-metal/tests/render_test.cpp
+index 1bfcf52..046e170 100644
+--- a/hakios-metal/tests/render_test.cpp
++++ b/hakios-metal/tests/render_test.cpp
+@@ -69,6 +69,15 @@ std::shared_ptr<Texture> target(Rig& r, uint32_t w = 64, uint32_t h = 64, uint32
+ }
+ 
+ constexpr uint32_t regid(uint32_t n, uint32_t c) { return n * 4 + c; }
++// What the chip the tests are built for has, where a test states it as a number (a6xx_test works each out from Mesa's row):
++// RB_CCU_CNTL in sysmem, and the instruction cache a program's preload is capped at.
++#if defined(HAKIOS_CHIP_A610)
++constexpr uint32_t kCcuSysmem = 0x01000001u;   // one CCU of 8 KiB caches (colour at 0x2000), no GMEM fast clear
++constexpr uint32_t kPreloadCap = 64;           // a6xx_gen1_low instr_cache_size
++#else
++constexpr uint32_t kCcuSysmem = 0x10000000u;
++constexpr uint32_t kPreloadCap = 127;
++#endif
+ constexpr uint8_t kSlotPos = 0, kSlotVar0 = 32, kSlotVertexId = 9, kSlotBaryPerspPixel = 56, kFragData0 = 4;
+ 
+ // A stage with no register read: every regid field kRegidNone, nothing else set. A zero-initialized Stage would name
+@@ -656,11 +665,11 @@ TEST(render_encodes_the_first_triangles_registers) {
+     CHECK_EQ(e.reg(REG_A6XX_SP_TP_BORDER_COLOR_BASE_ADDR), uint32_t(border));
+     CHECK_EQ(e.reg(REG_A6XX_SP_TP_BORDER_COLOR_BASE_ADDR + 1), uint32_t(border >> 32));
+     CHECK_EQ(e.reg(REG_A6XX_SP_PS_TP_BORDER_COLOR_BASE_ADDR), uint32_t(border));
+-    // RB_CCU_CNTL 0x10000000 right after a WFI
++    // RB_CCU_CNTL 0x10000000 (the A610's 0x01000001) right after a WFI
+     {
+         size_t ccu = e.findReg(REG_A6XX_RB_CCU_CNTL);
+         CHECK(ccu != size_t(-1));
+-        CHECK_EQ(w[ccu], 0x10000000u);
++        CHECK_EQ(w[ccu], kCcuSysmem);
+         pm4::Header before = pm4::decode(w[ccu - 2]);
+         CHECK(before.kind == pm4::Header::kCommand && before.opcode == pm4::kWaitForIdle && before.count == 0);
+     }
+@@ -964,7 +973,7 @@ TEST(render_options_switch_each_group_and_each_alternative) {
+         CHECK_EQ(e.find(CP_SET_DRAW_STATE), size_t(-1));
+         CHECK_EQ(e.reg(REG_A6XX_SP_TP_BORDER_COLOR_BASE_ADDR), Encoded::kNone);
+         CHECK_EQ(e.writes(REG_A6XX_RB_ALPHA_CONTROL), 1u);   // blendZsa's alone
+-        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x10000000u);   // ccuCntl is its own group
++        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), kCcuSysmem);   // ccuCntl is its own group
+         CHECK(e.stream.size() < whole.stream.size());
+     }
+     {
+@@ -974,7 +983,7 @@ TEST(render_options_switch_each_group_and_each_alternative) {
+     }
+     {
+         Encoded e = with([](render::Options& o) { o.ccuConcurrentResolve = true; });
+-        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x10000004u);
++        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), kCcuSysmem | 0x4u);   // CONCURRENT_RESOLVE, bit 2
+     }
+     {
+         Encoded e = with([](render::Options& o) { o.passBegin = false; });
+@@ -1851,7 +1860,9 @@ TEST(the_fake_refuses_a_draw_with_msaa_without_the_ccu_cntl_or_without_its_flush
+         Twin w;
+         size_t ccu = w.e.findReg(REG_A6XX_RB_CCU_CNTL);
+         w.words[ccu - 2] = pm4::type7(pm4::kNop, 0);   // the WFI before it, gone
+-        CHECK(has(w.fault(), "RB_CCU_CNTL (0x10000000) was not written in this submission right after a CP_WAIT_FOR_IDLE"));
++        char said[96];
++        snprintf(said, sizeof said, "RB_CCU_CNTL (%#x) was not written in this submission right after a CP_WAIT_FOR_IDLE", kCcuSysmem);
++        CHECK(has(w.fault(), said));
+     }
+     {
+         Twin w;
+@@ -4412,7 +4423,8 @@ TEST(a_draw_that_reads_its_target_gets_the_target_as_a_texture_and_a_barrier_bef
+     CHECK_EQ((gw[0] & A6XX_TEX_CONST_0_TILE_MODE__MASK) >> A6XX_TEX_CONST_0_TILE_MODE__SHIFT, uint32_t(TILE6_2));
+     CHECK_EQ(gw[0] & A6XX_TEX_CONST_0_SWAP__MASK, 0u);
+     CHECK_EQ((gw[2] & A6XX_TEX_CONST_2_PITCH__MASK) >> A6XX_TEX_CONST_2_PITCH__SHIFT, 64u * 4);
+-    CHECK(gw[4] == 0 && (gw[5] & A6XX_TEX_CONST_5_BASE_HI__MASK) == 0);
++    // (the bin's place 0 in GMEM, whose own GPU address is 0 on the A635 and 0x100000 on the A610)
++    CHECK(gw[4] == a6xx::kGmemBase && (gw[5] & A6XX_TEX_CONST_5_BASE_HI__MASK) == 0);
+     pm4::Stream gb;
+     std::string gwhy;
+     auto gt = newBuffer(*r.gpu, render::kTableBytes, &gwhy);
+@@ -4648,7 +4660,7 @@ TEST(a_program_longer_than_the_instruction_cache_is_preloaded_in_part) {
+         const uint32_t type = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_TYPE__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_TYPE__SHIFT;
+         const uint32_t block = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__SHIFT;
+         if (type == a6xx::ST6_SHADER && block == a6xx::SB6_FS_SHADER) {
+-            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT, 127u);
++            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT, kPreloadCap);
+             w[i + 1] = (d0 & ~a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) | a6xx::CP_LOAD_STATE6_0_NUM_UNIT(128);
+             found = true;
+         }
+@@ -5339,13 +5351,19 @@ TEST(the_gmem_plan_fits_the_bins_in_gmem_and_covers_the_target) {
+         std::printf("       %ux%u %s: %u x %u tiles of %u x %u\n", w, h, t->info().name, p.cols, p.rows, p.binW, p.binH);
+     }
+     // the screen at 4 bytes a pixel: two columns of 576 and twelve rows of 208, 24 tiles
++    // (the A610, 128 KiB of GMEM below the colour cache: a row of 576 pixels is 2304 bytes, 56 rows fit, 48 in whole
++    // granules of 16 -- two columns of 576 and 51 rows of 48, 102 tiles)
+     {
+         auto t = target(r, 1125, 2436, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+         RenderPass a;
+         a.color0 = t.get();
+         render::GmemPlan p;
+         CHECK(render::gmemPlan(a, &p, nullptr));
++#if defined(HAKIOS_CHIP_A610)
++        CHECK(p.cols == 2 && p.rows == 51 && p.binW == 576 && p.binH == 48);
++#else
+         CHECK(p.cols == 2 && p.rows == 12 && p.binW == 576 && p.binH == 208);
++#endif
+     }
+     // what stays in sysmem: a second colour attachment of another size, an integer target
+     {
+@@ -5462,7 +5480,12 @@ TEST(a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn) {
+         a.more[0].load = LoadAction::kLoad;
+         render::GmemPlan p;
+         CHECK(render::gmemPlan(a, &p, nullptr));
++#if defined(HAKIOS_CHIP_A610)
++        // (128 KiB shared out by bytes a pixel: 64 KiB each, 28 rows of 2304 bytes, 16 in whole granules)
++        CHECK(p.binW == 576 && p.binH == 16 && p.base[0] == 0 && p.base[1] == 0x10000 && p.room[0] == 0x10000 && p.room[1] == 0x10000);
++#else
+         CHECK(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 && p.room[1] == 0x3c000);
++#endif
+         auto cb = r.queue->commandBuffer();
+         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
+         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
+@@ -5500,7 +5523,12 @@ TEST(a_gmem_pass_is_tiled_over_its_render_area) {
+     CHECK(cb->status() == CommandBuffer::kCompleted);
+     const auto s = r.fake->stats();
+     CHECK_EQ(s.faults, 0u);
++#if defined(HAKIOS_CHIP_A610)
++    // (the area's 68 rows from 992 are two of this chip's bins of 48 rows at most)
++    CHECK(s.tiles == 2 && s.tileLoads == 2 && s.tileStores == 2);
++#else
+     CHECK(s.tiles == 1 && s.tileLoads == 1 && s.tileStores == 1);
++#endif
+     // the area (300, 1000)-(449, 1059) in 16 x 4 granules: x 288 to 463, y 1000 to 1059
+     CHECK_EQ(s.storedPixels, uint64_t(464 - 288) * (1060 - 1000));
+     CHECK_EQ(coordsWrong(*t), 0u);
+@@ -5528,7 +5556,11 @@ TEST(a_fetch_in_a_corner_reads_bins_of_the_width_its_descriptor_has) {
+     const auto s = r.fake->stats();
+     CHECK_EQ(s.faults, 0u);
+     if (s.faults) std::printf("       %s\n", s.lastFault.c_str());
++#if defined(HAKIOS_CHIP_A610)
++    CHECK(cb->counts().gmemPasses == 1 && s.tiles == 2);   // (the area's 58 rows from 992: two bins of 48 rows at most)
++#else
+     CHECK(cb->counts().gmemPasses == 1 && s.tiles == 1);
++#endif
+     const auto gd = r.fake->memory(s.lastDraw.fsTexConst, 64);
+     uint32_t gw[16] = {};
+     if (gd.size() == 64) memcpy(gw, gd.data(), 64);
+diff --git a/hakios-metal/tests/texture_test.cpp b/hakios-metal/tests/texture_test.cpp
+index 8731b23..c027fc6 100644
+--- a/hakios-metal/tests/texture_test.cpp
++++ b/hakios-metal/tests/texture_test.cpp
+@@ -506,9 +506,16 @@ TEST(sampler_words_follow_galliums_encoding_of_metals_descriptor) {
+         c.minFilter = c.magFilter = 2;
+         Sampler cs;
+         std::string cwhy;
++#if defined(HAKIOS_CHIP_A610)
++        // (the A610 has no cubic filter -- has_tex_filter_cubic is a6xx_gen3's and gen4's, freedreno_devices.py:396,419 --
++        // and the sampler is refused by name)
++        CHECK(!makeSampler(c, &cs, &cwhy));
++        CHECK(has(cwhy, "bicubic filtering: the Adreno 610 has no cubic filter"));
++#else
+         CHECK(makeSampler(c, &cs, &cwhy));
+         CHECK_EQ((cs.words[0] & A6XX_TEX_SAMP_0_XY_MIN__MASK) >> A6XX_TEX_SAMP_0_XY_MIN__SHIFT, uint32_t(A6XX_TEX_CUBIC));
+         CHECK_EQ((cs.words[0] & A6XX_TEX_SAMP_0_XY_MAG__MASK) >> A6XX_TEX_SAMP_0_XY_MAG__SHIFT, uint32_t(A6XX_TEX_CUBIC));
++#endif
+     }
+     d = SamplerDesc{};
+     d.mipFilter = 3;

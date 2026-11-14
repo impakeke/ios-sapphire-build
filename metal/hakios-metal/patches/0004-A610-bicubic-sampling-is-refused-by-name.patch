@@ -1,0 +1,25 @@
+Subject: A610: bicubic sampling is refused by name
+
+has_tex_filter_cubic is a6xx_gen3's and a6xx_gen4's (freedreno_devices.py:396, 419); Mesa 25.0.7's row for the A610
+has none, and turnip offers the cubic filter by that fact alone. A sampler asking for it is refused, as every other
+thing this driver does not serve, rather than written into a field the texture unit does not have.
+
+---
+diff --git a/hakios-metal/src/texture.cpp b/hakios-metal/src/texture.cpp
+index b1e2cf6..9cb009d 100644
+--- a/hakios-metal/src/texture.cpp
++++ b/hakios-metal/src/texture.cpp
+@@ -1244,6 +1244,13 @@ bool makeSampler(const SamplerDesc& d, Sampler* out, std::string* why) {
+     }
+     // bicubic is the TP's own cubic filter, which this chip has (freedreno_devices.py a6xx_gen4 has_tex_filter_cubic;
+     // turnip's VK_FILTER_CUBIC_EXT, tu6_tex_filter)
++#if defined(HAKIOS_CHIP_A610)
++    // (the A610 has no cubic filter: has_tex_filter_cubic is a6xx_gen3's and a6xx_gen4's in freedreno_devices.py:396,419,
++    // and Mesa 25.0.7's row for GPUId(610), __info6, has none; turnip offers VK_EXT_filter_cubic by that fact alone)
++    if (d.minFilter == 2 || d.magFilter == 2) {
++        return refuse(why, "bicubic filtering: the Adreno 610 has no cubic filter (Mesa: no has_tex_filter_cubic for it)");
++    }
++#endif
+     auto filter = [](uint32_t m) { return m == 2 ? A6XX_TEX_CUBIC : m == 1 ? A6XX_TEX_LINEAR : A6XX_TEX_NEAREST; };
+     f.min = filter(d.minFilter);
+     f.mag = filter(d.magFilter);

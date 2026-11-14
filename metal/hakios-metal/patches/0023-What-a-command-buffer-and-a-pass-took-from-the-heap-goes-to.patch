@@ -1,0 +1,347 @@
+Subject: What a command buffer and a pass took from the heap goes to the next one
+
+A frame's command buffer grew its stream, the list of buffers it names and the two lists of what it keeps from
+nothing, a doubling at a time, and each of its eight passes or so made its own streams and register shadows the
+same way; each also asked the queue, under its lock, for every program's state again.
+
+- CommandQueue::Spare: a command buffer that is done hands its stream and lists, emptied, and its DrawCache to
+  the queue; the next command buffer takes them. The DrawCache's slots stay as they are -- a state is a program's
+  for as long as the program has that uid -- so the frame after finds its programs' states without the queue's
+  lock; DrawCache::epoch counts command buffers, and a slot's says whether this one has named and kept the
+  buffers the state's two programs lie in (the submission's list is the same: the golden names). Programs made by
+  hand are forgotten at each command buffer, as before.
+- CommandBuffer::PassReturn: an open pass let go (closePass's open_.reset(), unchanged) goes back to the queue as a
+  new one in every field -- OpenPass{} assigned whole, whatever fields there are -- but for the memory of its
+  streams, shadows and cache. draw() takes its pass from there, and the pass's head is written into the
+  DrawCache's two streams rather than two new ones.
+- streamWords() says what the stream held once the buffer is done and its stream handed on.
+
+Heap allocations a draw, drawbench with A610 constants: T 0.8 -> 0.2, S 1.2 -> 0.4, K 1.0 -> 0.3, J 3.2 -> 0.7; bytes
+asked for a draw T 1739 -> 31, S 3073 -> 56. Least of 12 frames, us a draw: T 2.96 -> 2.66, K 3.18 -> 2.83, J 3.14 ->
+2.48. (U, five passes: 7.6 -> 5.6 allocations and 9.2 -> 7.6 us; the rest is the closing of its tiled passes.)
+
+The streams and the names are the same: golden three ways, both chips.
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/command.hpp b/hakios-metal/include/hakios-metal/command.hpp
+index 2ad9766..a26bbbf 100644
+--- a/hakios-metal/include/hakios-metal/command.hpp
++++ b/hakios-metal/include/hakios-metal/command.hpp
+@@ -209,8 +209,8 @@ public:
+     void setNullFsTextures(bool on) { nullFsTextures_ = on; }
+     // why the last pass that could not be drawn in GMEM was not (gmemPlan's or gmemDrawOk's reason), empty when none was refused
+     const std::string& gmemRefusal() const { return gmemWhy_; }
+-    // the words recorded so far (what the command processor will read)
+-    size_t streamWords() const { return stream_.words().size(); }
++    // the words recorded so far (what the command processor will read; once it is done, what it was given)
++    size_t streamWords() const { return streamWords_ != 0 ? streamWords_ : stream_.words().size(); }
+     // (for the tests) every draw taken from a program's kept state checked against the same draw encoded in full: a
+     // difference in a word of the stream or a byte of the draw's table ends the buffer in error, saying which
+     static void verifyDraws(bool on);
+@@ -352,7 +352,15 @@ private:
+     };
+     void closePass();
+     void useAttachments(const RenderPass& pass);
+-    std::unique_ptr<OpenPass> open_;
++    // An open pass let go is the queue's to hand to the next pass, as a new one in everything but what its streams and
++    // its register shadows have taken from the heap (render.cpp): a frame is eight passes or so, and each made those
++    // again from nothing, a doubling at a time.
++    struct PassReturn {
++        CommandQueue* queue = nullptr;
++        void operator()(OpenPass* p) const;
++    };
++    using OpenPassPtr = std::unique_ptr<OpenPass, PassReturn>;
++    OpenPassPtr open_;
+     // A piece of a larger buffer, for a draw's or a dispatch's table and a program's words. A buffer of its own for each
+     // was three requests to the kernel for every draw, which on the phone cost about 200 us a draw (probe 9r) while the
+     // GPU spent 3 us on it. A piece is the command buffer's: written once, used for writing, kept until completion.
+@@ -383,12 +391,14 @@ private:
+     std::unordered_multimap<const uint32_t*, Uploaded> uploaded_;
+     // the programs this buffer has drawn with and its scratch for a draw (render.cpp: DrawCache), made at the first draw
+     std::shared_ptr<render::DrawCache> drawCache_;
++    bool drawCacheBegun_ = false;     // drawCache_ is this buffer's (DrawCache::begin: it may be one the queue handed on)
+     std::shared_ptr<Texture> null_;   // the queue's null texture, asked for once a buffer rather than once a draw
+ 
+     CommandQueue& queue_;
+     std::atomic<Status> status_{kNotEnqueued};
+     std::string error_;
+     pm4::Stream stream_;
++    size_t streamWords_ = 0;   // the stream's words when the buffer was done and its stream handed back (finish)
+     std::vector<BoUse> uses_;
+     std::vector<std::shared_ptr<const Buffer>> kept_;   // the buffers it uses stay alive until it completes
+     std::vector<std::shared_ptr<const void>> keptAny_;
+@@ -469,6 +479,20 @@ public:
+     // what the queue keeps of the programs drawn with it, from one command buffer to the next (render.cpp: StateCache;
+     // under its own lock)
+     render::StateCache& states();
++    // What a command buffer that is done hands to the next: its stream and its lists, emptied, with the memory they
++    // grew to; and what it had at hand of the programs it drew with (render.cpp: DrawCache), which the next frame
++    // draws with again. And the open passes let go (CommandBuffer::PassReturn).
++    struct Spare {
++        pm4::Stream stream;
++        std::vector<BoUse> uses;
++        std::vector<std::shared_ptr<const Buffer>> kept;
++        std::vector<std::shared_ptr<const void>> keptAny;
++        std::shared_ptr<render::DrawCache> drawCache;
++    };
++    void giveSpare(Spare&& spare);
++    bool takeSpare(Spare* spare);
++    CommandBuffer::OpenPassPtr takePass();
++    void givePass(CommandBuffer::OpenPass* pass);
+ 
+ 
+ private:
+@@ -484,6 +508,8 @@ private:
+     // (under poolLock_, a lock of its own: a command buffer gives its stamps back as it is destroyed, which can be under
+     // lock_ -- the queue letting go of the last one in flight -- and lock_ there was the window server hung at boot)
+     std::mutex poolLock_;
++    std::vector<Spare> spares_;                            // (under poolLock_) giveSpare's, a few
++    std::vector<CommandBuffer::OpenPass*> sparePasses_;    // (under poolLock_) givePass's, a few
+     std::unordered_map<uint64_t, std::vector<std::shared_ptr<Buffer>>> freeBuffers_;   // by size: giveSlabs', giveBuffer's
+     uint64_t freeBytes_ = 0;
+     struct Resident { std::vector<uint32_t> words; std::shared_ptr<Buffer> buffer; };
+diff --git a/hakios-metal/src/command.cpp b/hakios-metal/src/command.cpp
+index 34fb79f..1e14103 100644
+--- a/hakios-metal/src/command.cpp
++++ b/hakios-metal/src/command.cpp
+@@ -442,6 +442,16 @@ void CommandBuffer::finish(Status s) {
+     slab_.reset();
+     queue_.giveSlabs(&slabs_);   // (done with: the GPU has finished with this buffer, or never had it)
+     keptAny_.clear();
++    // (and what its stream and lists grew to, and the programs it had at hand, to the queue's next command buffer)
++    streamWords_ = stream_.size();
++    stream_.clear();
++    uses_.clear();
++    queue_.giveSpare(CommandQueue::Spare{std::move(stream_), std::move(uses_), std::move(kept_), std::move(keptAny_), std::move(drawCache_)});
++    stream_ = pm4::Stream{};
++    uses_.clear();
++    kept_.clear();
++    keptAny_.clear();
++    drawCache_.reset();
+     {
+         std::lock_guard<std::mutex> g(lock_);
+         finished_ = true;
+@@ -550,11 +560,36 @@ CommandQueue::~CommandQueue() {
+         thread_.join();
+     }
+     idle_.clear();
++    for (CommandBuffer::OpenPass* p : sparePasses_) delete p;
++    sparePasses_.clear();
++    spares_.clear();
+     gpu_.closeQueue(id_);
+ }
+ 
+ std::shared_ptr<CommandBuffer> CommandQueue::commandBuffer() {
+-    return std::shared_ptr<CommandBuffer>(new CommandBuffer(*this));
++    std::shared_ptr<CommandBuffer> cb(new CommandBuffer(*this));
++    Spare spare;
++    if (takeSpare(&spare)) {
++        cb->stream_ = std::move(spare.stream);
++        cb->uses_ = std::move(spare.uses);
++        cb->kept_ = std::move(spare.kept);
++        cb->keptAny_ = std::move(spare.keptAny);
++        cb->drawCache_ = std::move(spare.drawCache);
++    }
++    return cb;
++}
++
++void CommandQueue::giveSpare(Spare&& spare) {
++    std::lock_guard<std::mutex> g(poolLock_);
++    if (spares_.size() < 4) spares_.push_back(std::move(spare));
++}
++
++bool CommandQueue::takeSpare(Spare* spare) {
++    std::lock_guard<std::mutex> g(poolLock_);
++    if (spares_.empty()) return false;
++    *spare = std::move(spares_.back());
++    spares_.pop_back();
++    return true;
+ }
+ 
+ std::shared_ptr<Texture> CommandQueue::nullTexture(std::string* why) {
+diff --git a/hakios-metal/src/render.cpp b/hakios-metal/src/render.cpp
+index 1d4950c..4e64fef 100644
+--- a/hakios-metal/src/render.cpp
++++ b/hakios-metal/src/render.cpp
+@@ -3433,6 +3433,7 @@ struct DrawCache {
+     struct Slot {
+         uint64_t uid = 0;
+         uint32_t keyId = StateCache::kNoKey;
++        uint32_t epoch = 0;             // the command buffer (EPOCH below) that has named and kept the state's two programs
+         const ProgramState* state = nullptr;
+     };
+     // (as many as a frame has programs several times over: two programs in one slot find each other's state gone at
+@@ -3453,8 +3454,24 @@ struct DrawCache {
+     // a draw's facts, here rather than on the stack so that what they hold of the heap (a direct range's words) is kept
+     ProgramFacts pf, pfSys;
+     DrawFacts facts, factsSys;
+-    pm4::Stream scratch;
++    pm4::Stream scratch, head, headSys;
+     std::vector<uint8_t> staticKey;
++    // A command buffer that is done hands this to the queue's next one (CommandQueue::Spare): the frame after draws
++    // with the programs of the frame before, and finds each state here without asking the queue under its lock. What
++    // the slots hold stays good -- a state is a program's for as long as the program has that uid -- but the buffers
++    // its stages' words lie in are each submission's to name: EPOCH counts the command buffers, and a slot's says
++    // whether this one has named them.
++    uint32_t epoch = 0;
++    void begin() {
++        epoch++;
++        hands.clear();   // (a Program made by hand is its command buffer's: nothing is kept of one across them)
++        staticKey.clear();
++        if (kept.size() > 1024 || epoch == 0) {
++            for (Slot& s : slots) s = Slot{};
++            kept.clear();
++            epoch = 1;
++        }
++    }
+ };
+ 
+ namespace {
+@@ -4188,6 +4205,62 @@ render::StateCache& CommandQueue::states() {
+     return *states_;
+ }
+ 
++// An open pass let go: as a new one -- every field what OpenPass{} gives it, whatever fields there are -- but for what
++// its streams, its shadows and its cache took from the heap, which the next pass writes into.
++void CommandBuffer::PassReturn::operator()(OpenPass* p) const {
++    if (p == nullptr) return;
++    if (queue == nullptr) {
++        delete p;
++        return;
++    }
++    RegShadow regs = std::move(p->regs), bodyRegs = std::move(p->bodyRegs);
++    pm4::Stream bodies = std::move(p->bodies), sysStream = std::move(p->sysStream), headGmem = std::move(p->headGmem);
++    std::vector<uint8_t> staticKey = std::move(p->staticKey);
++    std::shared_ptr<render::PassCache> cache = std::move(p->cache);
++    *p = OpenPass{};
++    regs.clear();
++    bodyRegs.clear();
++    bodies.clear();
++    sysStream.clear();
++    headGmem.clear();
++    staticKey.clear();
++    p->regs = std::move(regs);
++    p->bodyRegs = std::move(bodyRegs);
++    p->bodies = std::move(bodies);
++    p->sysStream = std::move(sysStream);
++    p->headGmem = std::move(headGmem);
++    p->staticKey = std::move(staticKey);
++    if (cache != nullptr && cache.use_count() == 1) {
++        *cache = render::PassCache{};
++        p->cache = std::move(cache);
++    }
++    queue->givePass(p);
++}
++
++CommandBuffer::OpenPassPtr CommandQueue::takePass() {
++    CommandBuffer::OpenPass* p = nullptr;
++    {
++        std::lock_guard<std::mutex> g(poolLock_);
++        if (!sparePasses_.empty()) {
++            p = sparePasses_.back();
++            sparePasses_.pop_back();
++        }
++    }
++    if (p == nullptr) p = new CommandBuffer::OpenPass();
++    return CommandBuffer::OpenPassPtr(p, CommandBuffer::PassReturn{this});
++}
++
++void CommandQueue::givePass(CommandBuffer::OpenPass* p) {
++    {
++        std::lock_guard<std::mutex> g(poolLock_);
++        if (sparePasses_.size() < 4) {
++            sparePasses_.push_back(p);
++            return;
++        }
++    }
++    delete p;
++}
++
+ void CommandBuffer::verifyDraws(bool on) { render::gVerifyDraws = on; }
+ bool CommandBuffer::keepStates(bool on) { return render::gKeepStates.exchange(on); }
+ 
+@@ -4202,6 +4275,11 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+     std::string why;
+     if (drawCache_ == nullptr) drawCache_ = std::make_shared<render::DrawCache>();
+     render::DrawCache& dc = *drawCache_;
++    if (!drawCacheBegun_) {
++        // (new, or the one the queue's last command buffer had: this buffer's from here)
++        drawCacheBegun_ = true;
++        dc.begin();
++    }
+     // A draw into the open pass's attachments joins it: no batch start, no pass begin and no tail of its own, which a
+     // pass per draw spent on every draw (the CCU flush and the cache flush waited for, each time). It joins when the
+     // attachments are the same textures, it asks for no Clear (a Clear begins a pass), and the options are the same.
+@@ -4234,9 +4312,18 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+         render::DrawCache::Slot& slot = dc.slots[(program.uid * 0x9e3779b97f4a7c15ull) >> (64 - render::DrawCache::kSlotBits)];
+         if (slot.uid == program.uid && slot.keyId == keyId) {
+             ps = slot.state;
++            if (slot.epoch != dc.epoch) {
++                // (kept from a command buffer before this one: its two stages' words are this submission's to name
++                // and keep as well)
++                slot.epoch = dc.epoch;
++                use(*ps->vsBuffer, false);
++                keep(ps->vsBuffer);
++                use(*ps->fsBuffer, false);
++                keep(ps->fsBuffer);
++            }
+         } else if (std::shared_ptr<const render::ProgramState> found = queue_.states().find(program.uid, keyId)) {
+             ps = found.get();
+-            slot = render::DrawCache::Slot{program.uid, keyId, ps};
++            slot = render::DrawCache::Slot{program.uid, keyId, dc.epoch, ps};
+             dc.kept.push_back(std::move(found));
+             // (its two stages' words where the queue keeps them: named by the submission and kept until it is done, as
+             // programAddress does for a program met the long way)
+@@ -4420,8 +4507,12 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+         }
+     }
+     Piece passTable;
+-    pm4::Stream head, headSys;
+-    std::shared_ptr<render::PassCache> opened;   // a new pass's
++    pm4::Stream& head = dc.head;
++    pm4::Stream& headSys = dc.headSys;
++    head.clear();
++    headSys.clear();
++    OpenPassPtr fresh;                            // a new pass, from the queue's spares
++    std::shared_ptr<render::PassCache> opened;   // ...and what is kept of it
+     if (!joins) {
+         if (!piece(render::kTableBytes, &passTable, &why)) {
+             return fail(std::string("no memory for the pass's table: ") + why);
+@@ -4440,7 +4531,9 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+             return refuseWork(why);
+         }
+         // (encodeBegin took the pass: it has an attachment, and every one of them is one a pass can have)
+-        opened = std::make_shared<render::PassCache>();
++        fresh = queue_.takePass();
++        if (fresh->cache == nullptr) fresh->cache = std::make_shared<render::PassCache>();
++        opened = fresh->cache;
+         opened->keyId = keyId;
+         const auto [W, H] = render::windowOf(pass);
+         opened->W = W;
+@@ -4554,14 +4647,15 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+                 }
+             }
+         }
+-        open_ = std::make_unique<OpenPass>();
++        open_ = std::move(fresh);
+         open_->pass = pass;
+         open_->options = options;
+         open_->table = passTable.gpuAddress();
+         open_->cache = std::move(opened);
+         if (dual) {
+             appendDeduped(open_->sysStream, headSys, open_->regs);
+-            open_->headGmem = std::move(head);
++            open_->headGmem.clear();
++            open_->headGmem.append(head.words().data(), head.size());
+         } else if (options.dedupRegs) {
+             appendDeduped(stream_, head, open_->regs);
+         } else {
+@@ -4934,6 +5028,7 @@ bool CommandBuffer::append(CommandBuffer& other) {
+     // names and keeps afresh)
+     memset(other.recent_, 0, sizeof other.recent_);
+     other.drawCache_.reset();
++    other.drawCacheBegun_ = false;
+     other.uploaded_.clear();
+     counts_.passes += other.counts_.passes;
+     counts_.draws += other.counts_.draws;

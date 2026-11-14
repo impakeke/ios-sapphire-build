@@ -1,0 +1,25 @@
+Subject: PassReturn: constructors of its own, for the iOS SDK's libc++
+
+A default member initializer of a struct nested in CommandBuffer is not usable while CommandBuffer is being defined;
+the SDK's libc++ 15 then finds the deleter not default-constructible and refuses unique_ptr's own default
+constructor (the host's newer libc++ did not mind). Found by the bundle build; the host tests are as they were.
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/command.hpp b/hakios-metal/include/hakios-metal/command.hpp
+index 2acd2e1..a08c155 100644
+--- a/hakios-metal/include/hakios-metal/command.hpp
++++ b/hakios-metal/include/hakios-metal/command.hpp
+@@ -361,7 +361,11 @@ private:
+     // its register shadows have taken from the heap (render.cpp): a frame is eight passes or so, and each made those
+     // again from nothing, a doubling at a time.
+     struct PassReturn {
+-        CommandQueue* queue = nullptr;
++        // (constructors of its own: a member initializer here is no use to unique_ptr while CommandBuffer itself is still
++        // being defined, and the iOS SDK's libc++ then finds no default constructor for the deleter)
++        PassReturn() : queue(nullptr) {}
++        explicit PassReturn(CommandQueue* q) : queue(q) {}
++        CommandQueue* queue;
+         void operator()(OpenPass* p) const;
+     };
+     using OpenPassPtr = std::unique_ptr<OpenPass, PassReturn>;

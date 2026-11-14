@@ -1,0 +1,65 @@
+Subject: The kernel's GPU service by name, and the chip, from the make line
+
+make ios MESA=1 CHIP=a610 GPU_SERVICE=SapphireGPU: this port's kernel publishes its msm client as the service
+SapphireGPU (xnu SapphireGpu.cpp msm_publish: setName("SapphireGPU"), user client SapphireGPUClient), with HackiOS's
+request numbers (0x09, 0x40-0x4c, 0x7e) and struct layouts. IOS_EXTRA adds flags to the library's objects.
+
+---
+diff --git a/hakios-metal/Makefile b/hakios-metal/Makefile
+index f8a1f35..7b9c101 100644
+--- a/hakios-metal/Makefile
++++ b/hakios-metal/Makefile
+@@ -94,6 +94,16 @@ darwin: ios
+ # with MESA=1 the compiler goes to the phone too, against the iOS build of Mesa's libraries (IOS_MESA_BUILD, tools/compiler.mk)
+ IOS_CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Werror
+ IOS_LIBS     =
++# another chip than the A635 the constants of a6xx.hpp are written for: CHIP=a610 (-DHAKIOS_CHIP_A610), and another
++# kernel's GPU service than HakiosGPU: GPU_SERVICE=SapphireGPU (src/iokit_transport.cpp)
++ifeq ($(CHIP),a610)
++IOS_CXXFLAGS += -DHAKIOS_CHIP_A610
++endif
++ifneq ($(strip $(GPU_SERVICE)),)
++IOS_CXXFLAGS += -DHAKIOS_GPU_SERVICE='"$(GPU_SERVICE)"'
++endif
++# more flags for the library's objects (IOS_EXTRA="-g -O3 -mcpu=cortex-a73")
++IOS_CXXFLAGS += $(IOS_EXTRA)
+ ifneq ($(strip $(MESA)),)
+ IOS_CXXFLAGS += -DHAKIOS_METAL_MESA $(HAKIOS_METAL_IOS_MESA_CXXFLAGS)
+ IOS_LIBS     += $(HAKIOS_METAL_IOS_MESA_LIBS)
+diff --git a/hakios-metal/src/iokit_transport.cpp b/hakios-metal/src/iokit_transport.cpp
+index 48ef40e..623b291 100644
+--- a/hakios-metal/src/iokit_transport.cpp
++++ b/hakios-metal/src/iokit_transport.cpp
+@@ -10,6 +10,12 @@
+ 
+ #include "hakios-metal/gpu.hpp"
+ 
++// The kernel's GPU service by name. HackiOS's kernel publishes "HakiosGPU"; another port's kernel names its own with
++// -DHAKIOS_GPU_SERVICE='"..."' (make ios GPU_SERVICE=...). The requests are msm_drm.h's numbers in both.
++#ifndef HAKIOS_GPU_SERVICE
++#define HAKIOS_GPU_SERVICE "HakiosGPU"
++#endif
++
+ namespace hakios::metal {
+ 
+ namespace {
+@@ -65,16 +71,16 @@ private:
+ }  // namespace
+ 
+ std::unique_ptr<Transport> openKernelGpu(std::string* why) {
+-    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("HakiosGPU"));
++    io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(HAKIOS_GPU_SERVICE));
+     if (s == 0) {
+-        *why = "no HakiosGPU service: the kernel has not started the GPU (gpu=1, the firmware in fw-gpu/, the phone)";
++        *why = "no " HAKIOS_GPU_SERVICE " service: the kernel has not started the GPU (gpu=1, the firmware in fw-gpu/, the phone)";
+         return nullptr;
+     }
+     io_connect_t c = 0;
+     kern_return_t r = IOServiceOpen(s, mach_task_self(), 0, &c);
+     IOObjectRelease(s);
+     if (r != KERN_SUCCESS) {
+-        *why = "HakiosGPU would not open: error " + std::to_string(r);
++        *why = HAKIOS_GPU_SERVICE " would not open: error " + std::to_string(r);
+         return nullptr;
+     }
+     return std::unique_ptr<Transport>(new KernelGpu(c));

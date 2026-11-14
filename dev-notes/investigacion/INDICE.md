@@ -24,10 +24,10 @@ Cómo operar el teléfono: [../OPERACION.md](../OPERACION.md).
    25 MB en 18-24 ms (1,0-1,4 GB/s), y el argumento era que subir el reloj no cambiaba nada cuando el reloj no subía
    (11 §9, §14; 09 §8).
 7. **El driver Metal se compila desde fuente en la Mac** (08): upstream de HackiOS `63fc2b4` más parches A610 propios.
-   Ramas `cpu-draw` (13) y `gpu-pass` (14); el bundle fusionado `merge-1` es el instalado (03 M9-M10). Se instala por
+   Ramas `cpu-draw` (13) y `gpu-pass` (14); el bundle fusionado `merge-3` es el instalado (03 M9-M12). Se instala por
    renombrado y se comprueba que backboardd es cliente de `SapphireGPU`: copiado encima de otro, el driver no carga y
-   CoreAnimation compone por software (03 M8; 14; [../OPERACION.md](../OPERACION.md) §9.3). El binario heredado
-   `HakiosMetal` del instalador no es el driver en uso.
+   CoreAnimation compone por software (03 M8; 14; [../OPERACION.md](../OPERACION.md) §9.3). El instalador lleva ese mismo build; su
+   fuente (serie de parches sobre el upstream y receta) está en [`metal/hakios-metal/`](../../metal/hakios-metal/README.md).
 8. **Kernel de la presentación y del submit** (0339-0342; 03 M7; 15): con la cola `kern.sweet_fb_queue=1` ningún frame
    se pisa (10,6 % → 0) y con `kern.sweet_gpu_flush=1` la limpieza de caché por submit pasa de 1,70 a 0,01 ms. La línea
    `SWEET FB: 5 s … N by the GPU` cuenta swaps, no frames mostrados, y sus tiempos salen a 0 con `sweetfb_scale=2` (09).

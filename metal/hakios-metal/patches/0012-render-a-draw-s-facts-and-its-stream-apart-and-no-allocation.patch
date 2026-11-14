@@ -1,0 +1,1136 @@
+Subject: render: a draw's facts and its stream apart, and no allocation between them
+
+encodeDraw was one function: every refusal, then every word. It is now two halves, the stream unchanged word for word
+(the golden streams, both chips):
+
+- drawFacts judges the draw, in the order the refusals always came, and leaves what the stream is made of: what the
+  program and the pass decide between them (ProgramFacts) and what this draw's bindings and numbers add (DrawFacts).
+- emitDraw writes the stream from the facts, group by group in the one order a draw has, and only the groups asked
+  for (kG...). render::encode and render::encodeInPass ask for all of them; CommandBuffer::draw will ask for the few
+  that changed. It is a template over the stream it writes: a pm4::Stream now, a pass's stream through its register
+  shadow next.
+
+On the way, what a draw allocated for nothing:
+- the copy of the fragment stage made to clear the colour registers of outputs without an attachment (1.4 KB moved a
+  draw): the registers alone are kept apart, in the facts;
+- a vector for each stage's pushed ranges and one for each direct range's words, a vector for each stage's UBO
+  descriptors, one for a load's words (pm4::Stream::open: the load's words are written where they lie), one for the
+  immediates' padding, two for the vertex decode tables, one for the fragment outputs: all in place now;
+- std::strings of the stage's name on entering vertexFetch and stageTextures, and three an attachment in checkTarget:
+  made for a refusal alone;
+- StageTextures::used and GfxIbos::used, vectors nobody read.
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/pm4.hpp b/hakios-metal/include/hakios-metal/pm4.hpp
+index 5b25776..9b4b399 100644
+--- a/hakios-metal/include/hakios-metal/pm4.hpp
++++ b/hakios-metal/include/hakios-metal/pm4.hpp
+@@ -73,6 +73,11 @@ public:
+     void indirect(uint64_t address, uint32_t words);
+     // any type-7 packet: OPCODE with WORDS after its header (the compute dispatch's packets, compute.cpp)
+     void packet(uint32_t opcode, const uint32_t* words, uint32_t count);
++    // ...whose COUNT words the caller writes itself, where they lie in the stream (zeros until then): the pointer holds
++    // until the next packet. A load of constants is its three words and then the constants, with no copy made to join them.
++    uint32_t* open(uint32_t opcode, uint32_t count);
++    // room for WORDS more, taken at once (a command buffer's stream grows to what the last one's was)
++    void reserve(size_t words) { words_.reserve(words_.size() + words); }
+ 
+     const std::vector<uint32_t>& words() const { return words_; }
+     size_t size() const { return words_.size(); }
+diff --git a/hakios-metal/src/pm4.cpp b/hakios-metal/src/pm4.cpp
+index ce3d65d..28082b8 100644
+--- a/hakios-metal/src/pm4.cpp
++++ b/hakios-metal/src/pm4.cpp
+@@ -83,4 +83,11 @@ void Stream::packet(uint32_t opcode, const uint32_t* words, uint32_t count) {
+     words_.insert(words_.end(), words, words + count);
+ }
+ 
++uint32_t* Stream::open(uint32_t opcode, uint32_t count) {
++    command(opcode, count);
++    const size_t at = words_.size();
++    words_.resize(at + count);
++    return words_.data() + at;
++}
++
+ }  // namespace hakios::metal::pm4
+diff --git a/hakios-metal/src/render.cpp b/hakios-metal/src/render.cpp
+index 46bf834..10a3a35 100644
+--- a/hakios-metal/src/render.cpp
++++ b/hakios-metal/src/render.cpp
+@@ -38,15 +38,19 @@ bool refuse(std::string* why, const std::string& text) {
+ 
+ const char* stageName(const Stage& s) { return s.k.name != nullptr ? s.k.name : s.kind == kStageVertex ? "the vertex stage" : "the fragment stage"; }
+ 
+-void reg(pm4::Stream& st, uint32_t r, uint32_t v) { st.registers(r, &v, 1); }
++// (the helpers below write into any stream: a pm4::Stream, or a pass's stream through its register shadow -- DedupSink)
++template <class S>
++void reg(S& st, uint32_t r, uint32_t v) { st.registers(r, &v, 1); }
+ 
+-void reg64(pm4::Stream& st, uint32_t r, uint64_t a) {
++template <class S>
++void reg64(S& st, uint32_t r, uint64_t a) {
+     uint32_t v[2] = {uint32_t(a), uint32_t(a >> 32)};
+     st.registers(r, v, 2);
+ }
+ 
+ // consecutive registers from R on, one type-4 (turnip's pkt4 of several)
+-void regs(pm4::Stream& st, uint32_t r, std::initializer_list<uint32_t> values) {
++template <class S>
++void regs(S& st, uint32_t r, std::initializer_list<uint32_t> values) {
+     uint32_t v[16];
+     uint32_t count = 0;
+     for (uint32_t x : values) v[count++] = x;
+@@ -54,9 +58,11 @@ void regs(pm4::Stream& st, uint32_t r, std::initializer_list<uint32_t> values) {
+ }
+ 
+ // a type-7 packet of one word
+-void command1(pm4::Stream& st, uint32_t opcode, uint32_t word) { st.packet(opcode, &word, 1); }
++template <class S>
++void command1(S& st, uint32_t opcode, uint32_t word) { st.packet(opcode, &word, 1); }
+ 
+-void event(pm4::Stream& st, vgt_event_type e) {
++template <class S>
++void event(S& st, vgt_event_type e) {
+     uint32_t w = eventWrite0(e, false);
+     st.packet(CP_EVENT_WRITE, &w, 1);
+ }
+@@ -64,22 +70,26 @@ void event(pm4::Stream& st, vgt_event_type e) {
+ // the 4-word event: VALUE written to ADDRESS when it has completed. turnip's form (tu_emit_raw_event_write,
+ // tu_cmd_buffer.cc:48-70) has no TIMESTAMP bit; with it the GPU writes a timestamp instead and the wait below never
+ // ends (28 October, every compute dispatch). The bit is here for the fake GPU's test of that alone.
+-void eventTimestamp(pm4::Stream& st, vgt_event_type e, uint64_t address, uint32_t value, bool timestampBit) {
++template <class S>
++void eventTimestamp(S& st, vgt_event_type e, uint64_t address, uint32_t value, bool timestampBit) {
+     uint32_t w[4] = {eventWrite0(e, timestampBit), uint32_t(address), uint32_t(address >> 32), value};
+     st.packet(CP_EVENT_WRITE, w, 4);
+ }
+ 
+-void waitForWord(pm4::Stream& st, uint64_t address, uint32_t value) {
++template <class S>
++void waitForWord(S& st, uint64_t address, uint32_t value) {
+     uint32_t w[6] = {waitRegMem0(WRITE_EQ, POLL_MEMORY), uint32_t(address), uint32_t(address >> 32), value, ~0u, kDelayLoopCycles};
+     st.packet(CP_WAIT_REG_MEM, w, 6);
+ }
+ 
+-void waitForWordNot(pm4::Stream& st, uint64_t address, uint32_t value) {
++template <class S>
++void waitForWordNot(S& st, uint64_t address, uint32_t value) {
+     uint32_t w[6] = {waitRegMem0(WRITE_NE, POLL_MEMORY), uint32_t(address), uint32_t(address >> 32), value, ~0u, kDelayLoopCycles};
+     st.packet(CP_WAIT_REG_MEM, w, 6);
+ }
+ 
+-void waitForWordAtLeast(pm4::Stream& st, uint64_t address, uint32_t value) {
++template <class S>
++void waitForWordAtLeast(S& st, uint64_t address, uint32_t value) {
+     uint32_t w[4] = {0, uint32_t(address), uint32_t(address >> 32), value};
+     st.packet(CP_WAIT_MEM_GTE, w, 4);
+ }
+@@ -90,20 +100,24 @@ void waitForWordAtLeast(pm4::Stream& st, uint64_t address, uint32_t value) {
+ uint32_t loadOpcode(const Stage& s) { return s.kind == kStageVertex ? uint32_t(CP_LOAD_STATE6_GEOM) : uint32_t(CP_LOAD_STATE6_FRAG); }
+ a6xx_state_block shaderBlock(const Stage& s) { return s.kind == kStageVertex ? SB6_VS_SHADER : SB6_FS_SHADER; }
+ 
+-void loadIndirect(pm4::Stream& st, const Stage& s, a6xx_state_type type, uint32_t dstOff, uint32_t units, uint64_t from) {
++template <class S>
++void loadIndirect(S& st, const Stage& s, a6xx_state_type type, uint32_t dstOff, uint32_t units, uint64_t from) {
+     uint32_t w[3] = {loadState6_0(dstOff, type, SS6_INDIRECT, shaderBlock(s), units), CP_LOAD_STATE6_1_EXT_SRC_ADDR(uint32_t(from)),
+                      CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI(uint32_t(from >> 32))};
+     st.packet(loadOpcode(s), w, 3);
+ }
+ 
+-void loadDirect(pm4::Stream& st, const Stage& s, a6xx_state_type type, uint32_t dstOff, uint32_t units, const uint32_t* data, uint32_t dwords) {
+-    std::vector<uint32_t> w;
+-    w.reserve(3 + dwords);
+-    w.push_back(loadState6_0(dstOff, type, SS6_DIRECT, shaderBlock(s), units));
+-    w.push_back(0);
+-    w.push_back(0);
+-    w.insert(w.end(), data, data + dwords);
+-    st.packet(loadOpcode(s), w.data(), uint32_t(w.size()));
++// (DWORDS of DATA and then zeros up to the load's UNITS * UNIT_DWORDS: a stage's immediates are loaded in whole vec4.
++// The words go straight into the stream: a vector to join the three with the data was an allocation a load)
++template <class S>
++void loadDirect(S& st, const Stage& s, a6xx_state_type type, uint32_t dstOff, uint32_t units, const uint32_t* data, uint32_t dwords, uint32_t padded = 0) {
++    const uint32_t total = std::max(dwords, padded);
++    uint32_t* w = st.open(loadOpcode(s), 3 + total);
++    w[0] = loadState6_0(dstOff, type, SS6_DIRECT, shaderBlock(s), units);
++    w[1] = 0;
++    w[2] = 0;
++    if (dwords != 0) memcpy(w + 3, data, 4ull * dwords);
++    for (uint32_t i = dwords; i < total; i++) w[3 + i] = 0;
+ }
+ 
+ // The colour target as RB_MRT[0], SP_FS_MRT_REG[0] and the sRGB registers name it, off the Texture's own fields: the
+@@ -208,24 +222,36 @@ bool checkStage(const Stage& s, std::string* why) {
+ struct PushedRange {
+     uint32_t offsetVec4, units;
+     uint64_t from;
+-    std::vector<uint32_t> words;   // non-empty: load these direct instead of reading FROM
++    uint32_t wordsAt, numWords;    // numWords != 0: load these direct (PushedRanges::words from wordsAt on) instead of reading FROM
+     // FROM not a multiple of 16: copied by the command processor to the draw's table at COPY_AT first and loaded from
+     // there (placeCopies), or, past the table's room, read by this processor into WORDS. The buffers are write-combined
+     // for this processor, and its reads of them go to memory one by one: CoreAnimation binds its uniforms at multiples
+     // of 8, and copying them so took 50-160 us a draw on the phone, most of a draw's encoding
+-    bool copy = false;
+-    uint32_t copyAt = 0;
+-    const Buffer* buffer = nullptr;
+-    uint64_t bufferOffset = 0;
++    bool copy;
++    uint32_t copyAt;
++    const Buffer* buffer;
++    uint64_t bufferOffset;
++};
++// A stage's ranges for one draw: as many as a Kernel holds, in place -- a vector of them, each with a vector of words,
++// was two allocations a stage a draw. The words of the ranges loaded direct lie one after another in WORDS, which stays
++// empty (and unallocated) for a stage with none, as CoreAnimation's are.
++struct PushedRanges {
++    uint32_t count = 0;
++    PushedRange r[kMaxUboRanges];
++    std::vector<uint32_t> words;
++    const PushedRange* begin() const { return r; }
++    const PushedRange* end() const { return r + count; }
++    PushedRange* begin() { return r; }
++    PushedRange* end() { return r + count; }
+ };
+ 
+ // The stage's pushed ranges against its own [[buffer(n)]] table, by compute's rules (compute.cpp: the range is ir3's,
+ // in whole vec4 and padded -- a 16-byte float4 is pushed as 64 bytes -- so the read must stay inside the bound object's
+ // pages, not inside the length bound; it must land inside the stage's constlen). False with *why naming the stage.
+-bool pushedRanges(const Stage& s, const Bindings& b, std::vector<PushedRange>* out, std::string* why) {
++bool pushedRanges(const Stage& s, const Bindings& b, PushedRanges* out, std::string* why) {
+     const Kernel& k = s.k;
+     auto name = [&s]() { return std::string(stageName(s)); };   // (built only for a refusal: a string a draw is an allocation a draw)
+-    for (uint32_t i = 0; i < k.numUboRanges; i++) {
++    for (uint32_t i = 0; i < k.numUboRanges && i < kMaxUboRanges; i++) {
+         const KernelUboRange& r = k.uboRanges[i];
+         // the constant data's range (a module's constant table, kernel.hpp: constantDataUbo): its words direct, from
+         // the program's own, past their end zeros (ir3 pushes whole vec4, the table need not fill the last)
+@@ -233,12 +259,13 @@ bool pushedRanges(const Stage& s, const Bindings& b, std::vector<PushedRange>* o
+             if (r.offsetVec4 + r.sizeDwords / 4 > k.constlen) {
+                 return refuse(why, name() + ": its constant data's range at vec4 " + n(r.offsetVec4) + " runs past its constlen of " + n(k.constlen));
+             }
+-            PushedRange p{r.offsetVec4, r.sizeDwords / 4, 0, std::vector<uint32_t>(r.sizeDwords, 0u)};
++            const PushedRange p{r.offsetVec4, r.sizeDwords / 4, 0, uint32_t(out->words.size()), r.sizeDwords, false, 0, nullptr, 0};
++            out->words.resize(out->words.size() + r.sizeDwords, 0u);
+             for (uint32_t d = 0; d < r.sizeDwords; d++) {
+                 const uint64_t at = uint64_t(r.startDword + d) * 4;
+-                if (at + 4 <= k.constantDataSize) p.words[d] = k.words[k.constantDataOffset / 4 + r.startDword + d];
++                if (at + 4 <= k.constantDataSize) out->words[p.wordsAt + d] = k.words[k.constantDataOffset / 4 + r.startDword + d];
+             }
+-            out->push_back(std::move(p));
++            out->r[out->count++] = p;
+             continue;
+         }
+         if (r.block >= b.buffers.size() || b.buffers[r.block].buffer == nullptr) {
+@@ -259,13 +286,13 @@ bool pushedRanges(const Stage& s, const Bindings& b, std::vector<PushedRange>* o
+         if (r.offsetVec4 + r.sizeDwords / 4 > k.constlen) {
+             return refuse(why, name() + ": constant buffer " + n(r.block) + "'s range at vec4 " + n(r.offsetVec4) + " runs past its constlen of " + n(k.constlen));
+         }
+-        PushedRange p{r.offsetVec4, r.sizeDwords / 4, x.buffer->gpuAddress() + x.offset + 4ull * r.startDword, {}};
++        PushedRange p{r.offsetVec4, r.sizeDwords / 4, x.buffer->gpuAddress() + x.offset + 4ull * r.startDword, 0, 0, false, 0, nullptr, 0};
+         if (p.from % 16 != 0) {
+             p.copy = true;
+             p.buffer = x.buffer;
+             p.bufferOffset = x.offset + 4ull * r.startDword;
+         }
+-        out->push_back(std::move(p));
++        out->r[out->count++] = p;
+     }
+     return true;
+ }
+@@ -344,15 +371,16 @@ const VertexFormatInfo* vertexFormatInfo(VertexFormat f) {
+ 
+ // What the vertex fetch registers get: decode entry n per [[attribute(n)]] up to the highest one the VS reads (holes
+ // zero, as turnip writes them), fetch entry b per Metal buffer index used.
++// (no initialisers: a draw's facts hold one, and vertexFetch is given it zeroed -- VertexFetch{} -- by whoever fills it whole)
+ struct VertexFetch {
+-    uint32_t count = 0;            // VFD_CONTROL_0.FETCH_CNT = DECODE_CNT (turnip writes both as the attribute count)
+-    uint32_t decode[kMaxVertexAttributes] = {};
+-    uint32_t stepRate[kMaxVertexAttributes] = {};
+-    uint32_t dest[kMaxVertexAttributes] = {};
+-    bool used[kMaxVertexBuffers] = {};
+-    uint64_t base[kMaxVertexBuffers] = {};
+-    uint32_t size[kMaxVertexBuffers] = {};
+-    uint32_t stride[kMaxVertexBuffers] = {};
++    uint32_t count;                // VFD_CONTROL_0.FETCH_CNT = DECODE_CNT (turnip writes both as the attribute count)
++    uint32_t decode[kMaxVertexAttributes];
++    uint32_t stepRate[kMaxVertexAttributes];
++    uint32_t dest[kMaxVertexAttributes];
++    bool used[kMaxVertexBuffers];
++    uint64_t base[kMaxVertexBuffers];
++    uint32_t size[kMaxVertexBuffers];
++    uint32_t stride[kMaxVertexBuffers];
+ };
+ 
+ // The VS's attributes against the descriptor and the VS's own [[buffer(n)]] table. Refused by name: an attribute the
+@@ -360,7 +388,11 @@ struct VertexFetch {
+ // a step other than per vertex, a stride of 0, no buffer bound at the layout's index, and a fetch that reads past the
+ // bound length for the draw's last vertex (Metal requires the bytes to be there; the GPU would read whatever follows).
+ bool vertexFetch(const Stage& vs, const VertexDescriptor& vd, const Draw& draw, const Bindings& b, VertexFetch* f, std::string* why) {
+-    const std::string name = stageName(vs);
++    // (made only for a refusal: a std::string of the stage's name was an allocation a draw)
++    struct Name {
++        const Stage& s;
++        std::string operator+(const char* rest) const { return std::string(stageName(s)) + rest; }
++    } name{vs};
+     for (uint32_t i = 0; i < vs.numInputs; i++) {
+         const StageInput& in = vs.inputs[i];
+         if (in.sysval || in.regid == kRegidNone) continue;
+@@ -559,7 +591,7 @@ static_assert(kConstCopyAt % 16 == 0 && kConstCopyAt < kConstCopyEnd, "room for
+ 
+ // Each range to be copied a place in the table's copy room, in order; one that does not fit is read here instead (its
+ // buffer's pages are this processor's to read, slowly). False with *why when that buffer is mapped nowhere.
+-bool placeCopies(std::vector<PushedRange>* ranges, uint32_t* at, const Stage& stage, std::string* why) {
++bool placeCopies(PushedRanges* ranges, uint32_t* at, const Stage& stage, std::string* why) {
+     for (PushedRange& r : *ranges) {
+         if (!r.copy) continue;
+         if (*at + r.units * 16 <= kConstCopyEnd) {
+@@ -571,8 +603,10 @@ bool placeCopies(std::vector<PushedRange>* ranges, uint32_t* at, const Stage& st
+             return refuse(why, std::string(stageName(stage)) + ": a constant buffer is bound at an address the CP cannot load from (not a multiple of 16), the table has no room to copy it to, and it is mapped nowhere to copy from");
+         }
+         r.copy = false;
+-        r.words.resize(r.units * 4);
+-        memcpy(r.words.data(), static_cast<const uint8_t*>(r.buffer->contents()) + r.bufferOffset, 16ull * r.units);
++        r.wordsAt = uint32_t(ranges->words.size());
++        r.numWords = r.units * 4;
++        ranges->words.resize(ranges->words.size() + r.numWords);
++        memcpy(ranges->words.data() + r.wordsAt, static_cast<const uint8_t*>(r.buffer->contents()) + r.bufferOffset, 16ull * r.units);
+     }
+     return true;
+ }
+@@ -581,7 +615,6 @@ struct StageTextures {
+     uint32_t numTex = 0, numSamp = 0;
+     uint32_t texWords[kMaxTextureSlots][16] = {};
+     uint32_t sampWords[kMaxTextureSlots][4] = {};
+-    std::vector<const Texture*> used;
+ };
+ 
+ const char* elementOf(uint8_t e) { return e == kElemFloat ? "float" : e == kElemUint ? "uint" : e == kElemInt ? "int" : "?"; }
+@@ -633,7 +666,11 @@ Attachment attachmentOf(const RenderPass& p, uint32_t i) {
+ 
+ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, StageTextures* out, std::string* why, const GmemPlan* gmem = nullptr) {
+     const Kernel& k = fs.k;
+-    const std::string name = stageName(fs);
++    // (made only for a refusal: a std::string of the stage's name, as long as CoreAnimation's are, was an allocation a stage a draw)
++    struct Name {
++        const Stage& s;
++        std::string operator+(const char* rest) const { return std::string(stageName(s)) + rest; }
++    } name{fs};
+     out->numTex = k.numTextureSlots;
+     if (out->numTex == 0) {
+         if (fs.numSamplerPrefetch != 0) {
+@@ -686,7 +723,6 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
+             // through it reads its one texel as the 2D sample does (probe 9s), so whatever is in that texel is what both read.
+             TexConst d = tex->sampledDescriptor();
+             memcpy(out->texWords[t], d.dword, sizeof d.dword);
+-            out->used.push_back(tex);
+             continue;
+         }
+         if (!tex->isShaped(kt)) {
+@@ -696,15 +732,14 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
+                                    ": 1D, 2D, 2D array, 2D multisample, cube and 3D, each as itself, are served in a draw");
+         }
+         if (kt.element != tex->info().element) {
+-            return refuse(why, "texture " + n(t) + " is " + tex->info().name + " (" + elementOf(tex->info().element) + "); " + name + " reads it as texture2d<" +
++            return refuse(why, "texture " + n(t) + " is " + tex->info().name + " (" + elementOf(tex->info().element) + "); " + stageName(fs) + " reads it as texture2d<" +
+                                    elementOf(kt.element) + ">");
+         }
+         if ((tex->usage() & kTextureUsageRead) == 0) {
+-            return refuse(why, "texture " + n(t) + " was made without shader-read usage; " + name + " samples it");
++            return refuse(why, "texture " + n(t) + " was made without shader-read usage; " + stageName(fs) + " samples it");
+         }
+         TexConst d = tex->sampledDescriptor();
+         memcpy(out->texWords[t], d.dword, sizeof d.dword);
+-        out->used.push_back(tex);
+     }
+     out->numSamp = 1;
+     for (uint32_t m = 0; m < kMaxTextureSlots; m++) {
+@@ -746,10 +781,20 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
+ // below it may be one no ldc reads (QuartzCore's path_blit_vert_lph reads 1 and 2 and leaves 0 unbound), and an
+ // unbound one there gets a descriptor of size 0, which the ldc's bound check turns into zeros, rather than whatever
+ // the block held.
+-bool uboDescriptors(const Stage& s, const Bindings& b, uint64_t program, std::vector<uint32_t>* out, std::string* why) {
++// (two words a UBO, as many as Metal's buffer table has indices -- checkStage holds numUbos to it: a vector was an allocation a stage a draw)
++struct Ubos {
++    uint32_t count = 0;   // words
++    uint32_t d[2 * kMaxVertexBuffers];
++    bool empty() const { return count == 0; }
++    uint32_t size() const { return count; }
++    const uint32_t* data() const { return d; }
++    void push_back(uint32_t w) { d[count++] = w; }
++};
++
++bool uboDescriptors(const Stage& s, const Bindings& b, uint64_t program, Ubos* out, std::string* why) {
+     auto name = [&s]() { return std::string(stageName(s)); };   // (built only for a refusal: a string a draw is an allocation a draw)
+-    out->clear();
+-    for (uint32_t u = 0; u < s.k.numUbos; u++) {
++    out->count = 0;
++    for (uint32_t u = 0; u < s.k.numUbos && u < kMaxVertexBuffers; u++) {
+         if (s.k.constantDataUbo != 0 && u == s.k.constantDataUbo - 1) {
+             // the constant data, where the program's words were uploaded (they carry it at constantDataOffset)
+             uint32_t d[2];
+@@ -792,7 +837,6 @@ static_assert(kMaxGfxIbos >= kMaxVertexBuffers, "the table holds an IBO per Meta
+ struct GfxIbos {
+     uint32_t count = 0;
+     uint32_t words[kMaxVertexBuffers][16] = {};
+-    std::vector<const Buffer*> used;
+ };
+ 
+ bool gfxIbos(const Stage& vs, const Bindings& vsb, const Stage& fs, const Bindings& fsb, uint32_t fsBase, GfxIbos* out, std::string* why) {
+@@ -831,7 +875,6 @@ bool gfxIbos(const Stage& vs, const Bindings& vsb, const Stage& fs, const Bindin
+                 }
+                 TexConst d = bufferIbo(x.buffer->gpuAddress() + x.offset, uint32_t(elements));
+                 memcpy(out->words[tableSlot], d.dword, sizeof d.dword);
+-                out->used.push_back(x.buffer);
+             }
+             out->count = std::max(out->count, tableSlot + 1);
+         }
+@@ -1000,45 +1043,48 @@ bool checkTarget(const RenderPass& pass, std::string* why) {
+         const Texture& t = *a.texture;
+         const FormatInfo& f = t.info();
+         // (attachment 0's sentences are the ones a single target always had; a later one's name its index)
+-        const std::string which = "colour attachment " + n(i), of = i == 0 ? std::string() : " of " + which, at = i == 0 ? std::string() : which + ": ";
++        // (made only for a refusal: three strings an attachment were allocations every draw)
++        auto which = [i]() { return "colour attachment " + n(i); };
++        auto of = [i, &which]() { return i == 0 ? std::string() : " of " + which(); };
++        auto at = [i, &which]() { return i == 0 ? std::string() : which() + ": "; };
+         if (t.compressed() && (i == 0 ? pass.load : pass.more[i - 1].load) == LoadAction::kClear) {
+-            return refuse(why, at + "a Clear of a compressed texture: the 2D engine's fill writes linear rows (not served yet)");
++            return refuse(why, at() + "a Clear of a compressed texture: the 2D engine's fill writes linear rows (not served yet)");
+         }
+         if ((t.usage() & kTextureUsageRenderTarget) == 0) {
+-            return refuse(why, "the " + n(t.width()) + " x " + n(t.height()) + " " + f.name + " texture" + of +
++            return refuse(why, "the " + n(t.width()) + " x " + n(t.height()) + " " + f.name + " texture" + of() +
+                                    " was made without render-target usage (MTLTextureUsageRenderTarget, 4); a draw needs it");
+         }
+         if (t.type() != TextureType::k2D && t.type() != TextureType::k2DMultisample && t.type() != TextureType::k2DArray && t.type() != TextureType::kCube &&
+             t.type() != TextureType::k3D && t.type() != TextureType::kCubeArray) {
+-            return refuse(why, at + "a colour attachment of texture type " + n(uint32_t(t.type())) +
++            return refuse(why, at() + "a colour attachment of texture type " + n(uint32_t(t.type())) +
+                                    ": 2D (2), 2D multisample (4), a 2D array's layer (3), a cube's or cube array's face (5, 6) and a 3D texture's plane (7) are served");
+         }
+         // a slice of a 2D array, a cube (array) or a 3D texture (Texture::depth() counts them all: layers, faces, planes)
+         const uint32_t slices = (t.type() == TextureType::k2DArray || t.type() == TextureType::kCube || t.type() == TextureType::kCubeArray ||
+                                  t.type() == TextureType::k3D) ? t.depth() : 1;
+         if (a.slice >= slices) {
+-            return refuse(why, at + "slice " + n(a.slice) + " of a texture of " + n(slices));
++            return refuse(why, at() + "slice " + n(a.slice) + " of a texture of " + n(slices));
+         }
+         if (!rbMrtPitchValid(uint32_t(t.bytesPerRow())) || t.buffer()->length() >= (1ull << 32)) {
+-            return refuse(why, at + "the target's pitch of " + n(t.bytesPerRow()) + " bytes or its " + n(t.buffer()->length()) +
++            return refuse(why, at() + "the target's pitch of " + n(t.bytesPerRow()) + " bytes or its " + n(t.buffer()->length()) +
+                                    " bytes do not fit RB_MRT_PITCH / RB_MRT_ARRAY_PITCH");
+         }
+         if (a.load != LoadAction::kLoad && a.load != LoadAction::kDontCare && a.load != LoadAction::kClear) {
+-            return refuse(why, at + "load action " + n(uint32_t(a.load)) + ": MTLLoadAction is DontCare (0), Load (1) or Clear (2)");
++            return refuse(why, at() + "load action " + n(uint32_t(a.load)) + ": MTLLoadAction is DontCare (0), Load (1) or Clear (2)");
+         }
+         // DontCare is served as a Store: in sysmem the RB writes the target's memory as it draws, and what DontCare
+         // allows -- the contents undefined after the pass -- includes keeping them
+         if (a.store != StoreAction::kStore && a.store != StoreAction::kDontCare) {
+-            return refuse(why, at + "store action " + n(uint32_t(a.store)) + ": Store (1) and DontCare (0) are served");
++            return refuse(why, at() + "store action " + n(uint32_t(a.store)) + ": Store (1) and DontCare (0) are served");
+         }
+         if (f.depth) {
+-            return refuse(why, std::string("a ") + f.name + " texture as " + which + ": a depth format is the depth attachment's");
++            return refuse(why, std::string("a ") + f.name + " texture as " + which() + ": a depth format is the depth attachment's");
+         }
+         if (a.level >= t.levels()) {
+-            return refuse(why, which + " names mip level " + n(a.level) + " of a texture of " + n(t.levels()));
++            return refuse(why, which() + " names mip level " + n(a.level) + " of a texture of " + n(t.levels()));
+         }
+         if (t.samples() != firstAttachment(pass)->samples()) {
+-            return refuse(why, which + " has " + n(t.samples()) + " sample(s) beside another attachment's " + n(firstAttachment(pass)->samples()) +
++            return refuse(why, which() + " has " + n(t.samples()) + " sample(s) beside another attachment's " + n(firstAttachment(pass)->samples()) +
+                                    ": a pass's attachments share one sample count");
+         }
+         // (attachments of different sizes are Metal's to allow: the window is the smallest of them, windowOf below)
+@@ -1245,23 +1291,88 @@ void passTail(pm4::Stream& stream, uint64_t table, const Options& o, bool depth
+ }  // namespace
+ 
+ namespace {
+-// A draw, either WHOLE (its own pass: the batch start, the pass begin, the clears, the draw, the tail) or inside a pass
+-// encodeBegin opened (the draw's state and the draw alone: TABLE is then the draw's own, holding only its descriptors;
+-// the pass's table, which the batch start pointed the border colours at and the tail writes, is the pass's)
+-bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings,
+-                const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, uint8_t* tableCpu, std::string* why,
+-                const Options& o, bool whole, const GmemPlan* gmem = nullptr, bool afterFetch = false) {
++// A draw is encoded in two halves. drawFacts judges it -- every refusal by name, in the order they always came -- and
++// leaves what the stream is made of: what the program and the pass alone decide (ProgramFacts) and what this draw's
++// bindings and numbers add (DrawFacts). emitDraw writes the stream from the facts, group by group in the one order a
++// draw has, and only the groups asked for (kG...): all of them for render::encode and render::encodeInPass, which are
++// the two halves one after the other, and a few at a time for CommandBuffer::draw, which keeps what a program's groups
++// come to and does not make them again for a draw that changes none of it.
++enum : uint32_t {
++    kGBarrier = 1u << 0,        // a framebuffer fetch's barrier
++    kGZs = 1u << 1,             // the depth and stencil buffers
++    kGMrt = 1u << 2,            // the colour targets
++    kGMsaa = 1u << 3,
++    kGRenderCntl = 1u << 4,
++    kGLrz = 1u << 5,
++    kGInvalidate = 1u << 6,     // HLSQ_INVALIDATE_CMD: a command, written every time
++    kGConfig = 1u << 7,         // SP_xS_CONFIG / HLSQ_xS_CNTL
++    kGIbos = 1u << 8,           // SP_IBO_COUNT and the 3D IBO table
++    kGVsRegs = 1u << 9,         // a stage's CTRL_REG0, INSTRLEN, the OBJ_START block, HW_STACK_OFFSET
++    kGVsLoads = 1u << 10,       // ...its preload and its immediates
++    kGVsConsts = 1u << 11,      // ...its pushed ranges and its UBO descriptors
++    kGDriverParams = 1u << 12,
++    kGFsRegs = 1u << 13,
++    kGFsLoads = 1u << 14,
++    kGFsConsts = 1u << 15,
++    kGFsTex = 1u << 16,
++    kGVsTex = 1u << 17,
++    kGVfdStatic = 1u << 18,     // the multiview registers, VFD_CONTROL_0..6, the decode and destination tables
++    kGVfdDynamic = 1u << 19,    // the fetches' bases, VFD_INDEX_OFFSET, the restart index
++    kGVpc = 1u << 20,
++    kGFsInputs = 1u << 21,
++    kGFsOutputs = 1u << 22,
++    kGRast = 1u << 23,
++    kGViewport = 1u << 24,
++    kGBlendStatic = 1u << 25,   // SP/RB_BLEND_CNTL and each target's RB_MRT_CONTROL / BLEND_CONTROL
++    kGBlendDynamic = 1u << 26,  // the blend constant, depth and stencil
++    kGVisibility = 1u << 27,    // an occlusion query's packets around the draw
++    kGDraw = 1u << 28,
++    kGAll = ~0u,
++};
++
++// what a draw's program and its pass decide between them
++struct ProgramFacts {
++    // the fragment stage's colour registers, kRegidNone where the pass has no attachment for the output
++    uint32_t colorRegid[kMaxColorOutputs];
++    uint32_t samples, numRt, numOut, blendMask, W, H;
++    bool dual;
++    BlendWords blends[kMaxColorOutputs];
++    Linkage link;
++};
++
++// ...and what the draw's own bindings and numbers add
++struct DrawFacts {
++    const ProgramFacts* p;
++    PushedRanges vsRanges, fsRanges;
++    Ubos vsUbos, fsUbos;
++    VertexFetch fetch;
++    uint32_t vsNumTex, vsNumSamp, fsNumTex, fsNumSamp, iboCount;
++    bool depthTest;
++    pc_di_primtype prim;
++    uint64_t maxIndices;
++    Scissor sc;
++    ClearWords clears[kMaxColorOutputs];   // (a whole draw's alone)
++};
++
++bool drawFacts(const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings, const Bindings& fsBindings,
++               uint64_t vsProgram, uint64_t fsProgram, uint8_t* tableCpu, std::string* why, bool whole, const GmemPlan* gmem, ProgramFacts* programFacts,
++               DrawFacts* facts) {
++    ProgramFacts& pf = *programFacts;
++    DrawFacts& f = *facts;
++    f.p = programFacts;
+     const Stage& vs = program.vs;
++    const Stage& fs = program.fs;
+     // A [[color(n)]] the pass has no attachment n for is written nowhere: Metal leaves that pipeline slot's format Invalid
+     // and discards the output (CoreAnimation's fixed_frag_lph_cpf writes three into passes of one). The stage is drawn
+     // as if it did not write it -- no register for the slot, RB_MRT_CONTROL 0 -- which is the slot nothing writes.
+-    Stage fsDrawn = program.fs;
++    // (the registers alone are kept apart: a copy of the stage to change them in was 1.4 KB moved every draw)
++    uint32_t* const colorRegid = pf.colorRegid;
+     // (a dual-source stage's second colour is the blend's second source, not attachment 1's: it is kept)
+     for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+-        if (i == 1 && program.fs.dualSrcBlend) continue;
+-        if (fsDrawn.colorRegid[i] != kRegidNone && attachmentOf(pass, i).texture == nullptr) fsDrawn.colorRegid[i] = kRegidNone;
++        colorRegid[i] = fs.colorRegid[i];
++        if (i == 1 && fs.dualSrcBlend) continue;
++        if (colorRegid[i] != kRegidNone && attachmentOf(pass, i).texture == nullptr) colorRegid[i] = kRegidNone;
+     }
+-    const Stage& fs = fsDrawn;
+     // --- the two stages ---
+     if (vs.kind != kStageVertex) {
+         return refuse(why, std::string(stageName(vs)) + " is not a vertex stage");
+@@ -1273,7 +1384,11 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+         return false;
+     }
+     // each stage's pushed constant ranges out of its own [[buffer(n)]] table (Metal's setVertexBuffer / setFragmentBuffer)
+-    std::vector<PushedRange> vsRanges, fsRanges;
++    PushedRanges& vsRanges = f.vsRanges;
++    PushedRanges& fsRanges = f.fsRanges;
++    vsRanges.count = fsRanges.count = 0;
++    vsRanges.words.clear();
++    fsRanges.words.clear();
+     if (!pushedRanges(vs, vsBindings, &vsRanges, why) || !pushedRanges(fs, fsBindings, &fsRanges, why)) {
+         return false;
+     }
+@@ -1288,7 +1403,8 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+                                n(fs.k.constlen) + "): the pipeline has " + n(kMaxConstPipeline) + " (ir3_compiler.c max_const_pipeline)");
+     }
+     // the VS's [[stage_in]] attributes through the pipeline's vertex descriptor and the VS's own [[buffer(n)]] table
+-    VertexFetch fetch;
++    VertexFetch& fetch = f.fetch;
++    fetch = VertexFetch{};
+     if (!vertexFetch(vs, program.vertexDescriptor, draw, vsBindings, &fetch, why)) {
+         return false;
+     }
+@@ -1353,13 +1469,13 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     // validation names the mismatch, but validation is off in a shipping app, and an Apple GPU then draws -- SiriUICore
+     // builds its orb's pipelines at 1 sample and draws them into a 4-sample target. Nothing a stage was compiled into
+     // depends on the count (the MSAA state is the attachments', below), so the attachments' is the one taken.
+-    const uint32_t samples = firstAttachment(pass)->samples();
+-    const bool dual = fs.dualSrcBlend != 0;
+-    const uint32_t numRt = dual ? 1u : std::max<uint32_t>(fs.numColorOutputs, 1);   // the attachments drawn into
+-    const uint32_t numOut = dual ? 2u : numRt;                                      // the registers the stage hands the RB
++    pf.samples = firstAttachment(pass)->samples();
++    const bool dual = pf.dual = fs.dualSrcBlend != 0;
++    const uint32_t numRt = pf.numRt = dual ? 1u : std::max<uint32_t>(fs.numColorOutputs, 1);   // the attachments drawn into
++    pf.numOut = dual ? 2u : numRt;                                                  // the registers the stage hands the RB
+     for (uint32_t i = 0; i < numRt; i++) {
+         const Texture* t = attachmentOf(pass, i).texture;
+-        if (fs.colorRegid[i] == kRegidNone) continue;   // (a slot nothing is written to: no attachment needed)
++        if (colorRegid[i] == kRegidNone) continue;   // (a slot nothing is written to: no attachment needed)
+         if (t == nullptr) {
+             return refuse(why, std::string(stageName(fs)) + " writes [[color(" + n(i) + ")]] and the pass has no colour attachment " + n(i));
+         }
+@@ -1379,14 +1495,15 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+                                    (formatClass == kElemFloat ? "floats" : "integers"));
+         }
+     }
+-    ClearWords clears[kMaxColorOutputs];
++    ClearWords* const clears = f.clears;
+     if (whole && !clearsOf(pass, clears, why)) {
+         return false;
+     }
+-    BlendWords blends[kMaxColorOutputs] = {};
++    BlendWords* const blends = pf.blends;
++    for (uint32_t i = 0; i < kMaxColorOutputs; i++) blends[i] = BlendWords{};
+     uint32_t blendMask = 0;
+     for (uint32_t i = 0; i < numRt; i++) {
+-        if (fs.colorRegid[i] == kRegidNone) continue;   // RB_MRT_CONTROL 0: no components written, no blend
++        if (colorRegid[i] == kRegidNone) continue;   // RB_MRT_CONTROL 0: no components written, no blend
+         const ColorBlend& cb = i == 0 ? program.blend : program.moreBlend[i - 1];
+         if (cb.enabled && !dual) {
+             // a second source colour asked of a stage that writes none: nothing for the factor to read
+@@ -1404,11 +1521,13 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+         }
+         if (blends[i].enabled) blendMask |= 1u << i;
+     }
++    pf.blendMask = blendMask;
+     StageTextures vsTex, fsTex;
+     if (!stageTextures(vs, vsBindings, pass, &vsTex, why, gmem) || !stageTextures(fs, fsBindings, pass, &fsTex, why, gmem)) {
+         return false;
+     }
+-    std::vector<uint32_t> vsUbos, fsUbos;
++    Ubos& vsUbos = f.vsUbos;
++    Ubos& fsUbos = f.fsUbos;
+     if (!uboDescriptors(vs, vsBindings, vsProgram, &vsUbos, why) || !uboDescriptors(fs, fsBindings, fsProgram, &fsUbos, why)) {
+         return false;
+     }
+@@ -1425,7 +1544,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     if (draw.depth.compare > 7) {
+         return refuse(why, "depth compare function " + n(draw.depth.compare) + ": MTLCompareFunction runs Never 0 to Always 7");
+     }
+-    const bool depthTest = draw.depth.compare != 7 || draw.depth.write;
++    const bool depthTest = f.depthTest = draw.depth.compare != 7 || draw.depth.write;
+     const StencilState& st = draw.stencil;
+     if (st.enabled && pass.stencil == nullptr) {
+         return refuse(why, "a stencil test with no stencil attachment");
+@@ -1454,6 +1573,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     default:
+         return refuse(why, "primitive " + n(uint32_t(draw.primitive)) + ": MTLPrimitiveType is Point (0), Line (1), LineStrip (2), Triangle (3) or TriangleStrip (4)");
+     }
++    f.prim = prim;
+     const bool indirect = draw.indirect != nullptr;
+     if (indirect) {
+         const uint64_t words = draw.indexBuffer != nullptr ? 5 : 4;
+@@ -1502,10 +1622,13 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+         }
+         if (maxIndices > 0xffffffffull) maxIndices = 0xffffffffull;
+     }
++    f.maxIndices = maxIndices;
+     if (draw.cullMode > 2 || draw.winding > 1) {
+         return refuse(why, "cull mode " + n(draw.cullMode) + ", winding " + n(draw.winding) + ": MTLCullMode is 0 to 2, MTLWinding 0 or 1");
+     }
+     const auto [W, H] = windowOf(pass);
++    pf.W = W;
++    pf.H = H;
+     const Viewport& vp = draw.viewport;
+     if (!finite(vp.x) || !finite(vp.y) || !finite(vp.width) || !finite(vp.height) || !finite(vp.znear) || !finite(vp.zfar)) {
+         return refuse(why, "a viewport with a non-finite value");
+@@ -1528,9 +1651,13 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     } else if (uint64_t(sc.x) + sc.width > W || uint64_t(sc.y) + sc.height > H) {
+         return refuse(why, "scissor (" + n(sc.x) + ", " + n(sc.y) + ", " + n(sc.width) + ", " + n(sc.height) + ") lies outside the " + n(W) + " x " + n(H) + " target");
+     }
++    f.sc = sc;
+     // --- the link: ir3_link_shaders over the two stages' tables (src/link.cpp), recomputed here so that a hand-built
+     // Program needs none and the one linkProgram stored cannot disagree with the registers
+-    Linkage link{};
++    // (over the stage as it is: the colour outputs a pass has no attachment for come off the components where they are
++    // written, with the registers above)
++    Linkage& link = pf.link;
++    link = Linkage{};
+     if (!render::link(vs, fs, &link, why)) {
+         return false;
+     }
+@@ -1538,7 +1665,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+         return refuse(why, "the link of " + std::string(stageName(vs)) + " and " + stageName(fs) + " has no position entry");
+     }
+ 
+-    // --- nothing is refused from here on: the table, then the stream ---
++    // --- nothing is refused from here on: the table, then (emitDraw) the stream ---
+     if (whole) {
+         tableStart(tableCpu);
+     }
+@@ -1550,9 +1677,43 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     memcpy(tableCpu + kFsTexSampAt, fsTex.sampWords, sizeof fsTex.sampWords);
+     memcpy(tableCpu + kVsTexConstAt, vsTex.texWords, sizeof vsTex.texWords);
+     memcpy(tableCpu + kVsTexSampAt, vsTex.sampWords, sizeof vsTex.sampWords);
++    f.vsNumTex = vsTex.numTex;
++    f.vsNumSamp = vsTex.numSamp;
++    f.fsNumTex = fsTex.numTex;
++    f.fsNumSamp = fsTex.numSamp;
++    f.iboCount = ibos.count;
++    return true;
++}
++
++// The stream of a draw from its facts: the groups G of it, in the order a draw has them, into any stream (S: a
++// pm4::Stream, or a pass's stream through its register shadow). TABLE is the draw's own; nothing here can refuse.
++template <class S>
++void emitDraw(S& stream, const DrawFacts& f, const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings,
++              const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, const Options& o, const GmemPlan* gmem, bool afterFetch,
++              uint32_t g) {
++    const ProgramFacts& pf = *f.p;
++    const Stage& vs = program.vs;
++    const Stage& fs = program.fs;
++    const uint32_t* const colorRegid = pf.colorRegid;
++    const uint32_t samples = pf.samples, numRt = pf.numRt, numOut = pf.numOut, blendMask = pf.blendMask, W = pf.W, H = pf.H;
++    const bool dual = pf.dual;
++    const BlendWords* const blends = pf.blends;
++    const Linkage& link = pf.link;
++    const PushedRanges& vsRanges = f.vsRanges;
++    const PushedRanges& fsRanges = f.fsRanges;
++    const Ubos& vsUbos = f.vsUbos;
++    const Ubos& fsUbos = f.fsUbos;
++    const VertexFetch& fetch = f.fetch;
++    const bool depthTest = f.depthTest;
++    const StencilState& st = draw.stencil;
++    const pc_di_primtype prim = f.prim;
++    const bool indirect = draw.indirect != nullptr;
++    const uint64_t maxIndices = f.maxIndices;
++    const Scissor sc = f.sc;
++    const Viewport& vp = draw.viewport;
+     MrtWords mrts[kMaxColorOutputs] = {};
+     uint32_t srgbMask = 0;
+-    for (uint32_t i = 0; i < numRt; i++) {
++    for (uint32_t i = 0; (g & (kGMrt | kGRenderCntl)) && i < numRt; i++) {
+         // (an unwritten slot with no attachment of its own names another attachment's memory: valid, and never written.
+         // In a pass of depth alone it names the depth texture's, as RGBA8 -- 4 bytes a pixel as Depth32Float's plane is,
+         // so its rows are the depth's rows -- which RB_MRT_CONTROL 0 never lets it write; memory the pass owns rather
+@@ -1569,22 +1730,14 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+         mrts[i] = a.texture != nullptr ? mrtWords(*named, a.level, a.slice)
+                                        : mrtWords(*named, named == attachmentOf(pass, 0).texture ? attachmentOf(pass, 0).level : 0,
+                                                   named == attachmentOf(pass, 0).texture ? attachmentOf(pass, 0).slice : 0);
+-        if (mrts[i].srgb && fs.colorRegid[i] != kRegidNone) srgbMask |= 1u << i;
++        if (mrts[i].srgb && colorRegid[i] != kRegidNone) srgbMask |= 1u << i;
+     }
+     // each attachment's bin in a pass drawn in tiles
+-    for (uint32_t i = 0; gmem != nullptr && i < numRt; i++) {
++    for (uint32_t i = 0; (g & (kGMrt | kGRenderCntl)) && gmem != nullptr && i < numRt; i++) {
+         if (attachmentOf(pass, i).texture != nullptr) mrts[i].baseGmem = gmem->base[i];
+     }
+-    const a6xx_threadsize fsThreads = fs.k.doubleThreadsize ? THREAD128 : THREAD64;
+     const uint32_t* ij = fs.ijRegid;
+ 
+-    if (whole) {
+-        passStart(stream, W, H, table, o);
+-        // a Clear: the 2D engine fills the target before any draw state is written, as turnip's subpass begin does it;
+-        // the depth attachment's Clear after it (tu_clear_sysmem_attachment, each attachment in turn)
+-        clearAll(stream, pass, clears, table);
+-        zsClears(stream, pass, table);
+-    }
+     // A framebuffer fetch reads the target through the texture unit while the RB writes it through the colour CCU: what
+     // the draws before this one (or the pass's Clear) wrote is put in memory and the texture caches dropped before it
+     // runs -- turnip's barrier for a sysmem feedback loop (FD_CCU_CLEAN_COLOR | FD_CACHE_INVALIDATE), the CCU flush
+@@ -1600,7 +1753,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     // (in GMEM only: in sysmem the ordering bought nothing measurable over the barrier -- SpringBoard's heaviest passes
+     // took some 50 ms either way -- and the barrier is what SpringBoard was looked at with)
+     const bool ordered = fs.fbRead && o.fbReadOrdered && gmem != nullptr;
+-    const bool barrier = fs.fbRead && o.fbReadBarrier && (!ordered || !afterFetch);
++    const bool barrier = (g & kGBarrier) && fs.fbRead && o.fbReadBarrier && (!ordered || !afterFetch);
+     if (barrier && gmem != nullptr) {
+         stream.waitForIdle();
+         event(stream, CACHE_INVALIDATE);
+@@ -1619,12 +1772,12 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     // its base, BASE_GMEM 0 in sysmem, the same format in GRAS_SU_DEPTH_BUFFER_INFO, the flag buffer 0 (no UBWC), no
+     // stencil. A6XX's RB_DEPTH_BUFFER_INFO has no tile field: the RB reads and writes depth TILE6_3, the only layout the
+     // hardware has for it (fd6_layout.c:157-164), which is how texture.cpp lays a Depth32Float texture out.
+-    if (o.zsNone && pass.depth == nullptr) {
++    if ((g & kGZs) && o.zsNone && pass.depth == nullptr) {
+         regs(stream, REG_A6XX_RB_DEPTH_BUFFER_INFO, {A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_NONE), 0, 0, 0, 0, 0});
+         reg(stream, REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO, A6XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_NONE));
+         reg(stream, REG_A6XX_RB_STENCIL_INFO, 0);
+     }
+-    if (pass.depth != nullptr) {
++    if ((g & kGZs) && pass.depth != nullptr) {
+         const Texture& d = *pass.depth;
+         // (a depth array's layer: that many tiled planes on, sliceBytes apart)
+         const uint64_t depthAt = d.levelAddress(pass.depthLevel) + uint64_t(pass.depthSlice) * d.sliceBytes();
+@@ -1650,7 +1803,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     // copies, GRAS_MAX_LAYER_INDEX 0
+     // ...and RB_MRT[i] / SP_FS_MRT_REG[i] / the flag buffer for each further target the FS writes, the sRGB bit of each
+     // in both copies (SRGB_MRTn is bit n in both registers)
+-    if (o.mrt) {
++    if ((g & kGMrt) && o.mrt) {
+         for (uint32_t i = 0; i < numRt; i++) {
+             const MrtWords& m = mrts[i];
+             regs(stream, regRbMrt(REG_A6XX_RB_MRT_BUF_INFO, i), {m.bufInfo, m.pitch, m.arrayPitch, m.baseLo, m.baseHi, m.baseGmem});
+@@ -1669,7 +1822,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     // ...or a multisample pass's count in all three blocks without MSAA_DISABLE, as tu6_emit_msaa writes it: the GRAS
+     // covers samples, the RB writes each covered one, the FS still runs once a pixel (no sample shading). The sample
+     // configs stay 0, the standard locations (tu6_emit_sample_locations without custom ones).
+-    if (o.msaaOff) {
++    if ((g & kGMsaa) && o.msaaOff) {
+         const a3xx_msaa_samples m = samples == 4 ? MSAA_FOUR : samples == 2 ? MSAA_TWO : MSAA_ONE;
+         regs(stream, REG_A6XX_SP_TP_RAS_MSAA_CNTL, {A6XX_SP_TP_RAS_MSAA_CNTL_SAMPLES(m),
+                                                     m == MSAA_ONE ? A6XX_SP_TP_DEST_MSAA_CNTL_MSAA_DISABLE : A6XX_SP_TP_DEST_MSAA_CNTL_SAMPLES(m)});
+@@ -1682,14 +1835,14 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     }
+     // 7. RB_RENDER_CNTL: CCUSINGLECACHELINESIZE 2 in both pipelines (tu_cmd_buffer.cc:633-693; fd6_gmem.cc:531-552), 0 in
+     // r3d_dst (tu_clear_blit.cc:1408) -- renderCntlZero for the bisect. A plain type-4: has_cp_reg_write is false here.
+-    if (o.renderCntl) {
++    if ((g & kGRenderCntl) && o.renderCntl) {
+         uint32_t flagMrts = 0;
+         for (uint32_t i = 0; i < numRt; i++) flagMrts |= mrts[i].flagPitch != 0 ? 1u << i : 0u;
+         reg(stream, REG_A6XX_RB_RENDER_CNTL, o.renderCntlZero ? 0u : rbRenderCntlSysmem() | A6XX_RB_RENDER_CNTL_FLAG_MRTS(flagMrts));
+     }
+     // 8. LRZ off (tu_lrz.cc:936-944 via a zero state; r3d :1622-1623; fd6 build_lrz with no zsbuf, fd6_emit.cc:262-270)
+     // and fd6's zeroed LRZ buffer registers (emit_lrz, fd6_gmem.cc:250-260): BASE (2), PITCH, FAST_CLEAR_BUFFER_BASE (2)
+-    if (o.lrzOff) {
++    if ((g & kGLrz) && o.lrzOff) {
+         reg(stream, REG_A6XX_GRAS_LRZ_CNTL, 0);
+         reg(stream, REG_A6XX_RB_LRZ_CNTL, 0);
+         regs(stream, REG_A6XX_GRAS_LRZ_BUFFER_BASE, {0, 0, 0, 0, 0});
+@@ -1698,10 +1851,12 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     // 400-458): HLSQ_INVALIDATE_CMD for the five graphics stages and the 3D IBOs, then SP_xS_CONFIG / HLSQ_xS_CNTL per
+     // stage with HS, DS and GS off (NTEX = NSAMP = num_samp = 0; CONSTLEN in the field's units of 4 vec4, the FS's 0 is
+     // ENABLED alone), SP_IBO_COUNT 0 (fd6's nibo(fs))
+-    if (o.programConfig) {
++    if ((g & kGInvalidate) && o.programConfig) {
+         reg(stream, REG_A6XX_HLSQ_INVALIDATE_CMD,
+             A6XX_HLSQ_INVALIDATE_CMD_VS_STATE | A6XX_HLSQ_INVALIDATE_CMD_HS_STATE | A6XX_HLSQ_INVALIDATE_CMD_DS_STATE |
+                 A6XX_HLSQ_INVALIDATE_CMD_GS_STATE | A6XX_HLSQ_INVALIDATE_CMD_FS_STATE | A6XX_HLSQ_INVALIDATE_CMD_GFX_IBO);
++    }
++    if ((g & kGConfig) && o.programConfig) {
+         reg(stream, REG_A6XX_SP_VS_CONFIG, spXsConfig(vs.k.numSamp, vs.k.numSamp, vs.k.numSsbos));
+         reg(stream, REG_A6XX_HLSQ_VS_CNTL, hlsqVsCntl(vs.k.constlen));
+         reg(stream, REG_A6XX_SP_HS_CONFIG, 0);
+@@ -1712,12 +1867,14 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+         reg(stream, REG_A6XX_HLSQ_GS_CNTL, 0);
+         reg(stream, REG_A6XX_SP_FS_CONFIG, spXsConfig(fs.k.numSamp, fs.k.numSamp, fs.k.numSsbos));
+         reg(stream, REG_A6XX_HLSQ_FS_CNTL, hlsqFsCntl(fs.k.constlen));
++    }
++    if ((g & kGIbos) && o.programConfig) {
+         // the 3D IBO table's count (fd6's nibo(fs); here the larger of the two stages', the table being one), and the table
+         // itself: CP_LOAD_STATE6 (the plain opcode) of ST6_SHADER into SB6_IBO, as both witnesses load it (tu_pipeline.cc:
+         // 183, fd6_image.cc:308-335 -- bindless there, from the table here, the SP_CS_IBO way), then SP_IBO at it
+-        reg(stream, REG_A6XX_SP_IBO_COUNT, ibos.count);
+-        if (ibos.count != 0) {
+-            uint32_t w[3] = {loadState6_0(0, ST6_SHADER, SS6_INDIRECT, SB6_IBO, ibos.count), CP_LOAD_STATE6_1_EXT_SRC_ADDR(uint32_t(table + kGfxIboAt)),
++        reg(stream, REG_A6XX_SP_IBO_COUNT, f.iboCount);
++        if (f.iboCount != 0) {
++            uint32_t w[3] = {loadState6_0(0, ST6_SHADER, SS6_INDIRECT, SB6_IBO, f.iboCount), CP_LOAD_STATE6_1_EXT_SRC_ADDR(uint32_t(table + kGfxIboAt)),
+                              CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI(uint32_t((table + kGfxIboAt) >> 32))};
+             stream.packet(CP_LOAD_STATE6, w, 3);
+             reg64(stream, REG_A6XX_SP_IBO, table + kGfxIboAt);
+@@ -1731,23 +1888,35 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     // (ST6_CONSTANTS, direct, at immediatesOffsetVec4)
+     // ... then the pushed constant ranges, indirect, as compute uploads them (fd6_emit_user_consts / tu6_emit_xs's ranges,
+     // tu_shader.cc:1397-1421) into the stage's own block
+-    auto programOf = [&](const Stage& s, const Bindings& b, const std::vector<PushedRange>& ranges, const std::vector<uint32_t>& ubos, uint64_t address,
+-                         uint32_t ctrlReg0, uint32_t regCtrl0, uint32_t regInstrlen, uint32_t regObjFirstExec, uint32_t regHwStackOffset) {
+-        reg(stream, regCtrl0, ctrlReg0);
+-        reg(stream, regInstrlen, s.k.instrlen);
+-        // (the CS's field helpers: the VS's and the FS's registers lay their fields out the same, and tu6_emit_xs writes
+-        // every stage's through the VS's)
+-        const PrivateMemory pm = s.k.pvtmemSize != 0 ? b.privateMemory : PrivateMemory{};
+-        regs(stream, regObjFirstExec,
+-             {0, uint32_t(address), uint32_t(address >> 32), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(pm.perFiber), uint32_t(pm.address),
+-              uint32_t(pm.address >> 32), A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(pm.perSp) | (pm.perWave ? A6XX_SP_CS_PVT_MEM_SIZE_PERWAVEMEMLAYOUT : 0u)});
+-        reg(stream, regHwStackOffset, A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(pm.perSp));
+-        loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, kInstrCacheSize), address);
+-        if (s.k.numImmediates != 0) {
+-            std::vector<uint32_t> imm(s.k.immediates, s.k.immediates + s.k.numImmediates);
+-            imm.resize((imm.size() + 3) & ~size_t(3), 0);
+-            loadDirect(stream, s, ST6_CONSTANTS, s.k.immediatesOffsetVec4, uint32_t(imm.size() / 4), imm.data(), uint32_t(imm.size()));
++    // (in three groups a stage: its registers, GREGS; the preload and the immediates, GLOADS; the ranges and the UBO
++    // descriptors, GCONSTS -- the first two are the program's alone, the third the draw's bindings')
++    auto programOf = [&](const Stage& s, const Bindings& b, const PushedRanges& ranges, const Ubos& ubos, uint64_t address, uint32_t gRegs, uint32_t gLoads,
++                         uint32_t gConsts) {
++        const bool vertex = &s == &vs;
++        if (g & gRegs) {
++            const uint32_t ctrlReg0 =
++                vertex ? spVsCtrlReg0(uint32_t(vs.k.maxReg + 1), uint32_t(vs.k.maxHalfReg + 1), vs.k.branchstackHw, vs.k.mergedRegs, vs.k.earlyPreamble)
++                       : spFsCtrlReg0(uint32_t(fs.k.maxReg + 1), uint32_t(fs.k.maxHalfReg + 1), fs.k.branchstackHw, fs.k.doubleThreadsize ? THREAD128 : THREAD64,
++                                      fs.totalIn != 0, fs.needFullQuad != 0, fs.needPixlod != 0, fs.k.earlyPreamble, fs.k.mergedRegs);
++            reg(stream, vertex ? REG_A6XX_SP_VS_CTRL_REG0 : REG_A6XX_SP_FS_CTRL_REG0, ctrlReg0);
++            reg(stream, vertex ? REG_A6XX_SP_VS_INSTRLEN : REG_A6XX_SP_FS_INSTRLEN, s.k.instrlen);
++            // (the CS's field helpers: the VS's and the FS's registers lay their fields out the same, and tu6_emit_xs writes
++            // every stage's through the VS's)
++            const PrivateMemory pm = s.k.pvtmemSize != 0 ? b.privateMemory : PrivateMemory{};
++            regs(stream, vertex ? REG_A6XX_SP_VS_OBJ_FIRST_EXEC_OFFSET : REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET,
++                 {0, uint32_t(address), uint32_t(address >> 32), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(pm.perFiber), uint32_t(pm.address),
++                  uint32_t(pm.address >> 32), A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(pm.perSp) | (pm.perWave ? A6XX_SP_CS_PVT_MEM_SIZE_PERWAVEMEMLAYOUT : 0u)});
++            reg(stream, vertex ? REG_A6XX_SP_VS_PVT_MEM_HW_STACK_OFFSET : REG_A6XX_SP_FS_PVT_MEM_HW_STACK_OFFSET, A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(pm.perSp));
++        }
++        if (g & gLoads) {
++            loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, kInstrCacheSize), address);
++            if (s.k.numImmediates != 0) {
++                // (in whole vec4, zeros after the last immediate)
++                const uint32_t padded = (s.k.numImmediates + 3) & ~3u;
++                loadDirect(stream, s, ST6_CONSTANTS, s.k.immediatesOffsetVec4, padded / 4, s.k.immediates, s.k.numImmediates, padded);
++            }
+         }
++        if (!(g & gConsts)) return;
+         for (const PushedRange& r : ranges) {
+             if (r.copy) {
+                 // (the copy landed before the load reads it: CP_WAIT_MEM_WRITES, then the micro engine caught up, as
+@@ -1756,8 +1925,8 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+                 stream.packet(pm4::kWaitMemWrites, nullptr, 0);
+                 stream.waitForMe();
+                 loadIndirect(stream, s, ST6_CONSTANTS, r.offsetVec4, r.units, table + r.copyAt);
+-            } else if (!r.words.empty()) {
+-                loadDirect(stream, s, ST6_CONSTANTS, r.offsetVec4, r.units, r.words.data(), uint32_t(r.words.size()));
++            } else if (r.numWords != 0) {
++                loadDirect(stream, s, ST6_CONSTANTS, r.offsetVec4, r.units, ranges.words.data() + r.wordsAt, r.numWords);
+             } else {
+                 loadIndirect(stream, s, ST6_CONSTANTS, r.offsetVec4, r.units, r.from);
+             }
+@@ -1769,55 +1938,51 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+         }
+     };
+     if (o.programVs) {
+-        programOf(vs, vsBindings, vsRanges, vsUbos, vsProgram, spVsCtrlReg0(uint32_t(vs.k.maxReg + 1), uint32_t(vs.k.maxHalfReg + 1), vs.k.branchstackHw, vs.k.mergedRegs, vs.k.earlyPreamble),
+-                  REG_A6XX_SP_VS_CTRL_REG0, REG_A6XX_SP_VS_INSTRLEN, REG_A6XX_SP_VS_OBJ_FIRST_EXEC_OFFSET, REG_A6XX_SP_VS_PVT_MEM_HW_STACK_OFFSET);
++        programOf(vs, vsBindings, vsRanges, vsUbos, vsProgram, kGVsRegs, kGVsLoads, kGVsConsts);
+     }
+     // 10a. the VS's driver params, every draw since they are the draw's own (tu6_emit_vs_params, tu_cmd_buffer.cc:
+     // 6135-6205: one vec4 of draw id, vertex offset, first instance, 0). The AIR front end reads Metal's [[base_vertex]]
+     // as first_vertex and makes [[instance_id]] the hardware's zero-based id plus base_instance, so a VS with either
+     // reads these; the vertex offset is the one VFD_INDEX_OFFSET adds, the base vertex of an indexed draw or the
+     // vertex start of the other kind, as Vulkan's firstVertex is.
+-    if (vs.k.driverParamsOffsetVec4 >= 0) {
++    if ((g & kGDriverParams) && vs.k.driverParamsOffsetVec4 >= 0) {
+         const uint32_t params[4] = {0, draw.indexBuffer != nullptr ? uint32_t(draw.baseVertex) : draw.vertexStart, draw.baseInstance, 0};
+         loadDirect(stream, vs, ST6_CONSTANTS, uint32_t(vs.k.driverParamsOffsetVec4), 1, params, 4);
+     }
+     if (o.programFs) {
+-        programOf(fs, fsBindings, fsRanges, fsUbos, fsProgram,
+-                  spFsCtrlReg0(uint32_t(fs.k.maxReg + 1), uint32_t(fs.k.maxHalfReg + 1), fs.k.branchstackHw, fsThreads, fs.totalIn != 0, fs.needFullQuad != 0,
+-                               fs.needPixlod != 0, fs.k.earlyPreamble, fs.k.mergedRegs),
+-                  REG_A6XX_SP_FS_CTRL_REG0, REG_A6XX_SP_FS_INSTRLEN, REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET, REG_A6XX_SP_FS_PVT_MEM_HW_STACK_OFFSET);
++        programOf(fs, fsBindings, fsRanges, fsUbos, fsProgram, kGFsRegs, kGFsLoads, kGFsConsts);
+     }
+     // 10b. the FS's textures and samplers, Gallium's FS_TEX group in its order (fd6_texture.cc:593-687): the samplers into
+     // SB6_FS_TEX as ST6_SHADER (16 bytes a unit), their pointer, the textures as ST6_CONSTANTS (64), their pointer, the
+     // count; SP_FS_TEX_COUNT 0 without textures, so that no earlier owner's count is left (the register is context state).
+     // SP_FS_CONFIG's NTEX and NSAMP (step 9) stay ir3's num_samp, as compute leaves SP_CS_CONFIG's.
+-    if (o.fsTextures) {
+-        if (fsTex.numTex != 0) {
+-            uint32_t w[3] = {loadState6_0(0, ST6_SHADER, SS6_INDIRECT, SB6_FS_TEX, fsTex.numSamp), CP_LOAD_STATE6_1_EXT_SRC_ADDR(uint32_t(table + kFsTexSampAt)),
++    if ((g & kGFsTex) && o.fsTextures) {
++        if (f.fsNumTex != 0) {
++            uint32_t w[3] = {loadState6_0(0, ST6_SHADER, SS6_INDIRECT, SB6_FS_TEX, f.fsNumSamp), CP_LOAD_STATE6_1_EXT_SRC_ADDR(uint32_t(table + kFsTexSampAt)),
+                              CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI(uint32_t((table + kFsTexSampAt) >> 32))};
+             stream.packet(CP_LOAD_STATE6_FRAG, w, 3);
+             reg64(stream, REG_A6XX_SP_FS_TEX_SAMP, table + kFsTexSampAt);
+-            uint32_t t[3] = {loadState6_0(0, ST6_CONSTANTS, SS6_INDIRECT, SB6_FS_TEX, fsTex.numTex), CP_LOAD_STATE6_1_EXT_SRC_ADDR(uint32_t(table + kFsTexConstAt)),
++            uint32_t t[3] = {loadState6_0(0, ST6_CONSTANTS, SS6_INDIRECT, SB6_FS_TEX, f.fsNumTex), CP_LOAD_STATE6_1_EXT_SRC_ADDR(uint32_t(table + kFsTexConstAt)),
+                              CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI(uint32_t((table + kFsTexConstAt) >> 32))};
+             stream.packet(CP_LOAD_STATE6_FRAG, t, 3);
+             reg64(stream, REG_A6XX_SP_FS_TEX_CONST, table + kFsTexConstAt);
+         }
+-        reg(stream, REG_A6XX_SP_FS_TEX_COUNT, fsTex.numTex);
++        reg(stream, REG_A6XX_SP_FS_TEX_COUNT, f.fsNumTex);
+     }
+     // 10c. the VS's, the same group by CP_LOAD_STATE6_GEOM into SB6_VS_TEX (fd6_texture.cc's VS_TEX); its count as well
+     // written 0 without textures, so that no earlier owner's stays
+-    if (o.vsTextures) {
+-        if (vsTex.numTex != 0) {
+-            uint32_t w[3] = {loadState6_0(0, ST6_SHADER, SS6_INDIRECT, SB6_VS_TEX, vsTex.numSamp), CP_LOAD_STATE6_1_EXT_SRC_ADDR(uint32_t(table + kVsTexSampAt)),
++    if ((g & kGVsTex) && o.vsTextures) {
++        if (f.vsNumTex != 0) {
++            uint32_t w[3] = {loadState6_0(0, ST6_SHADER, SS6_INDIRECT, SB6_VS_TEX, f.vsNumSamp), CP_LOAD_STATE6_1_EXT_SRC_ADDR(uint32_t(table + kVsTexSampAt)),
+                              CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI(uint32_t((table + kVsTexSampAt) >> 32))};
+             stream.packet(CP_LOAD_STATE6_GEOM, w, 3);
+             reg64(stream, REG_A6XX_SP_VS_TEX_SAMP, table + kVsTexSampAt);
+-            uint32_t t[3] = {loadState6_0(0, ST6_CONSTANTS, SS6_INDIRECT, SB6_VS_TEX, vsTex.numTex), CP_LOAD_STATE6_1_EXT_SRC_ADDR(uint32_t(table + kVsTexConstAt)),
++            uint32_t t[3] = {loadState6_0(0, ST6_CONSTANTS, SS6_INDIRECT, SB6_VS_TEX, f.vsNumTex), CP_LOAD_STATE6_1_EXT_SRC_ADDR(uint32_t(table + kVsTexConstAt)),
+                              CP_LOAD_STATE6_2_EXT_SRC_ADDR_HI(uint32_t((table + kVsTexConstAt) >> 32))};
+             stream.packet(CP_LOAD_STATE6_GEOM, t, 3);
+             reg64(stream, REG_A6XX_SP_VS_TEX_CONST, table + kVsTexConstAt);
+         }
+-        reg(stream, REG_A6XX_SP_VS_TEX_COUNT, vsTex.numTex);
++        reg(stream, REG_A6XX_SP_VS_TEX_COUNT, f.vsNumTex);
+     }
+     // 11. the vertex fetch with no attributes (tu6_emit_vs, tu_shader.cc:1902-1967; fd6 emit_vs_system_values,
+     // fd6_program.cc:510-556): PC/VFD_MULTIVIEW_CNTL 0, VFD_CONTROL_0 0 (no fetches, no decodes), VFD_CONTROL_1 with the
+@@ -1828,7 +1993,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     // With [[stage_in]] attributes: VFD_CONTROL_0 counts them, the decode and destination tables follow by attribute,
+     // each used fetch by Metal buffer index (BASE, SIZE to the bound end, STRIDE); the 32 fetch sizes were zeroed at the
+     // batch start, so an unused fetch reads nothing (fd6_emit.cc:1056-1059).
+-    if (o.vfd) {
++    if ((g & kGVfdStatic) && o.vfd) {
+         reg(stream, REG_A6XX_PC_MULTIVIEW_CNTL, 0);
+         reg(stream, REG_A6XX_VFD_MULTIVIEW_CNTL, 0);
+         regs(stream, REG_A6XX_VFD_CONTROL_0,
+@@ -1836,14 +2001,18 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+               vfdControl1(vs.vertexIdRegid, vs.instanceIdRegid, kRegidNone, kRegidNone), vfdControl2None(), vfdControl3None(), vfdControl4None(),
+               vfdControl5None(), 0});
+         if (fetch.count != 0) {
+-            std::vector<uint32_t> dec, dst;
++            uint32_t dec[2 * kMaxVertexAttributes], dst[kMaxVertexAttributes];
+             for (uint32_t loc = 0; loc < fetch.count; loc++) {
+-                dec.push_back(fetch.decode[loc]);
+-                dec.push_back(fetch.stepRate[loc]);
+-                dst.push_back(fetch.dest[loc]);
++                dec[2 * loc] = fetch.decode[loc];
++                dec[2 * loc + 1] = fetch.stepRate[loc];
++                dst[loc] = fetch.dest[loc];
+             }
+-            stream.registers(REG_A6XX_VFD_DECODE_INSTR, dec.data(), uint32_t(dec.size()));
+-            stream.registers(REG_A6XX_VFD_DEST_CNTL_INSTR, dst.data(), uint32_t(dst.size()));
++            stream.registers(REG_A6XX_VFD_DECODE_INSTR, dec, 2 * fetch.count);
++            stream.registers(REG_A6XX_VFD_DEST_CNTL_INSTR, dst, fetch.count);
++        }
++    }
++    if ((g & kGVfdDynamic) && o.vfd) {
++        if (fetch.count != 0) {
+             for (uint32_t bi = 0; bi < kMaxVertexBuffers; bi++) {
+                 if (!fetch.used[bi]) continue;
+                 regs(stream, regVfdFetchBase(bi), {uint32_t(fetch.base[bi]), uint32_t(fetch.base[bi] >> 32), fetch.size[bi], fetch.stride[bi]});
+@@ -1864,7 +2033,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     // varyings and a stale PS_REPL from the window server's RECTLIST blit would corrupt the first varying draw),
+     // PC_PS_CNTL 0, and stream-out off as tu6_setup_streamout writes it (tu_pipeline.cc:496-512; type-4 here, not
+     // CP_CONTEXT_REG_BUNCH)
+-    if (o.vpc) {
++    if ((g & kGVpc) && o.vpc) {
+         for (uint32_t i = 0; i < (link.cnt + 1) / 2; i++) {
+             const Linkage::Var& a = link.var[2 * i];
+             const bool hasB = 2 * i + 1 < link.cnt;
+@@ -1899,9 +2068,10 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     // with the same IJ bits and COORD_MASK (IJ_LINEAR_PIXEL also when the FS reads its face or its coordinate: need_size,
+     // :1747-1756), RB_RENDER_CONTROL0's UNK10 with varyings, RB_RENDER_CONTROL1 from the face/sample regids; the
+     // sample registers 0; VPC_VAR_DISABLE[0..3] = ~varmask; VPC_CNTL_0 with NUMNONPOSVAR = total_in
+-    const bool needSize = validReg(fs.faceRegid) || fs.fragcoordCompmask != 0;
+-    const uint32_t ijbits = ijBits(ij, needSize, false);
+-    if (o.fsInputs) {
++    if ((g & kGFsInputs) && o.fsInputs) {
++        const a6xx_threadsize fsThreads = fs.k.doubleThreadsize ? THREAD128 : THREAD64;
++        const bool needSize = validReg(fs.faceRegid) || fs.fragcoordCompmask != 0;
++        const uint32_t ijbits = ijBits(ij, needSize, false);
+         {
+             // with the prefetch commands after it in the same pkt4 (fd6 emit_fs_inputs, fd6_program.cc:947-971; A6XX keeps the
+             // slots in the command, no SP_FS_BINDLESS_PREFETCH_CMD)
+@@ -1936,19 +2106,19 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     // both CNTL1 copies, SP_FS_OUTPUT_REG[0] the colour register, RENDER_COMPONENTS 0xf for the one target in both
+     // copies, RB_FS_OUTPUT_CNTL0 0 (nothing but colour is written)
+     // (with MRT n and SP_FS_OUTPUT_REG[0 .. n-1] for an FS that writes n targets: the registers run on from CNTL1)
+-    if (o.fsOutputs) {
++    if ((g & kGFsOutputs) && o.fsOutputs) {
+         // (the components of a slot drawn as unwritten -- no attachment for it in this pass -- taken out of the link's)
+         uint32_t components = link.mrtComponents;
+         for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+-            if (fs.colorRegid[i] == kRegidNone) components &= ~(0xfu << (4 * i));
++            if (colorRegid[i] == kRegidNone) components &= ~(0xfu << (4 * i));
+         }
+         // (a depth written by the stage, into a pass with a depth attachment: its register, and FRAG_WRITES_Z, as
+         // tu6_emit_fs_outputs sets them for a stage writing FRAG_RESULT_DEPTH)
+         const bool fragDepth = fs.depthRegid != kRegidNone && pass.depth != nullptr;
+-        std::vector<uint32_t> out = {components, spFsOutputCntl0(fragDepth ? fs.depthRegid : kRegidNone, kRegidNone, kRegidNone, dual),
+-                                     A6XX_SP_FS_OUTPUT_CNTL1_MRT(numRt)};
+-        for (uint32_t i = 0; i < numOut; i++) out.push_back(spFsOutputReg(fs.colorRegid[i], fs.colorHalf[i] != 0));
+-        stream.registers(REG_A6XX_SP_FS_RENDER_COMPONENTS, out.data(), uint32_t(out.size()));
++        uint32_t out[3 + kMaxColorOutputs] = {components, spFsOutputCntl0(fragDepth ? fs.depthRegid : kRegidNone, kRegidNone, kRegidNone, dual),
++                                              A6XX_SP_FS_OUTPUT_CNTL1_MRT(numRt)};
++        for (uint32_t i = 0; i < numOut; i++) out[3 + i] = spFsOutputReg(colorRegid[i], fs.colorHalf[i] != 0);
++        stream.registers(REG_A6XX_SP_FS_RENDER_COMPONENTS, out, 3 + numOut);
+         regs(stream, REG_A6XX_RB_FS_OUTPUT_CNTL0, {(fragDepth ? A6XX_RB_FS_OUTPUT_CNTL0_FRAG_WRITES_Z : 0u) | (dual ? A6XX_RB_FS_OUTPUT_CNTL0_DUAL_COLOR_IN_ENABLE : 0u),
+                                                    A6XX_RB_FS_OUTPUT_CNTL1_MRT(numRt), components});
+     }
+@@ -1961,7 +2131,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     // PC_RASTER_CNTL and VPC_UNKNOWN_9107 0; point size 1 with turnip's limits; polygon offsets 0; the four shading-rate
+     // registers 0 (has_legacy_pipeline_shading_rate); GRAS_SC_CNTL for sysmem (:3351-3380); PC_PRIMITIVE_CNTL_0 0 (the
+     // first vertex provokes, no restart)
+-    if (o.rast) {
++    if ((g & kGRast) && o.rast) {
+         reg(stream, REG_A6XX_GRAS_CL_CNTL, grasClCntl());
+         reg(stream, REG_A6XX_GRAS_SU_CNTL, grasSuCntl(draw.cullMode == 1, draw.cullMode == 2, draw.winding == 0));
+         reg(stream, REG_A6XX_VPC_POLYGON_MODE, A6XX_VPC_POLYGON_MODE_MODE(POLYMODE6_TRIANGLES));
+@@ -1989,7 +2159,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     // rectangle with BR inclusive, the Z clamps znear..zfar in both GRAS and RB, the guardband from the offsets and scales
+     // (fd_calc_guardband; MAX_GB for a 64x64 viewport), the screen scissor as Metal's scissor rectangle (the whole target
+     // when none), BR inclusive (both witnesses: the fd6 'off by one' in a6xx-draw.md was spurious)
+-    if (o.viewportScissor) {
++    if ((g & kGViewport) && o.viewportScissor) {
+         const ViewportWords v = viewportWords(vp.x, vp.y, vp.width, vp.height, vp.znear, vp.zfar);
+         regs(stream, regGrasClVport(REG_A6XX_GRAS_CL_VPORT_XOFFSET, 0), {v.xoffset, v.xscale, v.yoffset, v.yscale, v.zoffset, v.zscale});
+         const uint32_t vx0 = uint32_t(std::max(0.0, std::floor(vp.x))), vy0 = uint32_t(std::max(0.0, std::floor(vp.y)));   // (clamped to the window)
+@@ -2006,7 +2176,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     // RB_MRT_CONTROL[0] the four-component write mask alone (0x780: turnip's ROP_CLEAR in the inert ROP_CODE field, not
+     // fd6's ROP_COPY), RB_MRT_BLEND_CONTROL[0] 0, the blend constant 0, the alpha test off, the depth and stencil
+     // registers 0 (EARLY_Z depth plane as r3d; pipelines with depth off write LATE_Z), Z bounds 0..1
+-    if (o.blendZsa) {
++    if ((g & kGBlendStatic) && o.blendZsa) {
+         // (ENABLE_BLEND is a mask of the targets that blend, one bit each; RB_MRT_CONTROL / BLEND_CONTROL per target)
+         reg(stream, REG_A6XX_SP_BLEND_CNTL,
+             A6XX_SP_BLEND_CNTL_ENABLE_BLEND(blendMask) | A6XX_SP_BLEND_CNTL_UNK8 | (dual ? A6XX_SP_BLEND_CNTL_DUAL_COLOR_IN_ENABLE : 0u));
+@@ -2015,6 +2185,8 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+         for (uint32_t i = 0; i < numRt; i++) {
+             regs(stream, regRbMrt(REG_A6XX_RB_MRT_CONTROL, i), {blends[i].mrtControl, blends[i].mrtBlendControl});
+         }
++    }
++    if ((g & kGBlendDynamic) && o.blendZsa) {
+         // the blend constants as floats (tu6_emit_blend_constants), RB_ALPHA_CONTROL 0 after them
+         regs(stream, REG_A6XX_RB_BLEND_RED_F32, {fui(draw.blendColor[0]), fui(draw.blendColor[1]), fui(draw.blendColor[2]), fui(draw.blendColor[3]), 0});
+         // the depth test (tu6_emit_depth_stencil, tu_pipeline.cc:3300-3332: Z_READ with the test, Z_WRITE only with it)
+@@ -2060,7 +2232,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+     // an occlusion query (turnip's emit_begin_occlusion_query, A6XX path): the word zeroed when the encoder first counts
+     // into it, then the running sample count's snapshot before the draw; after it the second snapshot, a wait for both
+     // to land, and the word += end - begin
+-    const bool counting = draw.visibilityMode != 0;
++    const bool counting = (g & kGVisibility) && draw.visibilityMode != 0;
+     const uint64_t snapshots = table + kTableVisibilityAt;
+     uint64_t result = 0;
+     if (counting) {
+@@ -2073,7 +2245,9 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+         reg64(stream, REG_A6XX_RB_SAMPLE_COUNT_ADDR, snapshots);
+         event(stream, ZPASS_DONE);
+     }
+-    if (indirect) {
++    if (!(g & kGDraw)) {
++        // (the state alone: no draw)
++    } else if (indirect) {
+         // tu_CmdDrawIndirect / tu_CmdDrawIndexedIndirect (tu_cmd_buffer.cc:6385-6423): one draw, the CP reading its
+         // words, setting VFD_INDEX_OFFSET and VFD_INSTANCE_START_OFFSET, and writing the VS's params at DST_OFF
+         const uint64_t args = draw.indirect->gpuAddress() + draw.indirectOffset;
+@@ -2117,6 +2291,27 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+         stream.packet(CP_MEM_TO_MEM, w, 9);
+         stream.packet(pm4::kWaitMemWrites, nullptr, 0);
+     }
++}
++
++// A draw, either WHOLE (its own pass: the batch start, the pass begin, the clears, the draw, the tail) or inside a pass
++// encodeBegin opened (the draw's state and the draw alone: TABLE is then the draw's own, holding only its descriptors;
++// the pass's table, which the batch start pointed the border colours at and the tail writes, is the pass's)
++bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings,
++                const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, uint8_t* tableCpu, std::string* why,
++                const Options& o, bool whole, const GmemPlan* gmem = nullptr, bool afterFetch = false) {
++    ProgramFacts pf;
++    DrawFacts f;
++    if (!drawFacts(program, pass, draw, vsBindings, fsBindings, vsProgram, fsProgram, tableCpu, why, whole, gmem, &pf, &f)) {
++        return false;
++    }
++    if (whole) {
++        passStart(stream, pf.W, pf.H, table, o);
++        // a Clear: the 2D engine fills the target before any draw state is written, as turnip's subpass begin does it;
++        // the depth attachment's Clear after it (tu_clear_sysmem_attachment, each attachment in turn)
++        clearAll(stream, pass, f.clears, table);
++        zsClears(stream, pass, table);
++    }
++    emitDraw(stream, f, program, pass, draw, vsBindings, fsBindings, vsProgram, fsProgram, table, o, gmem, afterFetch, kGAll);
+     if (whole) {
+         passTail(stream, table, o, pass.depth != nullptr);
+     }

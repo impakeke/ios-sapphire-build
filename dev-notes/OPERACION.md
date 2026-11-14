@@ -440,7 +440,6 @@ tools/perf/driver-en-uso.sh          # "DRIVER EN USO" = backboardd es cliente d
   CoreAnimation compone por software (materiales planos, blur oscuro con rayas, backboardd a varios núcleos, ninguna
   línea `fps:`). Investigacion/14, "Lo primero".
 - Sin la comprobación, ni una captura ni una medida dicen nada del driver.
-- `bundle.sh angel` restaura el binario heredado (guardado en el teléfono como `HakiosMetal.angel`).
 - La primera vez que corre un build nuevo recompila sus stages (hasta ~1 s cada uno): el primer ensayo tras instalar
   no es comparable.
 

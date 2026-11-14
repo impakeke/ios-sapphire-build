@@ -1,0 +1,198 @@
+Subject: A pass recorded both ways is recorded for tiles alone once tiles are certain
+
+Since gpu-pass a pass that may be tiled is recorded for tiles and for sysmem, and closePass chooses by what the
+pass turned out to hold (render::gmemWorth). CoreAnimation's main pass -- a hundred draws and more, tiled every
+frame -- was so written twice from its first draw to its last, the sysmem words thrown away.
+
+What gmemWorth weighs only grows as draws are added: the draws, the attachments they touch, whether one reads its
+target; and no pass loads and stores more than every attachment it has. So the choice is known to be tiles, whatever
+is still to come, from the draw at which
+- the pass has kGmemFewDraws draws and one of them reads its target, or
+- draws * the bytes touched so far >= the bar * the bytes of every attachment (which bounds gmemWorth's
+  bar * (11 (loaded + stored) - 10 cleared) <= draws * 22 touched), or
+- with kGmemByDrawsAlone, the draws reach the bar.
+From that draw the sysmem side is let go: the tiles' head goes onto the stream then, as closePass would have put it,
+and the draws after are written once. closePass notes the pass as it would have (OpenPass::tiledEarly: a heavy one
+of its kind, below the bar or not).
+
+Two things differ from before, and nothing else:
+- a draw that reads its target no longer takes a second table for the sysmem side once the choice is made, so the
+  tables after it lie elsewhere: the golden sums of what the loads name are what they were, the stream sums of the
+  scenes with fetches in tiled passes change by those addresses (B, Q, and the tests that draw so);
+- a draw that cannot be tiled arriving after the choice ends the tiled pass and opens a sysmem one, as it does in a
+  pass tiled outright; before, the whole pass fell back to its sysmem recording. The random frames hold both
+  recordings of that to each other as before (their sums change: more of those passes are tiled).
+
+drawbench, A610 constants, least of 12 frames, us a draw: S 4.75 -> 3.21, K 2.78 -> 2.04, Q 3.47 -> 2.55, U 7.1 -> 6.7.
+280 tests, golden three ways, both chips.
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/command.hpp b/hakios-metal/include/hakios-metal/command.hpp
+index a08c155..17f59c9 100644
+--- a/hakios-metal/include/hakios-metal/command.hpp
++++ b/hakios-metal/include/hakios-metal/command.hpp
+@@ -347,6 +347,9 @@ private:
+         // one the pass's draws call for, now that they are known
+         bool dual = false;
+         pm4::Stream sysStream, headGmem;
++        // (recorded both ways until its draws left no doubt that it is tiled -- render::gmemWorth's answer could no
++        // longer come out sysmem whatever the draws still to come -- and for tiles alone from then on: draw())
++        bool tiledEarly = false;
+         uint32_t clears = 0;        // the attachments a GMEM pass clears in its tiles (render::gmemClearWords), and their words
+         uint32_t clearWords[kMaxColorOutputs][4] = {};
+         uint64_t kind = 0;          // render::tuneKeyOf the pass and its ordinal in the buffer among passes of that kind
+diff --git a/hakios-metal/src/render.cpp b/hakios-metal/src/render.cpp
+index 1ce26fb..4321643 100644
+--- a/hakios-metal/src/render.cpp
++++ b/hakios-metal/src/render.cpp
+@@ -4835,6 +4835,40 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+         open_->cache->cur[1].forget();
+     }
+     if (timed) drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1) + 1));
++    // A pass recorded both ways is recorded for tiles alone from the draw at which closePass's choice can no longer
++    // come out sysmem: the choice is render::gmemWorth's over what the pass holds, and what it holds only grows --
++    // its draws, the attachments they touch, whether one reads its target -- while what a pass loads and stores is
++    // never more than every attachment it has. CoreAnimation's main pass is a hundred draws and more, tiled every
++    // frame, and each of them was written a second time for a sysmem pass that never ran. (What is on the stream is
++    // what closePass would have put there: the tiles' head now, the tiles when it closes.)
++    if (open_->dual) {
++        bool certain = false;
++        if (gmemOff_ & kGmemByDrawsAlone) {
++            certain = open_->draws >= gmemMinDraws_;
++        } else if (open_->draws >= std::min(gmemMinDraws_, render::kGmemFewDraws)) {
++            if (open_->read != 0) {
++                certain = true;   // (a draw reads its target: tiles)
++            } else {
++                uint64_t touched = 0, all = 0;
++                for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
++                    const Texture* t = i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture;
++                    if (t == nullptr) continue;
++                    const uint32_t bytes = t->info().bytesPerPixel;
++                    all += bytes;
++                    if ((gmemOff_ & kGmemEveryAttachment) || (((open_->written | open_->read | open_->clears) >> i) & 1)) touched += bytes;
++                }
++                // (gmemWorth: tiles when draws * 22 touched >= bar * (11 (loaded + stored) - 10 cleared), and that is at
++                // most bar * 22 * every attachment's bytes)
++                certain = touched != 0 && uint64_t(open_->draws) * touched >= uint64_t(gmemMinDraws_) * all;
++            }
++        }
++        if (certain) {
++            appendStream(stream_, open_->headGmem);
++            open_->sysStream.clear();
++            open_->dual = false;
++            open_->tiledEarly = true;
++        }
++    }
+     counts_.draws++;
+     if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().draws++;
+     // a stage with device buffers may write them (ldib's table is stib's): its whole table is used for writing
+@@ -5111,6 +5145,10 @@ void CommandBuffer::closePass() {
+             if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().sysmemWhy = why;
+         }
+         open_->dual = false;
++    } else if (open_->tiledEarly && !(gmemOff_ & kGmemByDrawsAlone)) {
++        // (tiled for what it holds, decided while it was being recorded: noted as above)
++        noted = std::max(noted, gmemMinDraws_);
++        belowBar = open_->draws < gmemMinDraws_;
+     }
+     if (open_->kind != 0) queue_.noteDraws(open_->kind, open_->ordinal, noted);
+     if (open_->gmem && open_->bodies.size() != 0) {
+diff --git a/hakios-metal/tests/golden/drawbench-a610.txt b/hakios-metal/tests/golden/drawbench-a610.txt
+index efa2ded..30821da 100644
+--- a/hakios-metal/tests/golden/drawbench-a610.txt
++++ b/hakios-metal/tests/golden/drawbench-a610.txt
+@@ -1,14 +1,14 @@
+ A draws 20 refused 0 submits 1 words 1417 loads 74 stream b2c12ae2aa0988ff state 711c4414f8362c2d names 22 f684cfeb98522a0b
+-B draws 20 refused 0 submits 1 words 80377 loads 1600 stream 80548e76a0cc9cfa state 0430128efbf44d05 names 19 b36f7cefbeada1b4
++B draws 20 refused 0 submits 1 words 80377 loads 1600 stream 76af53f98722d792 state 0430128efbf44d05 names 19 b36f7cefbeada1b4
+ C draws 143 refused 0 submits 1 words 353019 loads 11292 stream 87c452062c435394 state 9c9cb2b0dd5d9dd9 names 38 98f56aac1ab77b3c
+ D draws 143 refused 0 submits 1 words 8077 loads 526 stream 126cb0e0874cf315 state 613b84fbf63951c9 names 40 835694ab056b6c74
+ E draws 143 refused 0 submits 1 words 8656 loads 526 stream 15790af798f14e86 state 947ce2b970b8c58e names 41 ba9b887b4b68cbdf
+ F draws 143 refused 0 submits 4 words 353025 loads 11292 stream 0000000000000000 state 9c9cb2b0dd5d9dd9 names 53 0000000000000000 (stream and names by timing: not summed)
+ P draws 108 refused 0 submits 1 words 294978 loads 9374 stream 945b1425df35d92e state cc8348d4426b8c39 names 35 c3093af042c23ba9
+-Q draws 108 refused 0 submits 1 words 764538 loads 13846 stream 27f8e869b34d4a35 state 30866338866615f1 names 33 37f50ff140aa3202
++Q draws 108 refused 0 submits 1 words 764538 loads 13846 stream d698bc618ddb8101 state 30866338866615f1 names 32 6523c5c8bc6933c2
+ R draws 108 refused 0 submits 1 words 4939 loads 432 stream acf5e230f050aa3e state f90a178aa327c3f2 names 34 1745727537486b27
+ G draws 1 refused 0 submits 1 words 602 loads 4 stream 70b09a33bff42227 state f7616e282bf666a6 names 6 5fa93d36f82a0959
+ H draws 1 refused 0 submits 1 words 654 loads 4 stream 03f40241a9bc8e8f state f7616e282bf666a6 names 6 5fa93d36f82a0959
+ J draws 20 refused 0 submits 1 words 1508 loads 76 stream 000c0e69e22f980d state 57cf1cdb921b5d8b names 29 e691fe78504f6547
+-K draws 110 refused 0 submits 1 words 1076337 loads 20540 stream 8310683cd3b80a64 state a942c0d9e9c42add names 43 16baf0bd0ce02d8d
++K draws 110 refused 0 submits 1 words 1076337 loads 20540 stream b2756b1fb08745b9 state a942c0d9e9c42add names 43 16baf0bd0ce02d8d
+ L draws 110 refused 0 submits 1 words 5953 loads 404 stream 1100c23193797e7b state 32718647260908a1 names 42 edf0cac69d2bc050
+diff --git a/hakios-metal/tests/golden/drawbench-a635.txt b/hakios-metal/tests/golden/drawbench-a635.txt
+index b5534d3..49b90aa 100644
+--- a/hakios-metal/tests/golden/drawbench-a635.txt
++++ b/hakios-metal/tests/golden/drawbench-a635.txt
+@@ -1,14 +1,14 @@
+ A draws 20 refused 0 submits 1 words 1417 loads 74 stream 6de28c2564e9cb52 state 711c4414f8362c2d names 22 f684cfeb98522a0b
+-B draws 20 refused 0 submits 1 words 24497 loads 480 stream 7169ca0f18e56ee7 state 6c80f302a507f225 names 19 b36f7cefbeada1b4
++B draws 20 refused 0 submits 1 words 24497 loads 480 stream e4b1589eecbe6407 state 6c80f302a507f225 names 19 b36f7cefbeada1b4
+ C draws 143 refused 0 submits 1 words 107523 loads 3396 stream c30021da1311320c state 624f8ea5d784f2a9 names 38 98f56aac1ab77b3c
+ D draws 143 refused 0 submits 1 words 8077 loads 526 stream dee0f846eccc6025 state 613b84fbf63951c9 names 40 835694ab056b6c74
+ E draws 143 refused 0 submits 1 words 8656 loads 526 stream 89ba1522fc6c7286 state 947ce2b970b8c58e names 41 ba9b887b4b68cbdf
+ F draws 143 refused 0 submits 4 words 107529 loads 3396 stream 0000000000000000 state 624f8ea5d784f2a9 names 53 0000000000000000 (stream and names by timing: not summed)
+ P draws 108 refused 0 submits 1 words 89548 loads 2834 stream e2c16b041fc6d7ef state 2ff3d91466057b71 names 35 c3093af042c23ba9
+-Q draws 108 refused 0 submits 1 words 231508 loads 4186 stream 8e786f4c0fbf6aa8 state 58d2ca365c8c5f85 names 33 37f50ff140aa3202
++Q draws 108 refused 0 submits 1 words 231508 loads 4186 stream 986983411575be5c state 58d2ca365c8c5f85 names 32 6523c5c8bc6933c2
+ R draws 108 refused 0 submits 1 words 4939 loads 432 stream 6d4ca98398d1275f state f90a178aa327c3f2 names 34 1745727537486b27
+ G draws 1 refused 0 submits 1 words 602 loads 4 stream d18aa5cbb430bc42 state f7616e282bf666a6 names 6 5fa93d36f82a0959
+ H draws 1 refused 0 submits 1 words 654 loads 4 stream a2837c99c813e12e state f7616e282bf666a6 names 6 5fa93d36f82a0959
+ J draws 20 refused 0 submits 1 words 1508 loads 76 stream 8aaeef18eb048fa8 state 57cf1cdb921b5d8b names 29 e691fe78504f6547
+-K draws 110 refused 0 submits 1 words 300385 loads 5720 stream 002cda4cd5d76234 state 7299c20495231099 names 43 16baf0bd0ce02d8d
++K draws 110 refused 0 submits 1 words 300385 loads 5720 stream 7d20451085bdb274 state 7299c20495231099 names 43 16baf0bd0ce02d8d
+ L draws 110 refused 0 submits 1 words 5953 loads 404 stream f2223875097b5abe state 32718647260908a1 names 42 edf0cac69d2bc050
+diff --git a/hakios-metal/tests/golden/tests-a610.txt b/hakios-metal/tests/golden/tests-a610.txt
+index 63095f4..8e7188f 100644
+--- a/hakios-metal/tests/golden/tests-a610.txt
++++ b/hakios-metal/tests/golden/tests-a610.txt
+@@ -139,10 +139,10 @@ a_programs_state_is_kept_by_the_queue_from_one_command_buffer_to_the_next submit
+ a_program_made_by_hand_and_changed_in_place_is_drawn_as_it_is_now submits 1 words 760 draws 4 loads 8 stream 3124737029797cdf state 1b6f8d91e4c1b5b5 names 4 82e9056f7ae1d6e6
+ a_program_changed_by_the_c_interface_is_another_program_to_a_draw submits 1 words 882 draws 9 loads 18 stream 7ad80caa8188a98b state 3819d717c8bda6ac names 4 82e9056f7ae1d6e6
+ a_draw_its_kept_state_cannot_take_is_refused_by_name_the_long_way submits 1 words 916 draws 6 loads 21 stream 7fc53092d23928bf state 6a704e6fd77244ca names 8 2e72016e06717bd7
+-a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full submits 6 words 71974 draws 480 loads 1560 stream 75eaae3e779fd19d state 46e525014b71eef1 names 98 4f1ea5a3e689aba6
++a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full submits 6 words 71974 draws 480 loads 1560 stream 62926e8f8860944d state 46e525014b71eef1 names 98 4f1ea5a3e689aba6
+ the_groups_of_a_draw_write_registers_of_their_own submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+-       39692 draws taken, 26778 of them from a kept state; 6388 refused
+-random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 10052678 draws 81862 loads 234160 stream 4a4ee4cadc27f901 state 269b7df2f8a32025 names 39750 4388382c84d4618c
++       39692 draws taken, 26782 of them from a kept state; 6388 refused
++random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 10389910 draws 83260 loads 234586 stream 7de67292c06f939d state f506fd40253001d9 names 39812 6b9eca66a105cc5a
+ more_programs_than_a_command_buffer_has_slots_for_are_each_drawn_as_themselves submits 2 words 41800 draws 1200 loads 3000 stream cff598f3a12f1875 state 21ac3e4de18e2525 names 50 ff709ab37b62cffe
+ end_only_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ fill_id_text_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+@@ -268,7 +268,7 @@ a_fetch_in_a_corner_reads_bins_of_the_width_its_descriptor_has submits 1 words 1
+ the_queue_picks_gmem_or_sysmem_by_what_each_cost_a_target submits 3 words 1963 draws 3 loads 6 stream fc65fa1453cf2d4a state 6daed77ff6dca4f4 names 14 5bb689de53ed2224
+ gmem_for_a_pass_of_enough_draws_decided_at_its_end submits 6 words 4235 draws 11 loads 28 stream 756707daf27964a3 state 1b86c0f68d511005 names 25 fa19332ad5a24ef7
+ tiles_or_sysmem_by_what_a_pass_holds submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+-a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone submits 18 words 15538 draws 148 loads 384 stream f8ba37fe9809c324 state 54785826781f23a5 names 90 37f5855db810e49c
++a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone submits 18 words 15538 draws 148 loads 384 stream cf118119c781ab44 state 54785826781f23a5 names 90 37f5855db810e49c
+ a_pass_whose_like_was_light_is_recorded_for_sysmem_alone submits 5 words 3736 draws 32 loads 64 stream 741acb79b011181f state 179f28010791cba5 names 20 8e8d1b2d6669327e
+ a_dontcare_attachment_is_loaded_only_when_the_granules_pass_its_last_row submits 2 words 1353 draws 2 loads 4 stream 1e58b9a3b387a29f state b2db15d81d80c4dd names 8 05d20adef5c3adcc
+ a_clear_in_gmem_comes_out_as_the_fill_does submits 8 words 5302 draws 8 loads 16 stream 2cf84b6de3102d2e state 29f464ce110bdd85 names 32 17482b7bd70eb730
+diff --git a/hakios-metal/tests/golden/tests-a635.txt b/hakios-metal/tests/golden/tests-a635.txt
+index b2dd161..64eecea 100644
+--- a/hakios-metal/tests/golden/tests-a635.txt
++++ b/hakios-metal/tests/golden/tests-a635.txt
+@@ -139,10 +139,10 @@ a_programs_state_is_kept_by_the_queue_from_one_command_buffer_to_the_next submit
+ a_program_made_by_hand_and_changed_in_place_is_drawn_as_it_is_now submits 1 words 760 draws 4 loads 8 stream 17db46b630d582d5 state 1b6f8d91e4c1b5b5 names 4 82e9056f7ae1d6e6
+ a_program_changed_by_the_c_interface_is_another_program_to_a_draw submits 1 words 882 draws 9 loads 18 stream 6c62378d52407e41 state 3819d717c8bda6ac names 4 82e9056f7ae1d6e6
+ a_draw_its_kept_state_cannot_take_is_refused_by_name_the_long_way submits 1 words 916 draws 6 loads 21 stream e1fb977932e98a2d state 6a704e6fd77244ca names 8 2e72016e06717bd7
+-a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full submits 6 words 43862 draws 288 loads 936 stream 499117edf8cd3b29 state f0b3fb98a3f3d879 names 98 4f1ea5a3e689aba6
++a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full submits 6 words 43862 draws 288 loads 936 stream 8f43dc9048c32e61 state f0b3fb98a3f3d879 names 98 4f1ea5a3e689aba6
+ the_groups_of_a_draw_write_registers_of_their_own submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+-       39692 draws taken, 26778 of them from a kept state; 6388 refused
+-random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 10056614 draws 81862 loads 234160 stream 204b10b0851b3659 state 2c03e30e2fa8c885 names 39750 4388382c84d4618c
++       39692 draws taken, 26782 of them from a kept state; 6388 refused
++random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 10395798 draws 83260 loads 234586 stream 8490748c75cbce05 state 4eb3bfe1bcb9ac79 names 39812 6b9eca66a105cc5a
+ more_programs_than_a_command_buffer_has_slots_for_are_each_drawn_as_themselves submits 2 words 41800 draws 1200 loads 3000 stream 52ca32fc2f9646cd state 21ac3e4de18e2525 names 50 ff709ab37b62cffe
+ end_only_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ fill_id_text_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+@@ -268,7 +268,7 @@ a_fetch_in_a_corner_reads_bins_of_the_width_its_descriptor_has submits 1 words 1
+ the_queue_picks_gmem_or_sysmem_by_what_each_cost_a_target submits 3 words 1963 draws 3 loads 6 stream 2a2200ea517c691b state 6daed77ff6dca4f4 names 14 5bb689de53ed2224
+ gmem_for_a_pass_of_enough_draws_decided_at_its_end submits 6 words 4235 draws 11 loads 28 stream 4eae8fc58ce2a337 state 44e549e09cea1985 names 25 fa19332ad5a24ef7
+ tiles_or_sysmem_by_what_a_pass_holds submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+-a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone submits 18 words 15538 draws 148 loads 384 stream d88fabd47d1bfee4 state 287734657552d1c5 names 90 37f5855db810e49c
++a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone submits 18 words 15538 draws 148 loads 384 stream 1d9b7f4cf7f6c084 state 287734657552d1c5 names 90 37f5855db810e49c
+ a_pass_whose_like_was_light_is_recorded_for_sysmem_alone submits 5 words 3736 draws 32 loads 64 stream 4aba82bef7c44036 state 179f28010791cba5 names 20 8e8d1b2d6669327e
+ a_dontcare_attachment_is_loaded_only_when_the_granules_pass_its_last_row submits 2 words 1353 draws 2 loads 4 stream 41847c8a56cf0cf3 state b2db15d81d80c4dd names 8 05d20adef5c3adcc
+ a_clear_in_gmem_comes_out_as_the_fill_does submits 8 words 5302 draws 8 loads 16 stream 636ff9ea866da3b2 state 29f464ce110bdd85 names 32 17482b7bd70eb730
