@@ -247,3 +247,37 @@ Datos: `logs-telefono/cpu-0334-023406/muestras.txt` (las horas del archivo son l
 20 muestras de `uptime` + `ps` cada 30 s, unos 10 min, tras arrancar 0334 por la ruta R. Load de 1 min:
 4,79 en la primera muestra y **1,13-2,61** en las demás (8 núcleos). Ningún proceso dominante: cfprefsd
 6-12 %, notifyd 4-7 %, launchd ~5 %, logd ~2,5 %. Análisis y siguiente paso en 07.
+
+## M1 — Dónde se va el frame: perfil del hilo de render (2026-11-14, tarde)
+
+Kernel 0334 (`boot_a-0334.img`, ruta R), `sweetmetal=2`, `HakiosMetal` sha256 `13bbd782…` (el binario del
+repo). Carga: `swipetest.sh 5` (páginas del home a izquierda y derecha, abrir y cerrar el Centro de Control).
+Herramientas: `tools/perf/` (`thrtop`, `psamp`, `symb.py`). Datos: `research/metal/medicion/`.
+
+**Observado.**
+
+- `SWEET FB: 5 s`: 105-152 frames por ventana de 5 s durante la prueba (21-30 fps de media; la ventana
+  incluye las pausas entre gestos), 3 series.
+- `thrtop` 22 s (n=1): en backboardd, `com.apple.coreanimation.display.primary` consume 13 995 ms de usuario
+  y 2 930 ms de sistema (76,9 % de un núcleo, pausas incluidas); `render-server` 8,1 %; el proceso entero,
+  98,9 % de un núcleo. SpringBoard: hilo principal 34,2 %, proceso 47 %.
+- `psamp` del hilo `display.primary`, 20 s a 0,5 ms, n=3 (`psamp-{1,2,3}.txt`, `perfil-{1,2,3}.txt`):
+
+| Serie | Muestras | En modo usuario | HakiosMetal (self) | QuartzCore | malloc | memmove/memset | Ruta de draw de HakiosMetal (inclusive) |
+|---|---|---|---|---|---|---|---|
+| 1 | 17 958 | 90,3 % | 47,2 % | 26,8 % | 9,4 % | 8,2 % | 57,8 % |
+| 2 | 16 673 | 83,6 % | 37,5 % | 36,4 % | 10,4 % | 7,1 % | 45,6 % |
+| 3 | 17 636 | 88,1 % | 49,1 % | 27,2 % | 9,4 % | 6,9 % | 60,0 % |
+
+  (porcentajes de las cuatro columnas centrales y de la última: sobre las muestras en modo usuario).
+- Serie 1, inclusivo: `-[HakiosMetalRenderCommandEncoder hakiosDraw:…]` 57,8 % → `CommandBuffer::draw`
+  45,4 % → `render::encodeDraw` 24,1 % (8,8 % self), `appendDeduped` 10,1 % (7,1 % self),
+  `bindArgumentBuffers` 3,4 %, `programAddress` 2,3 %, `stageTextures` 2,2 %; `checkTarget`, `checkStage`,
+  `link`, `vertexFetch`, `pushedRanges` en torno al 1 % cada una. `Texture::replace` 1,6 %; `commit` 1,3 %.
+- Las muestras detenidas en una llamada al kernel son el 10-16 %; las que entran por IOKit (submit y
+  esperas de la GPU), el 5 % (serie 1).
+
+**Interpretación.** Durante la animación el hilo de render de CoreAnimation está saturado de CPU y la GPU
+no lo frena: el tiempo de frame lo fija el coste de CPU por draw del driver Metal (codificar el estado
+completo de cada draw y deduplicarlo contra una sombra de registros, validaciones, enlace y asignaciones
+de memoria por draw). El número de draws por frame no está medido aún.
