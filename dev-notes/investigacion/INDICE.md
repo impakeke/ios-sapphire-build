@@ -1,7 +1,7 @@
 # Investigación de iOS en sapphire — índice
 
 Investigación detrás de los arreglos de USB y UFS del fork (parches 0329-0334) y del trabajo de gráficos
-(parches 0336-0350, driver Metal). Todo lo que hay aquí es
+(parches 0336-0352, driver Metal). Todo lo que hay aquí es
 **observación medida** (03), **fuente primaria citada** (02) o **auditoría fechada** de lo heredado (01, 04).
 Cómo operar el teléfono: [../OPERACION.md](../OPERACION.md).
 
@@ -31,11 +31,14 @@ Cómo operar el teléfono: [../OPERACION.md](../OPERACION.md).
 8. **Kernel de la presentación y del submit** (0339-0342; 03 M7; 15): con la cola `kern.sweet_fb_queue=1` ningún frame
    se pisa (10,6 % → 0) y con `kern.sweet_gpu_flush=1` la limpieza de caché por submit pasa de 1,70 a 0,01 ms. La línea
    `SWEET FB: 5 s … N by the GPU` cuenta swaps, no frames mostrados, y sus tiempos salen a 0 con `sweetfb_scale=2` (09).
-9. **CPU:** XNU vaciaba la L2 del cluster A73 antes de cada WFI (16 §4). Con `kern.sweet_idle_cache=0` (0344) el
+9. **CPU:** XNU vaciaba la L2 del cluster A73 antes de cada WFI (16 §4). Con `kern.sweet_idle_cache=0` (0344; 0351, sin probar, lo hace el valor por defecto) el
    driver baja de 62-68 a 25-26 µs por draw y los command buffers por segundo pasan de 29,6-31,6 a 44,0-46,9 (n=2,
    03 M10). En XNU las CPU 0-3 son los A73 y las 4-7 los A53, al revés que en Linux (16 §1; 03 M8).
-10. **El límite es ahora la GPU:** 23-27 ms de commit a fin por frame (03 M10). Siguiente: "Gráficos: siguiente
-    trabajo" abajo.
+10. **Ningún recurso está saturado:** por frame, la GPU trabaja 8,3 ms dibujando y 4,15 ms en la copia escalada al
+    panel (12,5 ms, medidos con su propio contador), y el hilo de render gasta ~13,7 ms de CPU y espera su tick el
+    23 % del tiempo (n=1, 03 M11). De commit a fin pasan 23-27 ms (03 M10): es latencia con colas, no tiempo de GPU.
+    Lo que fija los frames por segundo es cómo se encadenan CPU, GPU, copia y presentación. Siguiente: "Gráficos:
+    siguiente trabajo" abajo.
 
 ## Reglas para agentes
 
@@ -53,7 +56,7 @@ Cómo operar el teléfono: [../OPERACION.md](../OPERACION.md).
 |---|---|---|
 | 01 | [01-auditoria-sweet_usb.md](01-auditoria-sweet_usb.md) | Auditoría del driver USB post-0328: mecanismo del fallo bajo carga con números de línea, 16 defectos, tabla de afirmaciones, diseño corregido e instrumentación |
 | 02 | [02-fuentes-primarias-dwc3-abl.md](02-fuentes-primarias-dwc3-abl.md) | Fuentes primarias: Linux/U-Boot dwc3, código y binarios de ABL, PHY femto, DT de khaje, erratas |
-| 03 | [03-experimentos-y-datos.md](03-experimentos-y-datos.md) | Bitácora de mediciones en el teléfono: USB y UFS (E0-E7), muestreo de CPU y gráficos (M1-M10) |
+| 03 | [03-experimentos-y-datos.md](03-experimentos-y-datos.md) | Bitácora de mediciones en el teléfono: USB y UFS (E0-E7), muestreo de CPU y gráficos (M1-M11) |
 | 04 | [04-auditoria-documentacion-heredada.md](04-auditoria-documentacion-heredada.md) | Auditoría del resto de docs: arranque/recovery, **seguridad** (hash en spwd.db, .supdate root sin firma, shell 2323), qué funciona, reproducibilidad, licencias, riesgos |
 | 05 | [05-parche-0330-ruta-de-datos.md](05-parche-0330-ruta-de-datos.md) | Parche 0330: ruta de datos v2 — diseño, invariantes, verificación, riesgos, boot-args del A/B |
 | 06 | [06-parche-0334-ufs-raw-io.md](06-parche-0334-ufs-raw-io.md) | Parche 0334: panic de `sweet_ufs` en E/S cruda (memcpy del kernel a una VA de usuario vía physio), arreglo con `uiomove` |
@@ -68,7 +71,7 @@ Cómo operar el teléfono: [../OPERACION.md](../OPERACION.md).
 | 15 | [15-kernel-cache-y-presentacion.md](15-kernel-cache-y-presentacion.md) | Kernel: parches 0339-0342 (limpieza de caché por cuenta, cola de presentación, TLB, caché de BOs); `SwapEnd` no presentaba en su hilo |
 | 16 | [16-planificador-e-hilos.md](16-planificador-e-hilos.md) | Planificador, hilos y caché de los A73: topología en XNU, dónde corren los hilos de un frame, la L2 vaciada antes de cada WFI (0344, 0351), despertares de hilos del kernel |
 | 17 | [17-gpu-escalado-termica-ddr.md](17-gpu-escalado-termica-ddr.md) | GPU: parches 0343 y 0345-0348 (relojes y temperaturas, cambio de nivel en caliente, gobernador, voto del DDR, clock gating); DDR y temperaturas medidas frente a Android |
-| 18 | [18-display-scanout-directo.md](18-display-scanout-directo.md) | Display: qué hace el port con el DPU y scanout directo con el escalador del VIG0 (en el repo, 0349 y 0350; el informe los llama 0347 y 0348). **En curso** |
+| 18 | [18-display-scanout-directo.md](18-display-scanout-directo.md) | Display: qué hace el port con el DPU y scanout directo con el escalador del VIG0 (en el repo, 0349, 0350 y las correcciones de 0352; el informe llama 0347 y 0348 a los dos primeros). **En curso** |
 | 19 | [19-como-dibuja-ios.md](19-como-dibuja-ios.md) | Cómo dibuja iOS: el camino de un frame, el contrato de CoreAnimation con Metal, no conformidades del driver y diagnóstico de los fallos visibles. **En curso** |
 | — | [../../GPU-ROADMAP.md](../../GPU-ROADMAP.md) | Gráficos: estado y plan, en inglés |
 | — | [../../tools/perf/README.md](../../tools/perf/README.md) | Herramientas de medición: perfil de hilos, contadores del driver, arnés A/B, frecuencia de la GPU, capturas |
@@ -114,13 +117,16 @@ correcto y se arregla en el driver o en el kernel (19); Metal sobre Vulkan (Turn
 compilar, instalar, comprobar y medir: [../OPERACION.md](../OPERACION.md) §9. Objetivo: 120 Hz en el panel (8,33 ms
 por frame).
 
-1. **La GPU es el límite: 23-27 ms por frame** (03 M10). Repartirlos (CP, coste por tile, pasadas en sysmem, píxeles)
-   con `metal_fps=passes`/`timeline` y terminar la elección GMEM/sysmem (14 §8), n≥3.
+1. **Ritmo del frame:** 12,5 ms de GPU (8,3 dibujando + 4,15 de copia al panel) y ~13,7 ms de CPU del hilo de render
+   por frame, por encima de los 8,33 ms de 120 Hz y por debajo de dos refrescos (03 M11, n=1). Quitar la copia (punto
+   4), bajar los 8,3 ms de GPU (`metal_fps=passes`/`timeline`, elección GMEM/sysmem, 14 §8) y el coste de QuartzCore y
+   del driver en el hilo de render; medir cómo se encadenan con n≥3.
 2. **Incidencia con el gobernador y la GPU a 1260 MHz** (SIGBUS de SpringBoard, fondo con bloques descolocados; n=1,
    sin causa; 03 M10): repetir con cada factor por separado (1260 MHz fijos, gobernador, `kern.sweet_idle_cache=0`).
 3. **0351**, el arreglo definitivo de la L2 (nada antes de WFI por defecto y el límite correcto en los bucles por
-   set/way): escrito y comprobado con `git apply` en `research/metal/hilos/`, sin integrar (16 §5.1).
-4. **Scanout directo** (0350, `kern.sweet_fb_scanout`): integrado y sin probar en el teléfono (18).
+   set/way): en la serie (run de CI 43635044868 con 0351 y 0352), sin probar en el teléfono (16 §5.1).
+4. **Scanout directo** (0350 con las correcciones de 0352, `kern.sweet_fb_scanout`; `kern.sweet_fb_flush_taken`):
+   quita los 4,15 ms de copia por frame; en la serie, sin probar en el teléfono (18).
 5. **Calor:** iOS está ~20 °C por encima de Android en reposo (17 §4.4); los hilos del kernel que sondean despiertan a
    los A73 3600-4100 veces por segundo (16 §1 punto 7, §5.2); `CalendarWidgetExtension` gira al 57-100 % de un núcleo
    (03 M5; 17 §4.2). Después, el voto del DDR (0347) y el clock gating (0348), sin probar en el teléfono (17 §11).
