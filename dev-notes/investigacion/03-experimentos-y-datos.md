@@ -585,3 +585,24 @@ Kernel 0352 a 820 MHz, driver `merge-3` cargado.
 
 **Interpretación.** Fuera del servidor de ventanas ningún proceso tiene Metal, cuando en iOS toda aplicación cuenta
 con él. El bucle del widget de Calendario no depende de Metal; su causa está sin establecer (20).
+
+## M14 — Traza de frames reales: home y apertura de una app (2026-11-14)
+
+Kernel 0352 a 820 MHz; bundle de traza `rebuild/out/trace-merge` (el driver de `merge-1` con `metal_trace=frame`,
+de 19), cargado. Capturas en `research/metal/ios-graficos/trace/capturas/`: `metal-trace-2079-1.txt` (home, 12
+command buffers, con un deslizamiento corto) y `metal-trace-2079-2.txt` (abrir Tiempo desde el home, 90), con
+`informe-home.md` e `informe-abrir-app.md` (`trace-frame.py`). Después queda instalado `merge-3`.
+
+**Observado en el home.**
+
+- Un frame es un command buffer con una pasada (`assembly-encoder`) de 106-107 draws sobre la superficie de pantalla
+  de 750×1624 BGRA8, alternando dos superficies; 11,3-11,7 ms de GPU, en 78 tiles. Los frames con contenido nuevo
+  llevan además 5-10 pasadas pequeñas (`offscreen-encoder`, 64×64 y 180×73) y suman 122-150 draws.
+- Con la pantalla quieta se dibuja un frame cada 100 ms.
+- Toda pasada lleva un segundo colour attachment (`c1`). Lo que queda en él no lo lee ninguna pasada posterior.
+- En cada pasada principal hay un draw que el driver no sirve (`106 (+1 no)`).
+- Programas más usados: `CA.draw.PBGRABsovXm_TimgA2Xhf_Isrc` (25 draws), `…_Ialp` (19).
+
+**Interpretación.** `c1` es la memoria de trabajo de la pasada (según el agente del driver, memoryless y sin carga
+ni almacenamiento: no mueve memoria, pero al ocupar sitio en GMEM deja bins de 128×128 y 78 tiles en vez de 42).
+El draw sin servir por frame y la causa del redibujado a 10 Hz en reposo están sin identificar.
