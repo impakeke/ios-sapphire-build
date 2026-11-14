@@ -2,7 +2,7 @@
 
 What draws the screen on sapphire today, what is measured, and the work that is left. The evidence is in
 [`dev-notes/investigacion/`](dev-notes/investigacion/INDICE.md): the lab log
-[03](dev-notes/investigacion/03-experimentos-y-datos.md) (entries M1-M10) and the reports 08-19. How to build,
+[03](dev-notes/investigacion/03-experimentos-y-datos.md) (entries M1-M11) and the reports 08-19. How to build,
 install and measure: [`dev-notes/OPERACION.md`](dev-notes/OPERACION.md) §9. The dated log is `NOTES.md`.
 
 ## 1. How a frame reaches the panel
@@ -64,7 +64,9 @@ Home-screen page swipes (`tools/perf/homeswipe.sh 8`), driver `merge-1` loaded a
 | DDR under iOS | 1555.2 MHz (7/7); nothing votes the bus | report [17](dev-notes/investigacion/17-gpu-escalado-termica-ddr.md) §4.3; 03 M10 |
 | Command buffers a second, 820 MHz, `kern.sweet_idle_cache=0` | 44.0-46.9 (n=2); 48.0 at 1260 MHz (n=1) | 03 M10 |
 | CPU per draw on the render thread | 25-26 µs (n=2); 62-68 µs with the cache maintenance before WFI (n=2); 142 µs for the base bundle before `cpu-draw` (n=1) | 03 M9, M10 |
-| GPU time per command buffer (commit → end) | 26.7-27.6 ms at 820 MHz (n=2), 23.0 ms at 1260 MHz (n=1): **the GPU is the limit** | 03 M10 |
+| Commit → end of a command buffer (latency, queueing included) | 26.7-27.6 ms at 820 MHz (n=2), 23.0 ms at 1260 MHz (n=1) | 03 M10 |
+| GPU busy time, from the GPU's own counter (`kern.sweet_gpu_marks=1`), 820 MHz | 8.3 ms per driver submit on average, plus 4.15 ms for the kernel's scaled copy to the panel: 12.5 ms per frame, a third of it the copy (n=1) | 03 M11 |
+| Render thread (backboardd), same run | ~13.7 ms of CPU per frame (QuartzCore ~7.2, driver ~3.4); 23 % of its time waiting for its next tick: no longer saturated (n=1) | 03 M11 |
 | Main compositor pass | ~22 ms in 102 tiles (base) → 13.3-13.5 ms in 78 tiles (`gpu-pass`) at 820 MHz (n=1) | 03 M9; 14 |
 | Frames drawn and never shown | 10.6 % → 0 with the presentation queue (0340) | 03 M7; report [15](dev-notes/investigacion/15-kernel-cache-y-presentacion.md) |
 | Cache maintenance per submit | 1.70 ms → 0.01 ms with the surface account (0339) | 03 M7; 15 |
@@ -74,7 +76,7 @@ Kernel findings behind those numbers:
 
 - **CPU.** Before every WFI, XNU cleaned and invalidated by set/way the core's L1 and also the A73 cluster's shared
   L2; the cluster idles thousands of times a second, so its 2 MB L2 held almost nothing. `kern.sweet_idle_cache=0`
-  (0344) removes it: 62-68 → 25-26 µs per draw and +50 % command buffers a second (report
+  (0344; 0351 makes 0 the default) removes it: 62-68 → 25-26 µs per draw and +50 % command buffers a second (report
   [16](dev-notes/investigacion/16-planificador-e-hilos.md) §4; 03 M10). In XNU the logical CPUs 0-3 are the A73 and
   4-7 the A53, the reverse of Linux (16 §1).
 - **Presentation.** `SwapEnd` did not present in its thread; the 120 Hz timer did, and a frame whose copy was still
@@ -111,14 +113,16 @@ Inherited claims that do not hold:
 In order; the list the agents keep current is in
 [`INDICE.md`](dev-notes/investigacion/INDICE.md) ("Gráficos: siguiente trabajo").
 
-1. **GPU time per frame (23-27 ms).** Separate where it goes (CP, per-tile cost, sysmem passes, pixels) with the
-   driver's `metal_fps=passes`/`timeline` and finish the GMEM/sysmem choice (14 §8).
+1. **Pacing.** No single resource is saturated now: per frame the render thread spends ~13.7 ms of CPU and the GPU
+   12.5 ms (8.3 drawing, 4.15 copying to the panel), above the 8.33 ms of 120 Hz and below two refreshes; what
+   sets the frame rate is how CPU, GPU, copy and presentation chain (03 M11). Next: remove the copy (item 4), and
+   cut the GPU's 8.3 ms with the driver's `metal_fps=passes`/`timeline` and the GMEM/sysmem choice (14 §8).
 2. **Incidents at 1260 MHz with the governor on** (SpringBoard SIGBUS, wallpaper with misplaced blocks; n=1, no
    cause established): repeat with each factor alone (1260 MHz fixed, governor, `kern.sweet_idle_cache=0`) (03 M10).
-3. **0351**, the lasting L2 fix (nothing before WFI by default, the right bound in the set/way loops), written and
-   checked with `git apply`, not in the series (16 §5.1).
-4. **Direct scanout** (0350, `kern.sweet_fb_scanout`): the display engine scales the surface itself and the GPU copy
-   disappears; in the series, never switched on (18).
+3. **0351**, the lasting L2 fix (nothing before WFI by default, the right bound in the set/way loops): in the
+   series, not yet tried on the phone (16 §5.1).
+4. **Direct scanout** (0350, with 0352's fixes; `kern.sweet_fb_scanout`): the display engine scales the surface
+   itself and the 4.15 ms GPU copy per frame disappears; in the series, never switched on (18).
 5. **Heat:** iOS sits ~20 °C above Android at rest; kernel threads that poll keep the A73 cluster waking 3600-4100
    times a second (16 §1 point 7); `CalendarWidgetExtension` spins at ~57-100 % of a core (03 M5; 17 §4.2). Then the
    DDR vote (0347) and clock gating (0348).
