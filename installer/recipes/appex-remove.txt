@@ -8,7 +8,6 @@
 /System/Library/AppPlaceholders/Stocks.app/PlugIns/StocksDetailIntents.appex
 /System/Library/AppPlaceholders/Weather.app/PlugIns/WeatherWidget.appex
 /System/Library/CoreServices/AegirProxyApp.app/PlugIns/AegirPoster.appex
-/System/Library/PrivateFrameworks/CalendarWidget.framework/PlugIns/IntentsExtension.appex
 /System/Library/PrivateFrameworks/EmojiPoster.framework/PlugIns/EmojiPosterExtension.appex
 /System/Library/PrivateFrameworks/MacinTalk.framework/PlugIns/MacinTalkAUSP.appex
 /System/Library/PrivateFrameworks/MobileTimer.framework/PlugIns/MobileTimerIntents.appex

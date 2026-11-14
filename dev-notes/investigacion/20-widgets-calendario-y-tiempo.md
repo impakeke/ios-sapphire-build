@@ -19,8 +19,9 @@ traza `kd-e.*`, `thrsched-*`, pilas `wx-e-*`, `adid.*`, `weatherd.*`, base de ch
    timeline(for:with:completion:)» y devuelve el error CHS 1101 («Returned view collection was either nil or
    empty»). chronod reintenta una vez, marca el timeline como fallido y lo pinta vacío (§2). La definición del intent
    la publica `CalendarWidget.framework/PlugIns/IntentsExtension.appex`, la extensión que nombra el
-   `INIntentsExtensionBundleIdentifier` del widget, y el port la quita al instalar (`installer/recipes/appex-remove.txt`)
-   y en `tools/sapphire-clean-base.sh`. Causa demostrada en el log; que reponerla lo arregle es [H] hasta probarlo.
+   `INIntentsExtensionBundleIdentifier` del widget, y el port la quitaba al instalar (`installer/recipes/appex-remove.txt`)
+   y en `tools/sapphire-clean-base.sh`. **Repuesta y verificada** (§6): con la extensión del IPSW en su sitio, el widget
+   tiene intent, el timeline se recarga con 3 entradas y el home muestra «SATURDAY 14 / No events today».
 2. **El giro de la extensión de Calendario es trabajo real repetido, no un bucle infinito.** chronod pide los
    placeholders de las 10 combinaciones de widget y tamaño (`getPlaceholders`) con un watchdog de ~15 s. La extensión
    tarda 25-30 s en renderizarlos y archivarlos; chronod cancela la sesión a los ~15 s, descarta el resultado y vuelve
@@ -37,6 +38,7 @@ traza `kd-e.*`, `thrsched-*`, pilas `wx-e-*`, `adid.*`, `weatherd.*`, base de ch
    «Mescal Failed», «Failed to fetch hardware info» (n=1); en otros 4 intentos el log se corta tras «Starting to
    generate JWT token request». chronod corta cada `getTimelines` a los ~30 s y reintenta. En este port fairplayd.H2
    no corre: lo sustituye `fpstub`, que contesta MIG_SERVER_DIED a todo (§4).
+6. **Generalización:** lo que el port quita o sustituye del sistema, con qué se rompe y qué devolver, está en 21.
 
 ## 1. Cómo se observa
 
@@ -85,16 +87,16 @@ evaluación sin contenido; todas sus condiciones de seguridad dan permiso y no e
 - `CalendarWidgetExtension.appex/Info.plist`: `INIntentsExtensionBundleIdentifier =
   com.apple.CalendarWidget.IntentsExtension`, `IntentsSupported = [EKUICalendarsIntent,
   NextEventComplicationConfigurationIntent]`. El bundle de la extensión no contiene ningún `.intentdefinition`.
-- La definición está en `CalendarWidget.framework/Base.lproj/CalendarWidgetIntents.intentdefinition`, y la extensión
-  de intents que la sirve sería `CalendarWidget.framework/PlugIns/IntentsExtension.appex`: en el teléfono `PlugIns/`
-  está vacío.
+- La definición la sirve `CalendarWidget.framework/PlugIns/IntentsExtension.appex`, que lleva su propio
+  `Base.lproj/CalendarWidgetIntents.intentdefinition` (manifiesto del IPSW; gemelo del de
+  `CalendarWidget.framework/Base.lproj`). En el teléfono de estas medidas `PlugIns/` estaba vacío.
 - El widget de Tiempo, que sí tiene intent, lleva su definición dentro de su propio bundle
   (`WeatherWidget.appex/Base.lproj/WeatherIntents.intentdefinition`), y SpringBoard la resuelve: «Successfully
   unarchived widget intent» para él.
-- El port quita esa extensión: `installer/recipes/appex-remove.txt` (la excluye al extraer el sistema;
-  `installer/recovery/sapphire.sh` la comenta como «widgets and speech extensions that crash-loop without Metal») y
-  `tools/sapphire-clean-base.sh` (lista `EXTENSIONS`). Que esta extensión de intents, sin interfaz, entrara en bucle
-  sin Metal no está medido en ningún sitio: es una lista de octubre aplicada en bloque.
+- Quien la quitaba era el propio port: `installer/recipes/appex-remove.txt` (excluida al extraer el sistema;
+  `installer/recovery/sapphire.sh` comenta la lista como «widgets and speech extensions that crash-loop without
+  Metal») y `tools/sapphire-clean-base.sh` (lista `EXTENSIONS`). Que esta extensión de intents, sin interfaz, entrara
+  en bucle sin Metal no está medido en ningún sitio: era una lista de octubre aplicada en bloque.
 
 **Descartado con medida.**
 - EventKit, calaccessd y TCC: la extensión lee los eventos (cientos de «NarrowEventLayout - Building view from
@@ -222,10 +224,12 @@ ausencia de fairplayd o de un identificador del dispositivo que FairPlay no encu
 denegada no es la causa: sin ella el widget usa la ciudad por defecto. Sus placeholders (18 combinaciones, ~14 s) también
 superan una vez el watchdog de `getPlaceholders` (`log-f`, 12:50:54→12:51:08).
 
-**Parpadeo [H, sin captura].** Cada recarga y cada respawn hacen que SpringBoard pase el widget a «Content state did
-change to preparing» y cambie entre la vista de snapshot y la viva (`Requested mode changed to live` / `static`), con
-el mismo contenido «No weather data». Con recargas cada ~30 s durante los reintentos y un respawn cada 1-1,5 min es la
-explicación más probable; falta una captura (`fbshot`) sincronizada con el log.
+**Parpadeo [H, sin captura].** El usuario lo ve al superponer algo al home (recientes, panel de titulares). En ese
+caso SpringBoard deja de mostrar la vista viva del widget y pone su snapshot («Will disappear», «Requested mode changed
+to static»), y al volver hace lo contrario («Requested mode changed to live», «Create caar snapshot view»); en las
+ventanas `log-g`-`log-i` no hay ningún relanzamiento de `WeatherWidget` que coincida. Apunta al cambio entre snapshot y
+vista viva en el camino de dibujo (19), no a los reintentos; las recargas de cada ~30 s durante los reintentos y los
+respawns de backboardd hacen el mismo cambio, con el mismo contenido «No weather data».
 
 ## 5. Otros informes de widgets
 
@@ -235,20 +239,25 @@ a los 6 min del arranque; no se repite en los logs de hoy.
 
 ## 6. Arreglos propuestos
 
-1. **Reponer `IntentsExtension.appex` de CalendarWidget** (causa de la pantalla en blanco). Es lo que iOS espera y el
-   port quita:
-   - Sacar `/System/Library/PrivateFrameworks/CalendarWidget.framework/PlugIns/IntentsExtension.appex` de
-     `installer/recipes/appex-remove.txt` y de la lista `EXTENSIONS` de `tools/sapphire-clean-base.sh`.
-   - En el teléfono instalado, el `.appex` no está en ningún sitio (ni en `/private/var/mobile/disabled-extensions`,
-     que no existe): hay que extraerlo del IPSW 20H392 leyendo por rangos (`tools/remotezip.py`; el método de
-     `research/metal/ios-graficos/binarios-ios-20H392.md` §1), copiarlo con su firma y dueño `root:wheel`, y que
-     LaunchServices lo registre (re-escaneo de lsd; 0156 en NOTES.md explica cuándo hace falta reconstruir la base).
-   - Verificación: tras un reinicio de chronod, SpringBoard ya no registra «No intent definitions found in extensions»
-     para `EKUICalendarsIntent`, la extensión no registra «No intent in timeline» y el timeline de
-     `CalendarUpNextWidget` termina con «succeeded with N entries»; captura del home. Vigilar además que la extensión de
-     intents no entre en bucle (la razón, sin medir, por la que se quitó).
-   Ningún paso es un workaround; ninguno toca el kernel. No se aplica desde aquí: escribe en `/System` y el registro
-   en LaunchServices puede requerir reiniciar SpringBoard.
+1. **`IntentsExtension.appex` de CalendarWidget, repuesta** (causa de la pantalla en blanco):
+   - **Origen:** el dmg raíz del IPSW 20H392 (`087-86698-044.dmg`, 4,7 GB, extraído con `tools/remotezip.py` y montado
+     de solo lectura). Su manifiesto confirma qué contiene la extensión: `Info.plist` (punto `com.apple.intents-service`,
+     `IntentsSupported = [EKUICalendarsIntent, NextEventComplicationConfigurationIntent]`), el ejecutable y
+     `Base.lproj/CalendarWidgetIntents.intentdefinition`, gemelo del de `CalendarWidget.framework/Base.lproj`. No tiene
+     interfaz ni usa Metal; sus entitlements son los de la extensión del widget.
+   - **Instalación** (14 nov, 13:03): copiada a `/System/Library/PrivateFrameworks/CalendarWidget.framework/PlugIns/`
+     con `root:wheel` y los modos del IPSW (50 entradas; sha256 del ejecutable `d0b01d37…`, idéntico al del dmg). El
+     `launchd.plist` del teléfono ya tenía su entrada en `AppExtensions`. `-[LSApplicationWorkspace registerPlugin:]`
+     se quedó esperando la respuesta de lsd más de 45 s y se cortó; lsd la registró solo en el siguiente arranque (el
+     del kernel 0353): `LSApplicationExtensionRecord` de `com.apple.CalendarWidget.IntentsExtension` con
+     `intentDefinitionURLs` = las dos intents → su `.intentdefinition`.
+   - **[M] Verificación** (`log-g`, `log-h`, `log-i` tras reiniciar solo chronod y volver al home): 0 líneas «No intent
+     definitions found», 0 «No intent in timeline», 0 errores 1101; el widget lleva identificador de intent
+     (`CalendarUpNextWidget:systemSmall:<id>`), «Cache hit; entry count: 3», «Reload success», evaluación «LIVE» y
+     siguiente recarga `timelineExhausted` a las 23:59. Captura `medicion/shots/w20-fix2-0.png`: el widget muestra
+     «SATURDAY 14 / No events today».
+   - **Repo:** la línea sale de `installer/recipes/appex-remove.txt` y de `EXTENSIONS` en `tools/sapphire-clean-base.sh`.
+   - Sigue abierto el giro de §3 (la extensión vuelve a gastar ~30-45 s en los placeholders tras cada relanzamiento).
 2. **Que el trabajo de QoS por defecto de las extensiones quepa en los plazos de chronod.** El A/B que lo decide, n≥3
    por condición, sin `killall backboardd` durante la medida: con `kern.sweet_sched=15` y `=13` (16 §3.3: 13 devuelve
    la QoS por defecto a los A73 sin diferencia medible en fps), reiniciar chronod y medir con el log a nivel por
@@ -265,7 +274,6 @@ a los 6 min del arranque; no se repite en los logs de hoy.
 
 ## 7. Abierto
 
-- Probar el arreglo 1 en el teléfono (requiere sacar el `.appex` del IPSW).
 - Medir el lote de placeholders en los A73 (arreglo 2); con eso queda demostrado o descartado que el giro sea efecto
   del reparto de `sweetsched=15`.
 - Saber qué llamada concreta de FairPlay falla en «Failed to fetch hardware info» y por qué en 4 de 5 intentos el log

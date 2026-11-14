@@ -23,7 +23,6 @@ EXTENSIONS="
 /System/Library/PrivateFrameworks/SiriTTSService.framework/PlugIns/SiriTTSSynthesizerAU.appex
 /System/Library/PrivateFrameworks/TextToSpeechKonaSupport.framework/PlugIns/KonaSynthesizer.appex
 /System/Library/PrivateFrameworks/MobileTimer.framework/PlugIns/MobileTimerIntents.appex
-/System/Library/PrivateFrameworks/CalendarWidget.framework/PlugIns/IntentsExtension.appex
 /Applications/Music.app/PlugIns/MusicWidgets.appex
 /Applications/Home.app/PlugIns/HomeWidget.appex
 /Applications/Home.app/PlugIns/HomeWidgetSingleAccessoryIntent.appex
