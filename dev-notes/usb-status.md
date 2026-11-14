@@ -15,7 +15,7 @@ Este doc es el estado *actual* y el siguiente paso. El diagnóstico profundo est
    — no aparece ⇒ **no hay pullup de D+ / no hay enumeración**, falla del lado del
    teléfono, no del host.
 3. En **fastboot** el mismo teléfono/cable/puerto SÍ enumera (`fastboot devices`
-   → `d24dbc87`) ⇒ HW USB del teléfono, cable y puerto del Mac están bien.
+   → `<serial>`) ⇒ HW USB del teléfono, cable y puerto del Mac están bien.
 4. Cambiar de cable y de puerto **no** lo destrabó.
 
 ### Interpretación

@@ -1,5 +1,10 @@
 # Acceso al teléfono en iOS: USB, shell, SSH (estado 2026-11-13)
 
+> **Actualización 2026-11-14:** con los parches 0331-0333 (UTMI como reloj PIPE, activo por
+> defecto) el USB de iOS **también enumera en arranque normal** (`set_active a` + reboot): 8/8
+> arranques normales. Ya no hace falta pasar por fastboot `continue`. SSH arranca solo (ver abajo).
+> Detalle y datos: [investigacion/03](investigacion/03-experimentos-y-datos.md) (E3, E4, E6).
+
 **Observación (n=1 por ruta, 2026-11-13):** con la misma imagen expG (0328 + shim zig), el gadget
 USB de iOS **enumeró y pasó tráfico** cuando iOS arrancó saliendo de fastboot
 (`fastboot set_active a` + `fastboot continue`). En un arranque anterior por `set_active a` +
@@ -37,14 +42,25 @@ sería inicializar el PHY nosotros.
 1. Teléfono en fastboot (Power + Vol−). En esta Mac (Hackintosh) el `fastboot` normal no ve USB:
    usar `~/adb-bridge/fbusb set_active:a continue` (cliente fastboot por IOUSBHost).
    En otra máquina: `fastboot set_active a && fastboot continue`.
-   **No usar `fastboot boot`: en este ABL brickea.**
+   Con kernel ≥ 0333 basta `set_active a` + reboot.
+   *Corregido 2026-11-14:* `fastboot boot` **no** brickea este ABL. Es solo RAM (`CmdBoot` =
+   `CmdContinue`, [investigacion/02](investigacion/02-fuentes-primarias-dwc3-abl.md) §P4). La
+   pantalla negra de la prueba del fork vino de una imagen sin la cabecera ARM64 que este ABL exige
+   (NOTES.md:466, entrada "through our own UEFI"). Si queda en negro, `fastboot reboot bootloader`
+   lo devuelve (uefi/README.md).
 2. Esperar ~30 s: aparece `1209:0001` y una interfaz `enX` nueva (MAC 02:00:5e:77:ee:01).
 3. `sudo ifconfig enX inet 192.168.7.1/24 up` → `ping 192.168.7.2`.
 4. **Shell root sin contraseña:** `nc 192.168.7.2 2323` (launchd `org.sapphire.usbshell`, solo
    escucha en 192.168.7.2).
 5. **SSH** (`Host sapphire` en `~/.ssh/config`, clave `~/.ssh/sapphire_phone`): `ssh sapphire`.
+   Solo por clave. Lo arranca el job que añadió el fork (`/redwood/launchd/com.sapphire.sshd-usb.plist`,
+   cargado por `/redwood/boot.d/70-sshd-usb.sh`; fuentes en `userland/sshd-usb/`) y escucha solo en 192.168.7.2:22
+   (investigacion/03, E6).
+6. Volver a fastboot desde iOS: `sysctl -w kern.sweet_reboot_mode=2; reboot` (por 2323 o SSH).
 
 ## Por qué SSH "habilitado por defecto" nunca funcionó
+
+*(Estado del 13 nov, antes del job `com.sapphire.sshd-usb`; se conserva como registro.)*
 
 - sshd (Procursus, `/var/jb/usr/sbin/sshd`) está instalado pero **no tiene job de launchd**,
   **no tiene claves de host** y **no hay `authorized_keys`** (el instalador de Angel las borra:

@@ -1,5 +1,54 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+> Note (2026-11-14): from the section "Agent handoff / active work (2026-10-15, latest)" down (about line 500 now), entries without the `sapphire:` prefix are about the earlier device, **sweet** (Redmi Note 10 Pro, SM7150), not sapphire.
+
+## 2026-11-14 (fork giovannipodesta): iOS USB on a normal boot, a data path that survives load (patches 0329-0334)
+
+Details, raw numbers and sources: `dev-notes/investigacion/` (`INDICE.md`; `03-experimentos-y-datos.md` for
+every measurement; `01`/`02` for the audit of `sweet_usb.c` and the primary sources; `05`/`06` for 0330 and
+0334). Phone: the fork's sapphire, `boot_a` = iOS, `boot_b` = Android (Infinity-X), iOS root on `iosroot`.
+Kernels 0329-0333 built by the `xnu-4k` workflow (macos-15, Xcode 16.0 16A242d; good run 43562358335 with
+0329, 327 patches applied; a run takes about 6-9 min).
+
+Patches:
+- 0329: read-only snapshot of the PHY, QSCRATCH, GCC and DWC3 registers at take-over (`SWEET USBDIAG`
+  lines), and the `sweetusb_reclaim` gate for 0327.
+- 0330: USB data path v2 behind `sweetusb_dp=2`: one owner per endpoint, completion only from the event (no
+  HWO reclaim), no `printf` on the data path, non-cacheable DMA.
+- 0331: UTMI selected as the PIPE clock (Linux `dwc3_qcom_select_utmi_clk`) behind `sweetusb_utmipipe=1`.
+- 0332: 0331 and 0330 on by default (boot-args turn them off). 0333: the `dp=2` default is chosen in
+  `gadget_start` instead of as the initial value.
+- 0334: `sweet_ufs` raw-device read/write without a kernel `memcpy` into user memory (`uiomove`).
+
+Observed (measured on the phone):
+- Without 0331, a normal boot (`set_active a` + reboot) did not enumerate: 0 of 3 (2026-11-13, R1, E2-R1);
+  the ring shows `ep0 cmd 0x1 timeout`. Leaving fastboot with `continue` enumerated. VBUS was present on both
+  paths.
+- E2 (same 0329 kernel on both paths): the HS PHY registers match; `gcc_usb3_prim_phy_pipe_clk` (GCC CBCR
+  0x1a058) is off on the normal path (0x80000001) and running after `continue` (0x00000001).
+- With UTMI as the PIPE clock, 8 of 8 normal boots enumerated (E3 x2, E4 x3, E6 x3; 41-44 s where timed), and
+  one boot through `continue` too (E6).
+- Load: on the old path (0327) the link died after 192 KiB, with 130 538 refused Start Transfers. On 0330,
+  20 transfers of 30 MB (10 each way) arrived with matching SHA-256; `refused 0`, `timeout 0` (one boot).
+- E5: a real panic (`Kernel data abort`, `memcpy+72` called from `sweet_ufs_strategy+604`) while a `dd` read
+  the ring through `/dev/rufsroot0`. Not related to USB. 0334 is the fix.
+- Access: iOS at 192.168.7.2 (host 192.168.7.1); unauthenticated root shell on :2323 (installed by the
+  original installer); key-only sshd from the fork's job `com.sapphire.sshd-usb` (`userland/sshd-usb/`),
+  listening only on 192.168.7.2. `sysctl -w kern.sweet_reboot_mode=2; reboot` goes back to fastboot.
+
+Hypotheses and open points (not measured):
+- Why the PIPE clock is off: ABL's source starts the USB device only inside fastboot (`02` §P4), which fits,
+  but what ABL leaves in the PHY was not obtained.
+- The "panics" seen on screen in E3's first boot are most likely the normal early xnu log, shown because a
+  command line over 575 characters makes the shim drop `sweet_splash`. E3's first boot left no record.
+- 0334 tested on the phone (03 E7): 30/30 raw reads of the log region that panicked, 16/64 MiB reads complete, EINVAL on unaligned offsets. E5 first blamed PAN; `06` shows these cores have no PAN: a kernel
+  `memcpy` faulted on a user page, which only the copyio paths can recover.
+- Small samples: n=1 boot for the load test; R/C repetitions are pending. 0333 came from a hypothesis that
+  E5 later ruled out; it is kept because it is harmless. `xbl_a` differs from `xbl_b` (iOS boots with
+  slot a's XBL): an uncontrolled variable.
+- Documentation corrected the same day from this evidence: `RECOVERY.md`, `README.md`, `AGENTS.md`,
+  `HANDOFF.md`, `docs/INSTALL.md`, the fork's `dev-notes/` and `dev-notes/release-notes-corrections.md`.
+
 ## SAPPHIRE 2026-11-08: a boot screen instead of the log (shim splash, kernel 0299)
 
 - The shim (`shim/splash.c`) puts a picture on the panel (`shim/splash/splash.png`, converted at build

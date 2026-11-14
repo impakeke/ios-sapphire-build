@@ -1,6 +1,7 @@
 # Build recipes — kernel, shim, empaquetado, flasheo
 
-Todo **desde fuente, limpio**. Probado en macOS 26 / x86_64 / Xcode 21. En otra
+Todo **desde fuente, limpio**. Probado en macOS 26 / x86_64 con Apple clang 21 / SDK 26.x de las
+Command Line Tools (las notas antiguas decían "Xcode 21", que no existe). En otra
 máquina ajusta rutas. Lo que NO va al repo (pesado / de terceros): IPSW, KDK, zig,
 binarios de Angel — ver `continuar-en-otra-maquina.md` para obtenerlos.
 
@@ -11,7 +12,8 @@ DXB = `blacktop/darwin-xnu-build`: clona el XNU de Apple, aplica `xnu/patches/*.
 `DEVELOPMENT/SWEET`, `TOPAZ_4K=1`.
 
 Requisitos:
-- **Xcode 21** (o 16; el proyecto nació con 16 — ver toolchain-findings.md).
+- **Apple clang 21 / SDK 26.x** (Command Line Tools) o Xcode 16; el proyecto nació con 16 y el CI
+  (`xnu-4k.yml`, macos-15) usa Xcode 16.0 (16A242d). Ver toolchain-findings.md.
 - **KDK 13.5** → `/Library/Developer/KDKs/KDK_13.5_22G74.kdk`
   (instalar con `sudo installer -pkg KDK_13.5_22G74.dmg/*.pkg -target /` en Terminal).
 - **ccache** (rebuilds incrementales rápidos): cableado con `base_dir` + sloppiness.
@@ -39,7 +41,7 @@ el SHA cambió (`shasum -a 256`) y que `sweet_usb.o` se recompiló.
 > rebuilds mientras no vuelvas a correr `patches`. Para generar un patch limpio de tus
 > cambios: revertir las ediciones en una copia y `diff -u` (así se hizo 0328).
 
-## 2) Shim en macOS — zig "Recipe C"  (`shim/build-mac.sh`)
+## 2) Shim en macOS — zig "Recipe C"  (`dev-notes/shim-build-mac.sh`)
 
 El shim arranca XNU (ABL → BootShim → XNU). El build original de Angel usa
 `aarch64-linux-gnu-gcc`. En macOS lo portamos a **zig cc** (clang+lld 0.13.0).
@@ -56,11 +58,13 @@ El shim arranca XNU (ABL → BootShim → XNU). El build original de Angel usa
 
 Correr:
 ```sh
-cd .../shim
-bash build-mac.sh ../shim/out/payload.bin   # payload = salida de mkpayload (paso 3)
+# el script hace `cd "$(dirname "$0")"` y espera las fuentes del shim al lado: copiarlo a shim/
+cp dev-notes/shim-build-mac.sh shim/build-mac.sh
+cd shim
+bash build-mac.sh out/payload.bin   # payload = salida de mkpayload (paso 3)
 # GATES deben dar OK: magic@56 == 41524d64 (ARM\x64) y image_size@16 == filesize
 ```
-Script completo versionado en `dev-notes/shim-build-mac.sh` (copia de referencia).
+El script está en `dev-notes/shim-build-mac.sh` (no existe `shim/build-mac.sh` en el repo).
 
 ## 3) Empaquetado — ADT + payload (tools del repo)
 
@@ -75,10 +79,17 @@ python3 tools/mkpayload.py \
 `angel.cmdline` lleva los boot-args correctos (incluye `sweetusb=…`, `sweetlog=1`, etc.).
 Guárdalo junto al ADT.
 
-## 4) Flasheo + boot  (IMPORTANTE: `fastboot boot` BRICKEA en este ABL)
+## 4) Flasheo + boot
+
+*Corregido 2026-11-14:* `fastboot boot` **no** brickea este ABL: es solo RAM (`CmdBoot` =
+`CmdContinue`, investigacion/02 §P4). La pantalla negra de la prueba v1 vino de una imagen sin la
+cabecera ARM64 (magic `ARM\x64` @56) que este ABL exige (NOTES.md:466); ver la puerta de la receta 2.
+Si queda en negro: `fastboot reboot bootloader` (uefi/README.md). Para probar un kernel sin tocar
+flash vale `fastboot boot img`; para dejarlo instalado, respaldar y flashear `boot_a`. Nunca
+escribir `boot_b` (Android).
 
 ```sh
-# el teléfono en fastboot (apagar, combo fastboot). NUNCA `fastboot boot img`.
+# el teléfono en fastboot (apagar, combo fastboot); respaldar boot_a antes.
 fastboot flash boot_a shim/out/shim-boot.img
 fastboot set_active a        # slot a = iOS ; slot b = Android
 fastboot reboot

@@ -8,6 +8,8 @@ entry first; this file is the short version plus what lives outside git.
 ## What works on the phone today
 
 Updated 2026-10-26 (kernel 0234; details in `NOTES.md`, entry "SAPPHIRE 2026-10-25/26").
+This list is older than `NOTES.md`'s newest entries; for USB see the 2026-11-14 entry there and
+`dev-notes/investigacion/INDICE.md`.
 
 - Boots to the iOS home screen on 8 cores (4K-page kernel, Codemagic workflow `xnu-4k`),
   through our UEFI (`uefi/`), with touch, GPU (Adreno 610, Mesa/turnip + EAGL bridge), sound,
@@ -48,7 +50,8 @@ Updated 2026-10-26 (kernel 0234; details in `NOTES.md`, entry "SAPPHIRE 2026-10-
 
 ## Working on the phone without copying 16 GB
 
-The iOS root is a journaled HFS+ volume in `userdata`. To change a file in it:
+The iOS root is a journaled HFS+ volume, today in its own `iosroot` partition (`ufsroot=iosroot`;
+it was `userdata` before the dual-boot installer). To change a file in it:
 
 1. Shut the phone down from **Settings → General → Shut Down** so the journal is clean
    (`tools/hfs-journal-replay.py` replays it offline if a crash left it dirty), then boot recovery.
@@ -81,9 +84,13 @@ Linux `qcom_mdt_load`.
 
 ## Booting
 
-Always `fastboot boot <image>`; never flash iOS into `boot`. On this phone the recovery runs with
-the kernel from `boot`, so an iOS image there takes the recovery away (`RECOVERY.md` has the way
-back, and the ROM's own `boot.img` is what `boot_a` needs).
+*Corrected 2026-11-14 (fork giovannipodesta): the earlier rule, "always `fastboot boot`, never flash
+iOS into `boot`", predates the dual boot.* The installer flashes the iOS kernel into `boot_<iOS slot>` (the slot Android is not
+using; on the fork's phone `boot_a` = iOS, `boot_b` = Android). To test a kernel, use `fastboot boot
+<image>` (RAM only; the image needs the ARM64 kernel header, see `NOTES.md` "through our own UEFI") or
+flash `boot_<iOS slot>` after backing it up and boot it with `set_active` + `continue`/`reboot`. Never
+write an iOS image into `boot_<Android slot>`: the recovery runs with the active slot's `boot`, and
+`RECOVERY.md` has the way back.
 
 ```sh
 tools/sapphire-boot.sh --gpu-fw ../gpu-fw xnu/out-cm6/kernel.development.sweet out.img \

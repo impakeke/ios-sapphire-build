@@ -6,9 +6,13 @@
   build IDs (Codemagic or GitHub Actions), exact boot args and results, unfinished work.
   Distinguish observations from guesses.
 - Commit completed changes. Kernels build on Codemagic (`codemagic.yaml`) or GitHub Actions
-  (`.github/workflows/xnu.yml`).
-- Device bring-up uses temporary `fastboot boot` images; never flash iOS into `boot` (it takes
-  the recovery away, see `RECOVERY.md`). The iOS root lives in `userdata`; keep bootloaders,
-  recovery, modem, persist, EFS (`modemst1/2`, `fsg`, `fsc`) and backups intact, and confirm
-  each destructive step with the user before running it.
+  (`.github/workflows/xnu-4k.yml` is the kernel the phone runs; `xnu.yml` is the 16K one). The
+  original author's release kernels were built locally (`tools/xnu-linux`), not on CI.
+- Boot rules (dual boot, corrected 2026-11-14): the installer flashes `boot_<iOS slot>`. To test a
+  kernel use `fastboot boot` (RAM only; the image needs the ARM64 kernel header) or
+  `fastboot set_active <iOS slot>` + `continue`/`reboot` after flashing `boot_<iOS slot>`; **never
+  write `boot_<Android slot>`** (see `RECOVERY.md`; on the fork's phone iOS = `a`, Android = `b`).
+  The iOS root lives in the `iosroot` partition (`ufsroot=iosroot`), not `userdata`; keep
+  bootloaders, recovery, modem, persist, EFS (`modemst1/2`, `fsg`, `fsc`), `metadata`, the GPTs
+  and backups intact, and confirm each destructive step with the user before running it.
 - Keep device dumps, serial numbers, boot logs and downloaded Apple artifacts out of git.

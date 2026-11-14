@@ -18,7 +18,11 @@ four parts; what is personal is never packaged.
 - Xiaomi firmware the iOS side loads (GPU a610 zap/sqe, sensors `sensfiles`, Bluetooth `btfw`, audio `*.arp`):
   firmware may be redistributed, as AOSP ROMs do.
 
-## 2. Jailbreak packages (installed by apt on first boot, from the same repos)
+## 2. Jailbreak packages (not installed automatically: the user installs them from Sileo, same repos)
+*Corrected 2026-11-14 (fork giovannipodesta): this heading said "installed by apt on first boot", but the
+recovery's `firstboot.sh` (`installer/recovery/`) only creates apt's directories and runs `uicache`; it runs
+no apt. `installer/overlay/scrub.py` drops these packages' files and dpkg records, and says testers install
+them from Sileo.*
 Repos: apt.procurs.us (iphoneos-arm64-rootless/1800), havoc.app, repo.chariz.com, apt.thebigboss.org,
 sparkdev.me, repo.getsileo.app. Packages added after the base image:
 com.ali.aim, com.alphastream.linearforsb, com.fiore.calculatorconverter, com.ichitaso.iconorder,

@@ -3,18 +3,17 @@
 Criterio: confianza casi nula en las notas o el código anteriores (escritos con modelos más débiles).
 Todo es **observación medida**, **fuente primaria citada** o **hipótesis marcada**.
 
-## Estado en 5 líneas (2026-11-14)
-1. El USB de iOS **sí funciona** cuando iOS arranca saliendo de fastboot (`continue`), y **no**
-   cuando arranca normal. En arranque normal el ABL ni siquiera inicializa el USB device (código
-   de ABL). Con VBUS presente en ambos casos, la diferencia depende de la ruta, no del cable.
-2. Bajo carga el enlace muere por una **regresión de 0327**: HWO se reclama dos veces, el Start
-   Transfer se rechaza con *No Resource* y el bucle de `printf` lo convierte en una tormenta.
-3. Contradichas por la evidencia: "se pierden eventos", "0327 lo cura", "toolchain roto",
-   "`fastboot boot` brickea", "parche USB probado correcto".
-4. **E3 (0331, `sweetusb_utmipipe=1`): el USB de iOS ENUMERA en arranque normal** (n=1), aplicando la secuencia de Linux que usa UTMI como reloj PIPE.
-   comparar rutas de arranque, y gate `sweetusb_reclaim` para el A/B bajo carga.
-5. Diseño correcto ya esbozado: un dueño por endpoint, solo el evento libera, DMA no cacheable,
-   sin `delay()` ni `printf` en la ruta de datos, init propia del PHY.
+## Estado en 5 líneas (2026-11-14, medido)
+1. **El USB de iOS enumera en arranque normal**: 8/8 arranques con la corrección UTMI-como-reloj-PIPE
+   (0331/0332/0333), frente a 0/3 sin ella. Causa: el reloj PIPE del PHY USB3 está apagado si no se pasa
+   por fastboot (E2, código de ABL en 02).
+2. **El enlace aguanta carga** con la ruta de datos v2 (0330, por defecto): 20×30 MB íntegros y 0 rechazos.
+   La ruta vieja (0327) moría a los 192 KiB por la doble toma de HWO más el bucle de `printf`.
+3. **Panic de `sweet_ufs` en E/S cruda arreglado** (0334): `memcpy` a una VA de usuario vía physio, validado (E7).
+4. **Acceso**: SSH persistente solo con clave en 192.168.7.2, reinicio remoto a fastboot (`kern.sweet_reboot_mode=2`)
+   y bucle de ensayos automático (`~/adb-bridge/exp-loop.sh`).
+5. **Contradichas** por la evidencia: "se pierden eventos", "0327 lo cura", "toolchain roto", "`fastboot boot` brickea",
+   "mobile/root sin contraseña", "parche USB probado correcto". Hipótesis propias descartadas: la de 0332 (E5) y la de PAN (06).
 
 ## Documentos
 | # | Archivo | Qué es |

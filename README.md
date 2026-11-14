@@ -2,62 +2,69 @@
 
 **Apple's iOS 16 running on a Redmi Note 13 4G.**
 
-A port of [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz) (itself a port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)) to the Xiaomi **Redmi Note 13 4G** (`sapphire` / `sapphiren`, Qualcomm **SM6225 "khaje"** / Snapdragon 685). Apple's open-source XNU kernel (xnu-8796) boots from RAM through a small boot shim, and on top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
+A port of [MakrSas/ios-topaz](https://github.com/MakrSas/ios-topaz) (itself a port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet)) to the Xiaomi **Redmi Note 13 4G** (`sapphire` / `sapphiren`, Qualcomm **SM6225 "khaje"** / Snapdragon 685). Apple's open-source XNU kernel (xnu-8796) boots through a UEFI stage and a small boot shim, and on top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd and SpringBoard.
 
 The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory carve-outs and most of the board, so this fork follows the topaz branch and adds what differs on sapphire (patches 0140–0154, the shim's DDR handling and the tools below).
 
-> Experimental bring-up, not a usable phone OS. Many things are missing or stubbed, and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**. The kernel is started from RAM with `fastboot boot`; boot partitions do not need to be flashed.
+> Experimental bring-up, not a usable phone OS. Many things are missing or stubbed, and Apple's security model is mostly switched off. The installer (`docs/INSTALL.md`) puts iOS in its own `iosroot` partition next to Android; the first install shrinks `userdata` and so **erases Android's user data**. It flashes the iOS kernel into `boot_<the slot Android is not using>`; `fastboot boot` (RAM only) is for testing kernels.
+>
+> *This README was corrected on 2026-11-14 by the fork giovannipodesta. Where a claim rests only on commit messages or release notes (versions 0.1.7/0.1.8: `NOTES.md` stops on 2026-11-08), it says "no recorded measurement". Sources: `NOTES.md`, `dev-notes/investigacion/` (03: measurements, 04: audit of these docs).*
 
 ## What works on sapphire
 
 | Area | State |
 | --- | --- |
-| Boot | Stock Xiaomi ABL (unlocked) → `fastboot boot` of the shim (boot image v4) → XNU on the four Gold cores. The shim fits the RAM to the DDR bank ABL reports |
-| Storage | UFS host driver; the iOS root is a journaled HFS+ volume in `userdata`, read/write. Shutdown from Settings unmounts it cleanly |
-| GUI | Apple logo, lock screen, home screen, Settings, notification and control centers; rendered by the CPU (no GPU) |
+| Boot | Stock Xiaomi ABL (unlocked) → BootShim → UEFI (Mu-Silicium, `uefi/`) → SapphireXnuBoot → shim → XNU on all **8 cores** (4 KiB-page kernel, workflow `xnu-4k`; `NOTES.md` "ALL EIGHT CORES"). The shim fits the RAM to the DDR bank ABL reports. Installed into `boot_<iOS slot>` |
+| Storage | UFS host driver; the iOS root is a journaled HFS+ volume in the `iosroot` partition (`ufsroot=iosroot`), read/write. Shutdown from Settings unmounts it cleanly |
+| GUI | Apple logo, lock screen with passcode, home screen, apps; CoreAnimation drawn on the Adreno 610 through Mesa and an OpenGL ES bridge (`NOTES.md` 2026-10-22 to 10-27). OpenGL ES apps draw; Metal apps do not (`NOTES.md` 2026-10-27 night). "Real Metal on the GPU" (release notes): no recorded measurement |
 | Touch | FocalTech FT3519T (chip id `54:52`) on QUP0 SE2, calibrated for sapphire by boot args (patch 0140) |
-| USB | DWC3 in device mode as a CDC-ECM network card (patch 0142): `192.168.7.2` on the phone, live kernel log over UDP |
-| Modem | Firmware read from the stock `modem_a`, authenticated by TrustZone, modem up with its QMI services (patch 0143) |
-| Wi-Fi | WCN3988 firmware in mission mode and passive scan (2.4 and 5 GHz networks listed in the kernel log). No association yet |
+| USB | DWC3 in device mode as a CDC-ECM network card: `192.168.7.2` on the phone, live kernel log over UDP. On a normal boot (`set_active` + reboot) it only enumerated after fastboot `continue` until patches 0331-0333 (UTMI as the PIPE clock, on by default): 8 of 8 normal boots enumerated since (fork's phone, 2026-11-14). Data path 0330 (default since 0332/0333): 20 × 30 MB transfers intact. Small samples; see `dev-notes/investigacion/03` |
+| Modem | Firmware read from the stock `modem_a`, authenticated by TrustZone, modem up with its QMI services (patch 0143); SIM PIN, signal, SMS, calls with audio, LTE data for every app (`NOTES.md` 2026-10-25 to 10-28). "Other carriers via APN": no recorded measurement |
+| Wi-Fi | WCN3988; joins WPA2-PSK networks and auto-joins after the first unlock (`NOTES.md` 2026-10-20, 2026-11-04). "Wi-Fi seconds after boot" (0.1.8): no recorded measurement |
+| Audio | Playback through the RedwoodAudio HAL plug-in, call audio both ways, microphones (`NOTES.md` 2026-10-28) |
+| Clock | Set from the PM6125 RTC at boot (`userland/rtcd`, `NOTES.md` 2026-11-04) |
 
-## What does not work (yet)
+## What does not work (yet), or is not measured
 
-- **Wi-Fi connection**: no association/WPA2, no data path, no network interface for iOS yet; the Wi-Fi switch in Settings does nothing.
-- **No GPU in use yet**: everything is drawn by the CPU, so it lags; wallpapers and Metal effects stay black. Patch 0145 brings the Adreno 610 up, **it executes commands and it has drawn**: zap shader through TrustZone, SQE microcode, `CP_ME_INIT`, and a 256×256 solid fill with the 2D blitter that the CPU reads back with every pixel right (see "GPU bring-up"); nothing drives it from user space yet. The upstream project has the GPU drawing on topaz with patches it has not published.
-- **SSH**: a Procursus rootless bootstrap with sshd can be installed (`tools/sapphire-ssh-install.sh`), but iOS does not resolve `root` for it yet ("Invalid user root").
-- **No Bluetooth, cellular data, audio, camera, sensors, GPS, SEP**; no real-time clock (the date starts at 31 December).
-- **Only 4 of 8 cores** (the Silver cores have no 16K translation granule).
-- **Security is off**: permissive AMFI and sandbox, stub AppleKeyStore, no data protection.
+- **Bluetooth**: "headphones tested" (release notes) has no recorded measurement; the last log entry (`NOTES.md` 2026-11-04) says it is still to be tried with headphones.
+- **Camera, battery charge counting** (0.1.7/0.1.8): no recorded measurement.
+- **Metal**: apps that need Metal do not draw.
+- **GPS**: not working (`dev-notes/gps-plan.md`). No SEP.
+- **Security is off**: permissive AMFI and sandbox, a stand-in AppleKeyStore (the passcode lock works, but the keychain wrapping "protects nothing", `NOTES.md` 2026-10-23), no data protection. An **unauthenticated root shell** listens on `192.168.7.2:2323` over USB (`org.sapphire.usbshell`, installed by the installer). SSH: see `docs/INSTALL.md`.
 
 ## How it boots
 
 ```
 ABL (stock Xiaomi bootloader, unlocked)
-  -> fastboot boot sapphire-boot.img     (boot image v4, RAM only)
-     -> shim on Silver CPU0: wakes Gold CPU 0x100, parks
-        -> shim on Gold: GIC setup, DDR bank from ABL's DTB, payload behind _end
+  -> boot_<iOS slot>  (boot image v4 with an ARM64 kernel header; or `fastboot boot` of it, RAM only)
+     -> BootShim -> UEFI (Mu-Silicium, uefi/) -> SapphireXnuBoot
+        -> shim: brings up the cores, GIC setup, DDR bank from ABL's DTB, payload behind _end
            -> XNU Mach-O + Apple Device Tree (ADT) + boot-args
-              -> XNU -> UFS driver -> HFS+ root in userdata
+              -> XNU -> UFS driver -> HFS+ root in iosroot
                  -> dyld + shared cache -> launchd -> backboardd + SpringBoard
 ```
 
-There is no serial console. The kernel keeps a persistent log ring at the end of `userdata` (read it from recovery with `tools/sweet-log-pull.sh`) and, with `sweetusb=2`, streams its console over USB. With `--console`, `tools/sapphire-boot.sh` also draws it over the GUI.
+There is no serial console. The kernel keeps a persistent log ring at the end of its root partition, `iosroot` in the dual-boot layout (1025 × 4 KiB; `userdata` on the early single-boot setup). `tools/sweet-log-pull.sh` reads only the end of `userdata`; in the dual-boot layout read the last 1025 blocks of `iosroot` from recovery, or use the Sapphire Dual Boot app's iOS log (`docs/INSTALL.md`). With `sweetusb=2` the kernel also streams its console over USB. With `--console`, `tools/sapphire-boot.sh` also draws it over the GUI.
 
 ## How to do it yourself
+
+The supported way is the installer, `docs/INSTALL.md`. The steps below are the original single-boot bring-up (root in `userdata`), kept for reference.
 
 You need a Redmi Note 13 4G (`sapphire`/`sapphiren`) with an **unlocked bootloader**, a recovery with a root adb shell (OrangeFox), a Linux machine (or WSL2) and a way to build the kernel on macOS. **Everything on `userdata` is lost.**
 
 ### 1. Build the kernel
 
-XNU only builds with Apple's toolchain. Two ways:
+Ways to build it:
 
-- **Codemagic** (`codemagic.yaml`, free personal tier: 500 macOS minutes a month, a build takes a few minutes): add this repository as an application, start the `xnu` workflow on `sapphire`, download `xnu-kernel.zip`. It uses Xcode 16; patch 0141 makes the kernel build with it.
-- **GitHub Actions** (`.github/workflows/xnu.yml`, macos-14 / Xcode 15):
+- **GitHub Actions** (`.github/workflows/xnu-4k.yml`, the 4 KiB-page kernel the phone runs): macos-15 with the oldest Xcode 16.x on the runner (16.0, 16A242d); a successful run takes about 6-9 minutes (`dev-notes/investigacion/03`). `.github/workflows/xnu.yml` builds the older 16K-page, Gold-only kernel the same way.
 
   ```sh
-  gh workflow run xnu.yml -R YOU/ios-sapphire --ref sapphire
-  gh run download RUN_ID -R YOU/ios-sapphire -n xnu-kernel -D xnu/out
+  gh workflow run xnu-4k.yml -R YOU/ios-sapphire --ref sapphire
+  gh run download RUN_ID -R YOU/ios-sapphire -n xnu-kernel-4k -D xnu/out
   ```
+- **Codemagic** (`codemagic.yaml`, workflows `xnu` and `xnu-4k`, free personal tier: 500 macOS minutes a month): start it on `sapphire`, download the kernel zip. It uses Xcode 16.0; patch 0141 makes the kernel build with it.
+- **Locally on Linux/WSL** (`tools/xnu-linux/`, LLVM clang 18 patched with Apple's builtins, iig-lite): this is how the original author built kernels from 0241 on, including the 0.1.8 release kernel (`NOTES.md` 2026-10-28; audit in `dev-notes/investigacion/04` §4: the release kernel cannot be reproduced exactly from the tagged tree).
+- **Locally on macOS**: the fork builds with Apple clang 21 / SDK 26.x from the Command Line Tools (`dev-notes/build-recipes.md`).
 
 ### 2. Build the iOS root image
 
@@ -82,8 +89,8 @@ tools/sapphire-boot.sh xnu/out/kernel.development.sweet sapphire-wifi.img "sweet
 
 | Boot-arg | Effect |
 | --- | --- |
-| `rd=ufsroot0 ufsrw=1 rootrw=1` | Root on `userdata`, writable (`--readonly` drops the last two) |
-| `cpus=4` | The four Gold cores |
+| `rd=ufsroot0 ufsrw=1 rootrw=1` | Root on `userdata`, writable (`--readonly` drops the last two). The installed dual boot uses `ufsroot=iosroot` |
+| `cpus=4` | The four Gold cores (16K kernel); the 4 KiB kernel runs `cpus=8` |
 | `sweetfb_noconsole=1` | No kernel text over the GUI (default; `--console` keeps it) |
 | `sweetfb_hz=60` | Panel refresh rate of the CPU frame copy |
 | `sweettouch_rx=8640 sweettouch_ry=9600` | sapphire's raw touch range (X 0..2159, Y 0..2399, 2 fraction bits) |
@@ -104,7 +111,7 @@ fastboot boot sapphire-boot.img
 
 Use the Linux `adb` for this: piping binary data into Windows' `adb.exe shell` corrupts it. From Windows, `adb push` the image in pieces and `dd` them on the phone. Check the result by comparing md5 sums of 1 MB blocks on both sides.
 
-Always use `fastboot boot`, not `fastboot flash boot`: on sapphire the recovery runs with the kernel in `boot`, so an iOS image in `boot` takes the recovery away (see `RECOVERY.md`). The first boot spends a while on the Apple logo; the lock screen follows after a few minutes. To leave iOS cleanly use Settings → General → Shut Down (the HFS+ journal stays clean), then Power + Volume down.
+In this single-boot setup `fastboot boot` (RAM only) keeps the recovery: on sapphire the recovery runs with the kernel in the active slot's `boot`. In the dual-boot layout the installer flashes `boot_<iOS slot>` instead; never write `boot_<Android slot>` (see `RECOVERY.md`). A black screen after `fastboot boot` is not a brick: `fastboot reboot bootloader` recovers it (`uefi/README.md`). The first boot spends a while on the Apple logo; the lock screen follows after a few minutes. To leave iOS cleanly use Settings → General → Shut Down (the HFS+ journal stays clean), then Power + Volume down.
 
 ### USB network and live log
 
@@ -216,6 +223,7 @@ driver (Mesa freedreno) behind CoreAnimation.
 | `codemagic.yaml`, `.github/workflows/xnu.yml` | Kernel builds |
 | `tools/` | ADT, payload, root image, boot image, log, modem and HFS+ tools |
 | `NOTES.md` | Engineering log (sweet, topaz, sapphire) |
+| `dev-notes/` | The fork's notes (Spanish); `dev-notes/investigacion/INDICE.md` is the current USB investigation |
 | `RECOVERY.md` | Getting back to recovery / Android on sapphire |
 
 Not in git: partition dumps, live device trees, Apple firmware and root images, boot logs, build trees.

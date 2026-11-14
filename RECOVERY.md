@@ -1,9 +1,31 @@
 # sapphire: getting back to recovery
 
 Redmi Note 13 4G (`sapphire` / `sapphiren`), SM6225, A/B slots, unlocked bootloader. All steps
-run in **fastboot** (Power + Volume down). Nothing here touches `userdata`, so the iOS root survives.
+run in **fastboot** (Power + Volume down).
 
-## What was observed (2026-10-20)
+> **Dual-boot layout (corrected 2026-11-14, fork giovannipodesta).** Parts of this file were written
+> on 2026-10-20, before the installer existed, and assumed iOS lived in `userdata` with no Android
+> next to it. Today:
+> - the installer writes the iOS kernel into `boot_<the slot Android is not using>` (installer
+>   `sapphire.sh`, `ios_slot()`, from the release's `sapphire-recovery.zip`);
+> - the iOS root is the **`iosroot`** partition (boot-arg `ufsroot=iosroot`), not `userdata`, which
+>   holds Android's data; the iOS kernel's log ring is at the end of `iosroot`;
+> - on the phone this was checked on, **`boot_a` = iOS** and **`boot_b` = Android** (Infinity-X). Other
+>   phones may differ: find Android's slot first (in Android, `getprop ro.boot.slot_suffix`, or
+>   `fastboot getvar current-slot` right after Android booted).
+>
+> Sources: `dev-notes/investigacion/04-auditoria-documentacion-heredada.md` §1 and
+> `dev-notes/investigacion/03-experimentos-y-datos.md`.
+
+## Before touching anything
+
+Back up, from OrangeFox and read-only, `boot_a`, `boot_b` and the GPT (header and entries, primary
+and backup) of `sda` and `sde` (the A/B LUN). Keep the copies off the phone. A GPT whose A/B
+attributes and type GUIDs disagree can stop the bootloader from loading anything
+(`android/dualboot/src/com/sapphire/dualboot/Gpt.java`, comment on `withActive`; not verified on
+this phone).
+
+## What was observed (2026-10-20, n=1, the original author's phone, before the dual boot)
 
 - In recovery mode ABL boots the **kernel in `boot`** of the active slot:
   - with an iOS shim image flashed into `boot`, `fastboot reboot recovery` started iOS;
@@ -11,8 +33,12 @@ run in **fastboot** (Power + Volume down). Nothing here touches `userdata`, so t
     installed), recovery showed the logo for an instant and fell back to fastboot;
   - flashing the **`boot.img` of the installed ROM** (here Lunaris 3.12, extracted from its zip's
     `payload.bin`) into `boot_a` brought OrangeFox back.
-- Every failed boot marks the slot unbootable; with both slots unbootable ABL goes straight to
-  fastboot (`slot-unbootable:a/b: yes`).
+- Not checked against ABL's source. In the dual-boot layout of the fork's phone, OrangeFox is
+  reached with the Android slot active: `fastboot set_active b` + `fastboot reboot recovery`.
+- "Every failed boot marks the slot unbootable" was imprecise: the slot has a retry counter (7, per
+  `Gpt.java` and `userland/dualboot/sweet_slot.h`); once it runs out on both slots ABL goes straight
+  to fastboot (`slot-unbootable:a/b: yes`). Whether the iOS slot gets marked successful (and so
+  stops counting down) was not verified.
 - `recovery_a` is `0x6400000` bytes. Recovery images built for another phone (for example the
   upstream topaz OrangeFox) did not boot with `fastboot boot`; use a sapphire build.
 
@@ -22,22 +48,40 @@ run in **fastboot** (Power + Volume down). Nothing here touches `userdata`, so t
 fastboot getvar current-slot
 fastboot getvar slot-unbootable:a
 fastboot getvar slot-retry-count:a
+fastboot getvar slot-unbootable:b
+fastboot getvar slot-retry-count:b
 ```
 
-## Fix
+## Fix (only when the *Android* slot's `boot` is broken)
+
+Write the ROM's own `boot.img` into **Android's** slot only (here `b`; check yours as above):
 
 ```sh
-fastboot set_active a                      # the slot the ROM is installed in
-fastboot flash boot_a ROM-boot.img         # boot.img of that ROM build
+fastboot set_active b                      # Android's slot, NOT the iOS one
+fastboot flash boot_b ROM-boot.img         # boot.img of the ROM installed in that slot
 fastboot reboot recovery
 ```
+
+**Do not** run the old version of this fix (`set_active a` + `flash boot_a ROM-boot.img`) on a
+dual-boot phone: `boot_a` is the iOS kernel, and the installer, which takes as the iOS slot the one
+opposite to the slot the recovery runs in, would then write iOS over the real Android on the next
+install.
 
 If you only have the ROM zip, extract `boot.img` from `payload.bin` (AOSP
 `system/update_engine/scripts/update_payload`, or any payload dumper).
 
-Do not wipe or format data in recovery: `userdata` is the iOS root.
+Do not wipe or format data in recovery: `userdata` is Android's data, and do not format `iosroot`
+(the iOS root and its log ring).
 
 ## Booting iOS without losing recovery
 
-Always `fastboot boot sapphire-boot.img` (RAM only). To leave iOS, use Settings → General →
-Shut Down, then Power + Volume down for fastboot.
+- Installed iOS: `fastboot set_active <iOS slot>` + `fastboot reboot` (or `fastboot continue`);
+  back to Android with `fastboot set_active <Android slot>`. Never write `boot_<Android slot>` with an
+  iOS image.
+- Testing a kernel: `fastboot boot img` runs it from RAM and writes nothing. This ABL only boots v4
+  images that carry an ARM64 kernel header (`NOTES.md`, entry "through our own UEFI"); an image
+  without it gives a black screen, not a brick. `fastboot reboot bootloader` brings fastboot back
+  (`uefi/README.md`). Otherwise flash `boot_<iOS slot>` after backing it up.
+- Leaving iOS: Settings → General → Shut Down (keeps the HFS+ journal clean), then Power + Volume
+  down. From a root shell, `sysctl -w kern.sweet_reboot_mode=2; reboot` restarts into fastboot
+  (`dev-notes/investigacion/03`, E4).

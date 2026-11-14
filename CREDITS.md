@@ -14,6 +14,11 @@ now here, with our changes for the Redmi Note 12 4G (topaz, SM6225 / Adreno 610)
 ### Kernel patches derived from HackiOS (APSL 2.0)
 
 `xnu/patches/0900-*` and `0901-*` … `0947-*` contain, adapted and modified for topaz:
+
+*(Note 2026-11-14, fork giovannipodesta: there are no `09xx` patches in this repository; the numbers
+are probably those of the topaz tree this text came from (unverified). Here, the patches whose headers
+name HackiOS are 0149, 0150, 0155, 0156, 0200, 0301 and 0319 (`grep -il hackios xnu/patches/*`). Which
+patches carry `kern.exec_inject` and the minisandbox container path was not verified.)*
 `RedwoodGPU.cpp` (msm-style GPU client), the `MiniIOMobileFramebuffer` presentation ideas
 (SwapEnd handed to a presenter thread, vsync notification layout), `redwood_apple80211` /
 `redwood_sta` / `redwood_net` (Apple80211 for wifid), the `/dev/redwood-audio` interface, the
