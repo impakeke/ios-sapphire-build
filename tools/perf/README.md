@@ -15,12 +15,15 @@ scp psamp sapphire:/var/root/
 | `psamp PID SEGUNDOS NOMBRE_HILO SALIDA [PERIODO_US]` | Pila (pc + marcos por frame pointer) de un hilo cada 0,5 ms, más la lista de imágenes del proceso |
 | `symb.py SALIDA_PSAMP BINARIO_HakiosMetal` | En la Mac: perfil por imagen, self e inclusivo, simbolizando HakiosMetal con `nm` |
 
-La carga reproducible es `userland/tests/swipetest.sh N` (deslizamientos del home y Centro de Control
-con `hidtouch`).
+| `gxfreq INTERVALO_MS N` | Frecuencia real del núcleo de la GPU: contadores de ciclos del CP y del RBBM frente al de 19,2 MHz |
+| `cpuacct.sh SEGUNDOS [home]` | CPU por proceso durante el intervalo, en reposo o durante `homeswipe.sh 8` |
+
+La carga reproducible es `homeswipe.sh N` (en el teléfono): despierta, desbloquea, va al home y hace N rondas de
+cambio de página con `hidtouch`; verificada con capturas.
 
 ## Contadores del driver Metal y ensayos A/B
 
-`HakiosMetal` añade el contenido de `/var/tmp/metal.args` a los boot-args que lee (`_hm_bootargs`), así que
+El driver (los bundles `propio-args` y posteriores, y el binario heredado) añade el contenido de `/var/tmp/metal.args` a los boot-args que lee, así que
 sus opciones (`metal_fps=1`, `metal_defer=1`, `metal_gmem_off=N`…) se cambian sin tocar la imagen de arranque;
 se aplican al reiniciar backboardd (`killall backboardd`). Sus líneas de diagnóstico van al stderr de
 backboardd, que es `/dev/null`, y de ahí a `/dev/console`:
@@ -28,7 +31,7 @@ backboardd, que es `/dev/null`, y de ahí a `/dev/console`:
 | Herramienta | Qué hace |
 |---|---|
 | `conscat SALIDA [SEGUNDOS]` | Toma la consola (`TIOCCONS` sobre un pty) y guarda lo que los procesos escriben en `/dev/console` |
-| `ab-phone.sh ETIQUETA "ARGS"` | En el teléfono: escribe `metal.args` (`metal_fps=1` + ARGS), reinicia backboardd, captura la consola durante `swipetest.sh 5` |
+| `ab-phone.sh ETIQUETA "ARGS"` | En el teléfono: escribe `metal.args` (`metal_fps=1` + ARGS), reinicia backboardd, captura la consola durante `homeswipe.sh 8`, más CPU por proceso y las líneas `SWEET FB` |
 | `ab.sh ETIQUETA "ARGS"` | En la Mac: lanza el ensayo, trae los datos y los resume |
 | `ab-sum.py CONSOLA...` | Resume las líneas `fps:` de los periodos con movimiento (≥ 15 buffers/s) |
 
@@ -39,8 +42,9 @@ backboardd, que es `/dev/null`, y de ahí a `/dev/console`:
 no se dibuja nada y la captura es la del último frame: despertar antes con `hidtouch press 0`. Tras despertar,
 el panel se apaga a los ~6 s si sigue en la pantalla de bloqueo.
 
-`swipetest.sh` no desbloquea el teléfono en el estado actual (verificado con capturas): sus gestos actúan sobre
-la pantalla de bloqueo.
+`userland/tests/swipetest.sh` no desbloquea el teléfono en el estado actual (verificado con capturas): sus gestos
+actúan sobre la pantalla de bloqueo. `glshot.sh BUNDLE NOMBRE` instala un bundle, reinicia backboardd, va a la
+Biblioteca de Apps (fondo con blur) y la captura.
 
 ## Instalar un bundle del driver
 
@@ -49,4 +53,4 @@ del archivo instalado deja el driver sin cargar si el binario nuevo es mayor que
 arranque (el kernel guarda la firma en el vnode y dyld lo rechaza): CoreAnimation compone entonces por software
 (materiales planos, fondos difuminados oscuros con rayas, backboardd a varios núcleos, ninguna línea `fps:`).
 Comprobar siempre, tras reiniciar backboardd, que el driver está dentro: `ioreg -c SapphireGPU -r -l | grep
-IOUserClientCreator` debe nombrar a backboardd (`rebuild/gpu-tools/driver-en-uso.sh`).
+IOUserClientCreator` debe nombrar a backboardd (`driver-en-uso.sh`).
