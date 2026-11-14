@@ -537,3 +537,34 @@ GPU gasta 8,3 ms en dibujar más 4,15 ms en la copia escalada del kernel: 12,5 m
 120 Hz (8,33 ms) y por debajo de dos. Un tercio del tiempo de GPU por frame es la copia al panel. Lo que fija
 ahora los frames por segundo es cómo se encadenan CPU, GPU, copia y presentación (ritmo y esperas), no un único
 recurso saturado.
+
+## M12 — Kernel 0352, bundles `merge-2` y `merge-3`, y scanout directo (2026-11-14)
+
+Kernel de CI, run 43635044868 (0351 y 0352 aplicados, 350 parches); imagen `boot_a-0352-vco2-820.img`. Con 0351,
+`kern.sweet_idle_cache` vale 0 al arrancar. `kern.sweet_fb_queue=1`, `kern.sweet_gpu_flush=1`, GPU a 820 MHz fijos.
+Carga `homeswipe.sh 8`; n=1 por fila salvo donde se dice; driver cargado comprobado en cada bundle.
+
+| Condición | Buffers/s | A tiempo / tarde / paradas | CPU/draw | Hecho→commit | Commit→fin |
+|---|---|---|---|---|---|
+| 0350, `merge-2` | 47,8 | 552 / 374 / 31 | 20 µs | 6,0 ms | 31,8 ms |
+| 0350, `merge-2`, `metal_fps=passes` | 51,6 | 972 / 233 / 39 | 17 µs | 4,0 ms | 25,1 ms |
+| 0352, `merge-2`, `kern.sweet_fb_scanout=1` | 47,0 · 38,5 | 1015/221/25 · 318/372/25 | 18 µs | 3,6 · 8,2 ms | 22,1 · 23,2 ms |
+| 0352, `merge-2`, `kern.sweet_fb_scanout=0` | 54,8 | 959 / 228 / 19 | 18 µs | 4,1 ms | 26,0 ms |
+| 0352, `merge-3` | 49,0 | 648 / 311 / 18 | 16 µs | 4,8 ms | 27,3 ms |
+
+- **Scanout directo (0350 + 0352).** Con `scanout=2` y un reinicio de backboardd las superficies de pantalla
+  pasan al pool (2 de 4 huecos) y la imagen es la de siempre. Con `scanout=1`: `plane now scaled`, `showing 13,12
+  720x1600 of a surface (rows of 3072 bytes) at 0xe5500000`, CTL_FLUSH devuelve sus bits en 769 de 769 flips,
+  `flushes not taken 0`, sin cuelgues. Nadie ha mirado el panel en ese modo. En una tanda: `frames 897 flips 897;
+  copied instead: … swapped again while on the panel or waiting 1029`, y al final `plane to scaled 407, to unscaled
+  406`. Queda en 0.
+- **Pasadas con `merge-3` y `metal_fps=passes`** (tiempo de GPU por pasada): la principal, `750x1624 draws 108
+  tiles 78 attached 0x3 touched 0x103 wrote 0x3 read 0x3`, 11,4 ms; pasadas `750x1624 draws 7 … sysmem`, 5,8-7,9 ms.
+  Con `merge-2`: principal en 78 tiles 10,5 ms de media (6 pasadas), y en 42 tiles cuando solo toca el primer
+  attachment, 2,4-3,3 ms.
+
+**Interpretación.** El driver gasta ya 16-20 µs de CPU por draw; lo que queda por frame es GPU y encadenado. El
+scanout directo funciona, pero CoreAnimation usa dos superficies de pantalla: la que está en el panel no se
+puede reutilizar, más de la mitad de los frames vuelven a la copia y el plano alterna entre los dos modos; así
+no gana. Pasadas de siete draws a pantalla completa cuestan 6-8 ms de GPU: el coste lo fija lo que cubren, no
+cuántos draws son.
