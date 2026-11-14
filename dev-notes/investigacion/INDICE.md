@@ -22,6 +22,7 @@ Todo es **observación medida**, **fuente primaria citada** o **hipótesis marca
 | 01 | [01-auditoria-sweet_usb.md](01-auditoria-sweet_usb.md) | Auditoría completa del driver: mecanismo del fallo con números de línea, 16 defectos, tabla de afirmaciones, diseño e instrumentación, experimentos |
 | 02 | [02-fuentes-primarias-dwc3-abl.md](02-fuentes-primarias-dwc3-abl.md) | Fuentes primarias: Linux/U-Boot dwc3, código y binarios de ABL, PHY femto, DT de khaje, erratas |
 | 03 | [03-experimentos-y-datos.md](03-experimentos-y-datos.md) | Bitácora de mediciones en el teléfono (E0, carga, E1 R/C, E2) |
+| 04 | [04-auditoria-documentacion-heredada.md](04-auditoria-documentacion-heredada.md) | Auditoría del resto de docs: arranque/recovery, **seguridad** (hash en spwd.db, .supdate root sin firma, shell 2323), qué funciona, reproducibilidad, licencias, correcciones y riesgos |
 | — | [../acceso-al-telefono.md](../acceso-al-telefono.md) | Receta para entrar: `fastboot continue`, 192.168.7.x, `nc 2323`, `ssh sapphire` |
 | — | [../angel.cmdline](../angel.cmdline) · [../bootargs.py](../bootargs.py) | Boot-args reales de expG y el extractor |
 
@@ -36,6 +37,7 @@ Todo es **observación medida**, **fuente primaria citada** o **hipótesis marca
 | `auditoria-sweet_usb/` | Mach-O de expG reconstruido (`kern/`), `ud_thread.dis`, fuentes de referencia fijadas (`ref/`), árbol de replay, `0329-borrador-descartado.patch`, transcripción del agente |
 | `investigacion-dwc3-abl/` | Transcripción del agente Fable (`.jsonl`), extracción buscable `tr.txt` + `idx.txt` |
 | `fuente-reconstruida/` | `sweet_usb.post-0328.c` (lo que corre en expG) y `sweet_usb.con-0329.c` |
+| `auditoria-docs/` | Assets de la release v0.1.8 descargados (kernel, recovery zip con `sapphire.sh` no versionado, overlay) — **ovl/ contiene un hash de contraseña: no publicar** |
 | `logs-telefono/` | Ring-logs (13 nov malo, R1), log UDP 5140, sesión 2323, monitores de enumeración, `exp1.txt` |
 | `../backups/` | `boot_a-expG-…img` (respaldo de boot_a), ring tails |
 

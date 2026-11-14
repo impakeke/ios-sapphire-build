@@ -73,7 +73,9 @@ Tamaño de muestra: n=1 por ruta. Las repeticiones R2, R3, C2 y C3 están pendie
   - Antes de escribir nada, vuelca (solo lectura) GCC 0x1a000-0x1a0a0, 0x1c000 y 0x1d000; DWC3 0xc100-0xc160, 0xc200, 0xc2c0, 0xc300-0xc320, 0xc380, 0xc600-0xc640 y 0xc700-0xc730; QSCRATCH 0x00-0x80; y el PHY 0x000-0x120.
   - Las líneas tienen el formato `SWEET USBDIAG <bloque> +off w0 w1 w2 w3`.
   - El boot-arg `sweetusb_reclaim=0` desactiva 0327, para el A/B de carga. Por defecto vale 1, igual que expG.
-- CI: `xnu-4k` en macos-15 (macos-14 está retirado), ejecución 43561459873.
+- CI: `xnu-4k` en macos-15 con Xcode 16.0 (16A242d). La ejecución 43561459873 falló en Collect (bug del workflow); la buena es **43562358335** (0329 aplicado, 327 parches). Kernel sha `fd991ef7…`, LC_UUID FAEA5217-…; imagen `boot_a-0329-diag.img` sha `fa0cf8cb…` (boot-args idénticos a expG).
+- **Variable extra:** el kernel 0329 sale de Xcode 16 (CI) y expG de Apple clang 21 local. No afecta a la comparación R frente a C con el mismo kernel.
+- E2-R1 (00:5x): el kernel 0329 arranca iOS por la ruta R y no enumera (esperado). Lectura del ring pendiente.
 - Empaquetado: `../repack-boot.py`, que reutiliza el shim, el ADT y el cmdline de expG.
 - Plan:
   1. Arrancar por R y por C, y comparar los bloques USBDIAG.
