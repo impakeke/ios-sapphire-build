@@ -20,7 +20,8 @@ assets de la release descargados en solo lectura), [investigacion/03](investigac
 | Fila `SHA256SUMS` en la tabla de archivos | Ese asset no existe | lista de assets de la release |
 | `sapphire-kernel.img` = "Apple's open-source XNU with Sapphire's patches" | Es un build local (WSL, clang 18 parcheado + iig-lite, `tools/xnu-linux`), con firma `Fri Nov 13 17:37:11 CET 2026`: 7 min antes del commit 1cdcbfb (17:44:34) que añade 0323-0325 y 51 min antes del tag (be9c5aa, 18:28:09). Se reempaquetó sobre un `BASE.img` local que no está en el repo. No se puede reproducir exactamente desde el tag | 04 resumen punto 4; `git log` |
 | "No USB link to the PC while iOS runs from the phone's storage (only when booted with `fastboot boot`)" | Cierto para 0.1.8: el USB enumera saliendo de fastboot (`continue`) y no en arranque normal. Los parches 0331-0333 del fork, que **no** están en 0.1.8, hacen que enumere también en arranque normal | 03 E1, E3, E4, E6 |
-| "Wi-Fi works seconds after boot", "Bluetooth … headphones tested", "Mobile data on other carriers", "Battery percentage from real charge counting", "Real Metal on the GPU" | Sin medición registrada: `NOTES.md` acaba el 2026-11-08 y solo los commits lo respaldan. La última entrada sobre BT dice "to be tried with headphones" | 04 §3 |
+| "Wi-Fi works seconds after boot", "Bluetooth … headphones tested", "Mobile data on other carriers", "Battery percentage from real charge counting" | Sin medición registrada: `NOTES.md` acaba el 2026-11-08 y solo los commits lo respaldan. La última entrada sobre BT dice "to be tried with headphones" | 04 §3 |
+| "Real Metal on the GPU" | Con el binario `HakiosMetal` del repo (`installer/update/files/`, sha256 `13bbd782…`, `sweetmetal=2`) y un kernel del fork (0334), CoreAnimation dibuja en la GPU por Metal: 23,5-23,8 command buffers por segundo con la GPU a 630 MHz, n=3. Con el kernel de la release no está medido, ni que ese binario sea el de los assets de 0.1.8. Que dibujen apps de terceros que usan Metal: sin medir | 03 M1-M2; 08 §1 |
 
 ## Texto propuesto (inglés)
 
@@ -66,5 +67,6 @@ assets de la release descargados en solo lectura), [investigacion/03](investigac
 ### Añadir debajo de "What's new in 0.1.8" y de "What's new in 0.1.7"
 
 > These items are based on the author's commits; there is no recorded measurement for: Wi-Fi seconds after
-> boot, Bluetooth with headphones, mobile data on other carriers, battery charge counting and Metal on the
-> GPU.
+> boot, Bluetooth with headphones, mobile data on other carriers and battery charge counting. Metal on the GPU:
+> CoreAnimation draws through the Metal driver (`sweetmetal=2`), measured with a later kernel of the fork
+> giovannipodesta; whether third-party Metal apps draw is not measured.
