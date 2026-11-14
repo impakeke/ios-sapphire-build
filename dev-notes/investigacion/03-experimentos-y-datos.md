@@ -700,3 +700,24 @@ informes `informe-{1,2,3}.md`. n=1 por pantalla.
 compilar en el hilo de render los shaders que se usan por primera vez; y, durante la animación, 18-42 ms de GPU por
 frame repartidos en muchas pasadas, varias de ellas sobre la propia superficie de pantalla. El análisis del blur
 está en 22.
+
+## M19 — Primera apertura del selector de apps (2026-11-14)
+
+Kernel 0353 a 820 MHz, scanout directo, parciales activas, `merge-5` con `metal_trace=frame`. Tras reiniciar
+backboardd y esperar 40 s, se abre el selector de apps dos veces seguidas (gesto de `hidtouch` desde el borde
+inferior hasta media pantalla, 600 ms), capturando 70 command buffers cada vez. Trazas en
+`research/metal/ios-graficos/trace/capturas-recientes/` y `capturas-recientes-bocache/`. n=1 por condición.
+
+| Condición | Apertura | Frames por encima de 60 ms de codificación | GPU media por frame |
+|---|---|---|---|
+| `kern.sweet_gpu_bocache=0` | primera | uno, de 228 ms (GPU 34,1 ms; 10 pasadas, 111 draws, 25 pipelines, 91 texturas) | 17,4 ms |
+| | segunda | ninguno | 13,6 ms |
+| `kern.sweet_gpu_bocache=1` | primera | uno de 470 ms y cuatro de 67-72 ms | 16,4 ms |
+| | segunda | ninguno | 13,5 ms |
+
+La caché de stages en disco ya contenía los shaders de esa vista. Con `bocache=1`, `kern.sweet_gpu_bocache_stats`:
+`kept 282, handed out again 146 (92 569 600 bytes)`.
+
+**Interpretación.** El tirón de la primera apertura es un frame que tarda 0,2-0,5 s en prepararse en CPU, el primero
+en que aparecen las tarjetas; la segunda apertura no lo tiene. Reutilizar buffers en el kernel no lo quita. Queda
+por separar cuánto es preparar por primera vez los pipelines en el proceso y cuánto subir las imágenes de las tarjetas.
