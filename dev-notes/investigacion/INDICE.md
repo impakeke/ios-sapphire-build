@@ -24,7 +24,9 @@ Cómo operar el teléfono: [../OPERACION.md](../OPERACION.md).
    buffers por segundo un 18 %.
 7. **El driver Metal se compila desde fuente en la Mac** (08): upstream de HackiOS `63fc2b4` más seis parches
    A610 propios; el bundle `propio-args` carga y pinta bien (03 M5).
-8. **Siguiente:** ver "Gráficos: siguiente trabajo" abajo.
+8. **El kernel 0342 deja de pisar frames y de limpiar la caché en cada submit** con `kern.sweet_fb_queue=1` y
+   `kern.sweet_gpu_flush=1` (0340, 0339; 03 M7): pisados 10,6 % → 0, submit 1,74 → 0,05 ms.
+9. **Siguiente:** ver "Gráficos: siguiente trabajo" abajo.
 
 ## Reglas para agentes
 
@@ -51,7 +53,10 @@ Cómo operar el teléfono: [../OPERACION.md](../OPERACION.md).
 | 09 | [09-auditoria-kernel-gpu.md](09-auditoria-kernel-gpu.md) | Auditoría del kernel en la ruta gráfica: buffers, submit, fences, presentación (frames pisados, copia escalada por frame, vsync), parches 0336 y 0338 |
 | 10 | [10-auditoria-rendimiento-hakios-metal.md](10-auditoria-rendimiento-hakios-metal.md) | Auditoría de rendimiento del driver Metal: coste de CPU por draw, por qué la pasada principal tarda 20 ms (102 tiles, estado repetido por tile), plan por etapas |
 | 11 | [11-gpu-relojes-bus-vs-android.md](11-gpu-relojes-bus-vs-android.md) | Relojes, raíles, bus y memoria de la GPU frente a Android en este teléfono; parche 0337 y su escalera |
-| 12 | [12-escena-drivers-metal-alternativos.md](12-escena-drivers-metal-alternativos.md) | Otros proyectos con driver Metal sobre GPU que no es de Apple (búsqueda en curso) |
+| 12 | [12-escena-drivers-metal-alternativos.md](12-escena-drivers-metal-alternativos.md) | Otros proyectos con driver Metal sobre GPU que no es de Apple: mapa de la escena, cifras publicadas, veredicto |
+| 13 | [13-driver-cpu-por-draw.md](13-driver-cpu-por-draw.md) | Driver: coste de CPU por draw (rama `cpu-draw`, en curso) |
+| 14 | [14-driver-gmem-tiles-estado.md](14-driver-gmem-tiles-estado.md) | Driver: GMEM, tiles y grupos de estado (rama `gpu-pass`, en curso; G1-G3 pintan mal el blur) |
+| 15 | [15-kernel-cache-y-presentacion.md](15-kernel-cache-y-presentacion.md) | Kernel: parches 0339-0342 (limpieza de caché por suciedad, cola de presentación, TLB, caché de BOs) |
 | — | [../../tools/perf/README.md](../../tools/perf/README.md) | Herramientas de medición: perfil de hilos, contadores del driver, arnés A/B, frecuencia de la GPU, capturas |
 | — | [../OPERACION.md](../OPERACION.md) | Runbook: herramientas de la Mac, acceso, ciclo CI → flash → ensayo → ring, fallos |
 | — | [../angel.cmdline](../angel.cmdline) · [../bootargs.py](../bootargs.py) · [../repack-boot.py](../repack-boot.py) | Boot-args de expG, su extractor y el empaquetador de imágenes |

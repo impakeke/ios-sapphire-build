@@ -381,3 +381,28 @@ a la mitad: una parte de esa pasada no va al ritmo del reloj. Los buffers por se
 límite es ahora la CPU del driver (hecho→commit 30 ms; el bundle propio, sin las tablas del port, gasta 157 µs
 por draw frente a 126). En el kernel hay dos costes medidos por primera vez: 1,5 ms de limpieza de caché por
 submit dentro del candado, y uno de cada siete frames pisado.
+
+## M7 — Kernel 0342 en el home: cola de presentación y limpieza de caché (2026-11-14)
+
+Kernel de CI, run 43620776409 (0339-0342 aplicados, 340 parches). Imagen `boot_a-0342-vco2-820.img`
+(`gpu_vco2=1 gpu_mhz=820 sweet_reboot=2`; `gxfreq`: 820,00 MHz). Driver `rebuild/out/propio-args`. Carga:
+`tools/perf/homeswipe.sh 8` (páginas del home, verificada con capturas). n=1 por condición, cambiando los sysctl
+en caliente, con el teléfono caliente y en un ambiente caluroso: orientativo.
+
+| Condición | Buffers/s | CPU/draw | Hecho→commit | Commit→fin | Swaps | Flips | Pisados | Submit (media) | de ello, limpieza de caché |
+|---|---|---|---|---|---|---|---|---|---|
+| Arranque sin tocar (`gpu_tlb=3`) | 22,1 | 161 µs | 26,7 ms | 23,3 ms | 886 | 716 | 94 (10,6 %) | 1,74 ms | 1,70 ms |
+| `kern.sweet_fb_queue=1` | 19,2 | 163 µs | 30,1 ms | 25,8 ms | 781 | 781 | 0 | 1,67 ms | 1,63 ms |
+| `sweet_fb_queue=1 sweet_gpu_flush=1` | 21,8 | 160 µs | 25,8 ms | 20,9 ms | 1045 | 1045 | 0 | 0,05 ms | 0,01 ms |
+
+- Capturas con las dos opciones activas: la Biblioteca de Apps (blur) y el Centro de Control salen bien
+  (`medicion/shots/hoja-kqf.png`).
+- Las dos opciones quedan activas en cada arranque por `/redwood/boot.d/80-gfx.sh` (en el teléfono).
+- **Bundles del driver en la pantalla de la Biblioteca de Apps** (kernel 0338, 820 MHz, capturas
+  `medicion/shots/hoja-blur.png`): `propio-args` pinta bien el fondo difuminado (2 de 2); `gpu-G1`, `gpu-G2`,
+  `gpu-G3` y el binario heredado lo pintan oscuro y con rayas, y la barra de búsqueda blanca (1 de 1 cada uno).
+- A 1260 MHz fijos el teléfono se calienta y el usuario ve fallos gráficos; por eso la imagen en uso es de 820 MHz.
+
+**Interpretación.** Con la cola, todo frame entregado llega al panel (flips = swaps). Con el seguimiento de
+suciedad, la limpieza de caché por submit desaparece. Los buffers por segundo no cambian porque el límite sigue
+siendo la CPU del driver (160 µs por draw).
