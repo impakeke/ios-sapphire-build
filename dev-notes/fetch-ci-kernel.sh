@@ -21,7 +21,7 @@ REPO=${REPO:-giovannipodesta/ios-sapphire}
 WORKFLOW=xnu-4k
 ARTIFACT=xnu-kernel-4k
 KERNEL=kernel.development.sweet
-PATCH=${PATCH:-0352-sapphire-fb-scanout-fixes-flush-taken.patch}
+PATCH=${PATCH:-0353-sapphire-fb-swapwait-from-queue.patch}
 INTERVAL=${INTERVAL:-30}
 
 fail() { printf '\n\033[1;31m*** FALLO: %s ***\033[0m\n' "$*" >&2; exit 1; }
