@@ -12,27 +12,34 @@ Convención de evidencia, la de 10: **[O]** observación propia (código con `ar
 Árbol de trabajo: `~/sapphire-angel/research/metal/rebuild/wt-cpu` (worktree de `hakios-upstream`), rama `cpu-draw`,
 creada desde `opcional-puerto` (`620950c`). Las rutas `src/…`, `include/…`, `tests/…`, `tools/…` son de
 `wt-cpu/hakios-metal/`; `CA.m` es `wt-cpu/userland/src/HakiosMetalCA.m`. Los números de línea son los de la punta de
-la rama que §7 nombra. Herramientas y resultados fuera de git: `rebuild/cpu-tools/`.
+la rama, `f58c688` (§11.1). Herramientas y resultados fuera de git: `rebuild/cpu-tools/`. Quien continúe este trabajo
+empieza por §11 (Relevo).
 
 ## Resumen
 
 | | Base (`propio-args`, `620950c`) | Rama `cpu-draw` |
 |---|---|---|
-| Teléfono, CPU por draw en el hilo que llama [M] | 142 µs (130-172) | 59 µs con `cpu-A-wip`; 16-20 µs con `merge-2`, `merge-3` y `merge-4` y el kernel 0350 en adelante (§6) |
-| Teléfono, buffer hecho → commit [M] | 24,9 ms | 13,6 ms (`cpu-A-wip`); 4,0-6,0 ms (`merge-2`, kernel 0350) |
+| Teléfono, CPU por draw en el hilo que llama [M] | 142 µs (130-172) | 59 µs con `cpu-A-wip`; 16-20 µs de `merge-2` a `merge-7` con el kernel 0350 en adelante (§6) |
+| Teléfono, buffer hecho → commit [M] | 24,9 ms | 13,6 ms (`cpu-A-wip`); 2,4-6,0 ms (`merge-2` a `merge-7`, kernel 0350 en adelante) |
 | Teléfono, pasada principal del home en la GPU [M] | — | 10,5-11,4 ms guardando el segundo attachment (`merge-2`, `merge-3`); 9,6-11,2 ms sin guardarlo (`merge-4`, §10.2) |
+| Teléfono, codificación más larga de un buffer la primera vez que se abre el selector de apps · el Centro de Control [M, n=1 o 2] | — | 228 y 470 ms · 1 318 ms con `merge-5`; 51,9 · 69,8 ms con `merge-6` (§10.6) |
 | Host, escena T (interfaz C, stages del teléfono, sysmem), µs por draw [O] | 10,88 | 3,40 (mínimo 2,82) |
 | Host, asignaciones de heap por draw, escena T [O] | 38,3 | 0,2 |
-| Palabras PM4 que recibe el procesador de comandos | — | las mismas, palabra por palabra, en todo lo que la rama `gpu-pass` no cambia a propósito (§4) |
+| Palabras PM4 que recibe el procesador de comandos | — | las mismas, palabra por palabra, en todo lo que la rama `gpu-pass` y las correcciones de §10.2 no cambian a propósito (§4) |
 
 - El objetivo de < 10 µs por draw en el teléfono **no se alcanza**: 16-20 µs [M]. Qué queda y por qué: §6 y §9.
 - La etapa B tal como la describe 10 §2.7 (cargas de estado elididas cuando no cambian) **no está hecha**: choca con
   cómo `gpu-pass` convierte los draws de un pase en grupos de estado (§9.1). Lo que sí cambia el stream está en §3.9
   y §10.2.
 - Con la CPU en 16 µs por draw el límite es la GPU. §10 recoge lo que las trazas de frames reales muestran que el
-  driver hacía de más o distinto de lo pedido, lo corregido (ocho no conformidades, cada una con su prueba de host
-  donde el código es del núcleo) y lo que queda.
-- Bundles en `rebuild/out/`: `cpu-A-wip`, `merge-1` a `merge-4` medidos en el teléfono; `merge-5` y el de la punta, §7.
+  driver hacía de más o distinto de lo pedido y lo corregido: siete filas de §10.2 (cada una con su prueba de host
+  donde el código es del núcleo) y una octava, N-07, hecha y apagada porque depende de otra que no lo está (N-12,
+  §10.7).
+- El tirón de la primera vez que se abre una vista era la espera por el compilador de shaders, no la compilación del
+  pipeline que se crea; la causa de fondo, que la clave de especialización incluía bytes de relleno (§10.6).
+- Bundles en `rebuild/out/`: `cpu-A-wip` y `merge-1` a `merge-7`, todos probados en el teléfono por el coordinador;
+  el instalado es `merge-7` (`96d9bac`). Estado exacto de la rama, comandos, mapa del código, pendientes, diseño sin
+  implementar y trampas: §11.
 
 ## 1. Punto de partida medido
 
@@ -40,7 +47,7 @@ la rama que §7 nombra. Herramientas y resultados fuera de git: `rebuild/cpu-too
 
 [M] `medicion/ab/ab-real-propio-args.txt` (kernel 0342, GPU a 820 MHz; resumido con `ab-sum.py`): 142 µs de CPU
 por draw en el hilo que llama («of ours each», 130-172 según el periodo), de ellos 124-161 dentro de
-`hakios_metal_cb_draw_indexed`/`_draw3` («the core's», cronometrado en `-hakiosDrawOnce:`, `CA.m:8385`); 129 draws
+`hakios_metal_cb_draw_indexed`/`_draw3` («the core's», cronometrado en `-hakiosDrawOnce:`, `CA.m:10176`); 129 draws
 por command buffer; del buffer hecho al commit, 24,9 ms. Las medidas anteriores de la misma base
 (`ab-v1260-base-1.txt`, `ab-propio-args-{1,2}.txt`) dan 141-164 µs.
 
@@ -88,8 +95,8 @@ primitivas casi lleno habría apagado el binning por sí solo. `render::vscOverf
 el único sitio que dice dónde está la palabra. En funcionamiento normal (sin desbordamiento) las dos lecturas dan 0 y
 el binning sigue encendido igual.
 
-Con esto, 261/261 con las constantes de los dos chips en la base; la punta de la rama pasa 280 (269 propios + 11 de
-`gpu-pass`) con las dos.
+Con esto, 261/261 con las constantes de los dos chips en la base; la punta de la rama pasa 284 con las dos (269
+propios y 11 de `gpu-pass` en la fusión, más las cuatro pruebas de §10.2).
 
 ## 3. Qué se cambió, por función
 
@@ -99,38 +106,38 @@ paquete y descarta, contra una sombra de registros (`RegShadow`), las ~9 de cada
 
 ### 3.1 Un draw en dos mitades: hechos y emisión (`6f2e4e0`)
 
-`render::encodeDraw` queda partido en `drawFacts` (`src/render.cpp:1364`), que juzga el draw en el orden de siempre
+`render::encodeDraw` queda partido en `drawFacts` (`src/render.cpp:1383`), que juzga el draw en el orden de siempre
 y deja lo que decide el stream (`ProgramFacts`: lo que deciden el programa y el pase; `DrawFacts`: lo que añaden los
-enlaces y números del draw), y `emitDraw<S>` (`:1698`), que escribe el stream grupo a grupo según una máscara
+enlaces y números del draw), y `emitDraw<S>` (`:1719`), que escribe el stream grupo a grupo según una máscara
 (`kG…`, 29 grupos). `encodeDraw` es el envoltorio de los dos. De paso desaparecen las asignaciones que no eran del
 draw: la copia del stage de fragmento para borrar regids, vectores por stage para rangos y UBOs, un vector por carga
 (`pm4::Stream::open` escribe las palabras donde quedan), los `std::string` de nombres construidos al entrar.
 
 ### 3.2 El estado de un programa se guarda (`afc2eca`)
 
-- `ProgramState` (`:3262`): para un programa en un tipo de pase (`StateKey`, `:3145`: formato de cada attachment,
+- `ProgramState` (`:3292`): para un programa en un tipo de pase (`StateKey`, `:3175`: formato de cada attachment,
   si hay depth, todas las opciones), los veredictos de `checkStage`, `link` y las palabras de blend (`ProgramFacts`),
-  lo que cada stage necesita ligado (`StagePlan`, `:3162`), los atributos de vértice como los lee `vertexFetch`, y las
-  palabras de los grupos que son solo del programa tal como las escribió `emitDraw` (`buildState`, `:3483`). Vive en
-  la cola (`StateCache`, `:3298`, por `Program::uid`) para un programa con uid; en el command buffer, junto a una copia
+  lo que cada stage necesita ligado (`StagePlan`, `:3192`), los atributos de vértice como los lee `vertexFetch`, y las
+  palabras de los grupos que son solo del programa tal como las escribió `emitDraw` (`buildState`, `:3513`). Vive en
+  la cola (`StateCache`, `:3328`, por `Program::uid`) para un programa con uid; en el command buffer, junto a una copia
   del `Program` comparada byte a byte, para uno hecho a mano.
 - `Program::uid` (`include/…/render.hpp`): lo da `linkProgram` y lo renueva cada setter de la interfaz C que cambia el
   programa después (descriptor de vértices, blend, muestras; `src/c_api.cpp`): un programa cambiado es otro programa.
-- `PassCache` (`:3410`, en `OpenPass::cache`): ventana y muestras que `checkTarget` calculó, los grupos propios del
+- `PassCache` (`:3440`, en `OpenPass::cache`): ventana y muestras que `checkTarget` calculó, los grupos propios del
   pase por lo que dibuja cada programa, los descriptores de fetch de los attachments y, por cada stream del pase, un
-  `Cursor` (`:3341`): las palabras que el stream tuvo por última vez de cada grupo guardado y los números con que se
+  `Cursor` (`:3371`): las palabras que el stream tuvo por última vez de cada grupo guardado y los números con que se
   hicieron los grupos propios del último draw (viewport, raster, blend dinámico, fetch de vértices).
-- Un draw con estado guardado: `fastFacts` (`:3633`) y `fastTables` (`:3819`) son las reglas de `drawFacts` para lo
+- Un draw con estado guardado: `fastFacts` (`:3663`) y `fastTables` (`:3851`) son las reglas de `drawFacts` para lo
   que trae el draw —enlaces, cuentas, viewport, scissor, depth/stencil, índices— y escriben los descriptores de
   textura, sampler e IBO directamente en la tabla del draw (`Texture::sampledWords`, `src/texture.cpp:851`, guarda las
   16 palabras de una textura). Lo que no pueden asegurar va por el camino largo, donde `drawFacts` lo juzga y lo
-  rechaza con la frase de siempre. `emitFast` (`:3890`) recorre los grupos en el orden de un draw: un grupo guardado
+  rechaza con la frase de siempre. `emitFast` (`:3922`) recorre los grupos en el orden de un draw: un grupo guardado
   cuyas palabras son las últimas que tuvo el stream se salta; uno hecho de números del draw se hace cuando los números
   no son los del draw anterior; las cargas de los stages y `HLSQ_INVALIDATE_CMD`, que ninguna sombra descarta, se
   añaden tal cual en cada draw.
-- `DedupSink` (`:3092`): la regla de `appendDeduped` aplicada mientras se generan las palabras, sin stream intermedio.
-- `keep()`/`use()` (`include/…/command.hpp:125`, `:268`) reciben una referencia y recuerdan lo último que se les dio
-  (`recently`, `:274`): un draw nombra los mismos buffers y texturas que el anterior. La lista de buffers del envío es
+- `DedupSink` (`:3122`): la regla de `appendDeduped` aplicada mientras se generan las palabras, sin stream intermedio.
+- `keep()`/`use()` (`include/…/command.hpp:125`, `:271`) reciben una referencia y recuerdan lo último que se les dio
+  (`recently`, `:277`): un draw nombra los mismos buffers y texturas que el anterior. La lista de buffers del envío es
   la misma (§4).
 - El primer draw con un programa, un draw con memoria privada, uno indirecto, uno que cuenta muestras y todo pase sin
   deduplicación van por el camino largo (`drawFacts` + `emitDraw` a través de `DedupSink`).
@@ -140,7 +147,7 @@ draw: la copia del stage de fragmento para borrar regids, vectores por stage par
 Cuando el programa de un draw no es el del anterior, sus grupos guardados pasaban enteros por la sombra: unas 350
 consultas a una tabla hash para encontrar las pocas decenas de registros que difieren. El `Cursor` sabe qué palabras
 tuvo el stream de cada grupo; para un grupo *plano* (solo paquetes de registros, ningún registro dos veces, sin
-`HLSQ_INVALIDATE_CMD`; `packetsOf`, `:3233`) esas palabras son lo que valen sus registros, así que el grupo nuevo se
+`HLSQ_INVALIDATE_CMD`; `packetsOf`, `:3263`) esas palabras son lo que valen sus registros, así que el grupo nuevo se
 compara con ellas (`emitFast`, lambda `kept`): un registro que escriben los dos se emite si difiere, sin preguntar a
 la sombra; uno que el anterior no escribía lo decide (y lo aprende) la sombra; uno que el anterior escribía y este no,
 vuelve a la sombra. `Cursor::settle` pone la sombra al día antes de un draw por el camino largo. Lo que esto supone
@@ -149,7 +156,7 @@ estado (`buildState`): si no se cumple, ese programa va siempre por el camino la
 
 ### 3.4 Interfaz C (`25ad496`)
 
-`drawCommon` (`src/c_api.cpp:1399`) creaba dos `Bindings` por draw (seis vectores) y llamaba a `bindArgumentBuffers`
+`drawCommon` (`src/c_api.cpp:1452`) creaba dos `Bindings` por draw (seis vectores) y llamaba a `bindArgumentBuffers`
 por stage, que copia la tabla de buffers antes de mirar si hay algún miembro de argument buffer. Las dos tablas son
 del `hakios_metal_cb` y se rellenan en sitio; `CompiledProgram::argumentBuffers` (`include/…/compiler.hpp`) dice una
 vez por programa si hay miembros, y sin ellos no se llama.
@@ -166,29 +173,30 @@ el slab reutilizado: las sumas de lo que nombran las cargas no cambian.
 
 ### 3.6 Reciclado entre command buffers y entre pases (`99279c0`, `01ca4f6`)
 
-- `CommandQueue::Spare` (`include/…/command.hpp:494`): un command buffer que termina entrega a la cola su stream y
-  sus listas, vacíos, y su `DrawCache` (`src/render.cpp:3431`); el siguiente los toma (`CommandQueue::commandBuffer`,
+- `CommandQueue::Spare` (`include/…/command.hpp:504`): un command buffer que termina entrega a la cola su stream y
+  sus listas, vacíos, y su `DrawCache` (`src/render.cpp:3461`); el siguiente los toma (`CommandQueue::commandBuffer`,
   `src/command.cpp:569`; `CommandBuffer::finish`, `:429`). Los 256 slots del `DrawCache` siguen valiendo —un estado es
   de un programa mientras tenga ese uid—, así que el frame siguiente encuentra los estados sin el cerrojo de la cola;
   `DrawCache::epoch` cuenta command buffers y el de cada slot dice si este ya ha nombrado y retenido los buffers de
   los dos programas del estado.
-- `CommandBuffer::PassReturn` (`include/…/command.hpp:363`, `src/render.cpp:4213`): un pase abierto que se suelta
+- `CommandBuffer::PassReturn` (`include/…/command.hpp:373`, `src/render.cpp:4246`): un pase abierto que se suelta
   (`open_.reset()` en `closePass`, sin tocar) vuelve a la cola como nuevo en todos sus campos (`*p = OpenPass{}`)
   salvo la memoria de sus streams, sombras y caché; `draw()` toma de ahí su pase.
 
 ### 3.7 `appendStream` (`316d077`)
 
 Copiaba el stream de un pase paquete a paquete (decodificar, volver a hacer, un `insert` por paquete) para llegar a
-las mismas palabras. Es un NOP y un `append` (`src/render.cpp:4158`).
+las mismas palabras. Es un NOP y un `append` (`src/render.cpp:4191`).
 
 ### 3.8 Plug-in ObjC (`6c42baf`)
 
-- `-hakiosProgramFor:offsets:count:` (`CA.m:7526`) buscaba la variante de un über-shader con un `NSData` nuevo, un
+- `-hakiosProgramFor:offsets:count:` (`CA.m:9163`) buscaba la variante de un über-shader con un `NSData` nuevo, un
   `NSDictionary` y `@synchronized` en cada draw. Los contenidos vistos son arrays en el pipeline (bytes, hash,
-  programa; 64 como antes) bajo un `os_unfair_lock` que solo dura la búsqueda; los bytes se leen una vez, a la pila.
+  programa y la máscara de los bytes que decidieron su compilación; 128 ranuras, §10.6) bajo un `os_unfair_lock` que
+  solo dura la búsqueda; los bytes se leen una vez, a la pila.
 - `hakios_metal_cb_set_vertex_textures` se llamaba antes de cada draw; se llama en el primer draw de un encoder y
-  cuando cambia una textura o sampler de vértices (`_vsTexturesTold`, `CA.m:8451`).
-- Interruptores (boot-args o `/var/tmp/metal.args`, leídos con la primera cola, `CA.m:5038`): `metal_keep=0` (ningún
+  cuando cambia una textura o sampler de vértices (`_vsTexturesTold`, `CA.m:10252`).
+- Interruptores (boot-args o `/var/tmp/metal.args`, leídos con la primera cola, `CA.m:6352-6367`): `metal_keep=0` (ningún
   draw desde estado guardado: mismo stream, es el A/B del estado guardado con un solo binario) y `metal_verify=1` (§4).
 - `passes:` (con `metal_fps=passes`) separa, por pasada en tiles, `wrote` (attachments con salida del stage de
   fragmento) y `read` (leídos por fetch), y añade el motivo de las que quedan en sysmem.
@@ -205,7 +213,7 @@ desde estado guardado deja las mismas palabras que uno por el camino largo, así
 
 Sobre lo fusionado:
 - `drawStates` trabaja en un `Work` por hilo (`src/gmem.cpp:107`) y escribe cada fragmento donde queda; `closePass`
-  (`src/render.cpp:5049`) usa el scratch del command buffer para tiles, cola, copia de draws y grupos (`db05cce`):
+  (`src/render.cpp:5120`) usa el scratch del command buffer para tiles, cola, copia de draws y grupos (`db05cce`):
   mismas palabras, 5,6 → 1,1 asignaciones por draw en la escena U.
 - Un pase grabado de las dos formas se graba solo para tiles desde el draw en que `gmemWorth` ya no puede elegir
   sysmem (`6867870`, `CommandBuffer::draw`): hay un draw con fetch y el pase tiene `kGmemFewDraws` draws, o
@@ -226,9 +234,9 @@ Sobre lo fusionado:
 2. **Tres vías** del mismo binario, comparadas por `check`: estado guardado con cada draw comprobado; sin comprobar
    (`tests --unchecked`, como corre en el teléfono); y todo por el camino largo (`CommandBuffer::keepStates(false)`,
    `tests --long`, `drawbench --long`).
-3. **`CommandBuffer::verifyDraws`** (`include/…/command.hpp:221`; `metal_verify=1` en el teléfono): cada draw tomado
+3. **`CommandBuffer::verifyDraws`** (`include/…/command.hpp:224`; `metal_verify=1` en el teléfono): cada draw tomado
    de un estado guardado se escribe además entero, a través de una copia de la sombra puesta al día, y se comparan
-   las palabras y los bytes de la tabla (`verifyDraw`, `src/render.cpp:4111`). Una diferencia falla el command buffer
+   las palabras y los bytes de la tabla (`verifyDraw`, `src/render.cpp:4144`). Una diferencia falla el command buffer
    y dice cuál: «a draw of X from its kept state: word 12 of 85 is 0x…, 0x… the long way».
 4. **`tests/draw_state_test.cpp`**: los casos en que un estado guardado sería falso si se guardase mal (programa
    cambiado tras dibujar con él, otro tipo de pase, enlaces que el estado no puede tomar, más programas que slots) y
@@ -296,12 +304,22 @@ salvo donde hay dos archivos):
 | `ab-k350-merge2-passes` | `merge-2`, `metal_fps=passes` | 0350, `idle_cache=0` | 51,6 | 126 | 17 µs | 4,0 ms |
 | `ab-k352-merge3-a` | `merge-3` (`4e0a51a`) | 0352 | 49,0 | — | 16 µs | 4,8 ms |
 | `ab-k353-merge4-a` | `merge-4` (`81dd364`), `metal_fps=passes` | 0353, escalado directo por el DPU | 48,9 | — | 16 µs | — |
+| `ab-k353-todo-{1,2}` | `merge-5` (`4cf8232`) | 0353, escalado directo y actualizaciones parciales de CoreAnimation (la configuración «todo» del coordinador) | 55,1 / 58,3 | 75 / 74 | 16 µs | 6,0 / 2,4 ms |
+| `ab-k353-merge7` | `merge-7` (`96d9bac`) | 0353, otro arranque | 50,7 | 75 | 19 µs | 3,0 ms |
 
 [M] Entre ensayos idénticos de `merge-3` la base varía de 38,7 a 46,3 buffers/s (`ab-k352-m3b-*`): las diferencias
 entre filas de menos de ~15 % no dicen nada con n=1. Dos A/B del coordinador sobre `merge-3` que sí separan:
 `metal_gmem_off=64` (el cuerpo del pase sin grupos de estado, cada tile repite el estado de todos los draws) baja a
 35,3 buffers/s y sube commit→fin de ~28 a 43,8 ms: el trabajo del procesador de comandos por bin pesa;
 `metal_gmem_draws=6` no cambia nada medible en el home (44,2 y 48,2 buffers/s).
+
+[M] La fila de `merge-7` no es comparable con las de `todo`: es otro arranque, y las líneas `SWEET FB` del kernel
+(`ab-k353-merge7.fb`) dicen que ahí todos los frames pasan por la composición de GPU del kernel (248 a 326 de 248 a
+326 swaps por periodo), mientras que en `todo` casi ninguno (10 de 630). Con ello commit→fin es 16,0 ms y la GPU va
+al 81 % (7,6 ms y 43-46 % en `todo`). El ensayo que se le parece es `ab-k353-dirty-a` (49,9 buffers/s, 19 µs por
+draw, commit→fin 14,3 ms, GPU 71 %; por la hora, `merge-5`: no verificado). Qué opciones del kernel llevaba cada
+arranque no está verificado aquí. En `ab-k353-merge7.txt` los pipelines se hacen en 0,5-0,8 ms («2 of 2 stages from
+the cache») y no hay ninguna línea `refused`, `stands in for it` ni `specialise:`.
 
 ### 6.1 Por qué el teléfono iba ~13× más lento por draw que el host
 
@@ -347,15 +365,18 @@ $R/wt-cpu/hakios-metal/out/dev-a610/drawbench --runs 1 --record 30000 --scene U 
 cd $R && SRC=$R/wt-cpu IOS_EXTRA="-g" CACHE_BUILD=24ed84207640dc54c2b865f7 ./build-bundle.sh $R/out/NOMBRE
 ```
 
-- La clave de caché de stages se fija a la de `propio-args` porque el compilador no cambia: de `620950c` a la punta,
-  `src/compiler.cpp` gana tres líneas (el uid) y ni `kernel.hpp` ni `Stage` cambian; la caché del teléfono sigue
-  valiendo.
+- La clave de caché de stages se fija a la de `propio-args` (`CACHE_BUILD`) porque lo que `compileStage` produce
+  para una misma entrada no cambia de `620950c` a la punta: los cambios de `src/compiler.cpp` son el uid, el orden
+  entre caché y cerrojo, los tiempos y el índice de buffers conocidos (§10.6), y ni `kernel.hpp` ni `Stage` cambian.
+  La caché del teléfono sigue valiendo [M: con `merge-7` los pipelines salen «2 of 2 stages from the cache»]. Sin
+  `CACHE_BUILD` la clave es el hash de `src/compiler.cpp`, las cabeceras y los archivos de Mesa (`Makefile:113`):
+  cualquier cambio de cabecera vacía la caché del teléfono.
 - El build de iOS usa la libc++ 15 del SDK: compilar el bundle después de cada cambio de cabeceras (un
   `unique_ptr` con deleter anidado compilaba en el host y no ahí, `6d3f273`).
 - Los bundles son mayores que `propio-args`: instalar por renombrado, no copiando encima (el instalador que copiaba
   sobre el vnode hacía que dyld rechazase el binario y CoreAnimation compusiera por software: fondo de la Biblioteca
   de Apps sin blur, 434 % de CPU en backboardd, consola vacía).
-- Punta de la rama y bundle: ver «Estado al cerrar».
+- Punta de la rama, bundles y el resto de comandos (compilador en host, trazas, sintaxis del plug-in): §11.1 y §11.2.
 
 ## 8. Interfaces compartidas y riesgos
 
@@ -366,15 +387,22 @@ cd $R && SRC=$R/wt-cpu IOS_EXTRA="-g" CACHE_BUILD=24ed84207640dc54c2b865f7 ./bui
 | `CommandBuffer::keep`, `keepAlive`, `use` | Por referencia y con filtro de recientes (`recently`) | Sin copias de `shared_ptr` ni listas del tamaño del frame |
 | `OpenPass` | Campos `cache` (`PassCache`) y `tiledEarly`; se recicla (`PassReturn`), `open_` es `OpenPassPtr` | §3.2, §3.6, §3.9 |
 | `CommandBuffer::Counts` | `keptDraws` | Tests |
-| `CommandBuffer::PassTime` | `wrote`, `read` | `passes:` |
+| `CommandBuffer::PassTime` | `wrote`, `read`, `loaded`, `stored` | `passes:` |
+| `CommandBuffer::closePass` | Parámetros `next` (el pase del draw que lo cierra) y `kept` | Qué guarda un pase con un attachment memoryless (§10.2) |
+| `Texture` | `setMemoryless`/`memoryless`; `swizzled` conserva la marca | §10.2 |
+| `Draw` | `scissorEmpty` | N-04 |
+| `render::Options` | `fbReadOverlap` | N-18 |
+| `compileStage` | Mira la caché sin el cerrojo del compilador; `CompileTimes`, `takeCompileTimes()`; `CompiledStage::knownReads` | §10.6 |
+| Directorio de la caché de stages | Ficheros `<hash>.known` junto a los `.stage` (`src/compiler.cpp:1323-1395`) | §10.6 |
 | `CommandBuffer::piece` | Parámetro `asIs` | §3.5 |
 | `CommandQueue` | `states()`, `Spare`, `takePass`/`givePass`, `takeSlab(…, usedBefore)`, `poisonReused` | §3.2, §3.5, §3.6 |
 | `Program` | `uid` | §3.2 |
-| `FakeGpu` | `submitHook`, `peek`, `named()`; constantes atadas a su programa | Golden; §2 |
+| `FakeGpu` | `submitHook`, `peek`, `named()`; constantes atadas a su programa; `Stats::loadedPixels`; acepta el scissor vacío (1,1)-(0,0) | Golden; §2; §10.2, §10.3 |
 | `render::vscOverflowWordAt()` | Nueva; `checkVsc` la usa | §2 |
 | `appendStream` | Copia en bloque | §3.7 |
 | `render::drawStates` | Almacenamiento por hilo; mismo resultado | §3.9 |
 | Interfaz C | `hakios_metal_draw_states`, `hakios_metal_cb_pass_access`, `hakios_metal_program_from_stages` (tests) | §3.8, §4 |
+| Interfaz C | `hakios_metal_texture_set_memoryless`, `hakios_metal_texture_memoryless`, `hakios_metal_cb_pass_moved`, `hakios_metal_program_fs_traits`, `hakios_metal_compile_times`, `hakios_metal_program_known_reads`; un scissor de anchura o altura 0 es un scissor vacío | §10 |
 
 `RegShadow` no cambia. Una sombra por páginas de registros (en vez de la tabla hash) se probó y se descartó: sin
 ganancia caliente y peor con cachés frías [O].
@@ -398,6 +426,15 @@ ganancia caliente y peor con cachés frías [O].
   están verificados en el teléfono solo por que `cpu-A-wip`, `merge-1` y `merge-2` pintan bien home, widgets y
   Biblioteca de Apps [M].
 - **Grabación diferida (`metal_defer=1`)**: el camino `DrawCopy` de la interfaz C no está optimizado ni medido aquí.
+- **Máscara de bytes leídos** (§10.6): un stage compilado para un buffer conocido vale para todo buffer que coincida
+  en los bytes que `foldKnownLoad` plegó. Es correcto mientras lo único que la compilación tome del buffer pase por
+  ese plegado: una optimización nueva que lea el buffer conocido por otra vía tiene que anotar sus lecturas.
+  `metal_spec_mask=0` devuelve al plug-in la comparación de todos los bytes; el índice del núcleo no tiene interruptor.
+- **Buffers *no-copy* y texturas sobre buffer** (N-12, §10.7): son copias hechas al crear. Con las respuestas de
+  alineación de la clase base, un tercio de las imágenes de un frame ya llegan así.
+- **Red de seguridad de N-01**: si el compilador rechaza un módulo propio se compila la variante cercana y la consola
+  lo dice (`refused: … stand in for it`). No ha saltado en ninguna consola desde `merge-4`; si salta, es un defecto del
+  compilador que hay que arreglar, no un estado aceptable.
 
 ## 9. Qué falta
 
@@ -444,7 +481,10 @@ enteros (attachments con sus acciones, texturas con su memoria, pipelines con el
 draws con área, vértices transformados y enlaces, y cada pasada del núcleo con su modo, tiles y tiempo de GPU).
 Capturas del coordinador con el bundle de traza sobre `merge-1`, kernel 0352 a 820 MHz, en
 `~/sapphire-angel/research/metal/ios-graficos/trace/capturas/`: `metal-trace-2079-1.txt` (home, 12 command buffers) y
-`metal-trace-2079-2.txt` (abrir la app Tiempo, 90). Lector: `../trace-frame.py`.
+`metal-trace-2079-2.txt` (abrir la app Tiempo, 90). Lector: `../trace-frame.py`. Capturas posteriores, ya con bundles
+de esta rama, en el mismo directorio `trace/`: `capturas-blur/` y `capturas-recientes/` (`merge-5`: Centro de Control
+y selector de apps recién arrancado backboardd) y `capturas-merge6/` (`merge-6`: las mismas vistas, con los tiempos
+de §10.6).
 
 ### 10.1 Qué muestran las trazas [M]
 
@@ -489,10 +529,10 @@ commit nombra.
 | N-03 | Un rango de constantes que ir3 rellena a vec4 enteros (16 B de color → 64) y pasa de las páginas del buffer: draw rechazado y omitido | Se carga directo: los bytes que hay, leídos al codificar, y ceros detrás. El procesador de comandos sigue sin leer fuera de las páginas. Igual en dispatch | `c571fcd` · `a_constant_range_running_past_its_buffers_pages_is_loaded_with_what_is_there` | `merge-4`: 0 líneas `refused` |
 | N-01 | Pipeline creado en ejecución → variante «cercana» de la library, con otras constantes | Se compilan los módulos propios de las funciones con las constantes de CoreAnimation; las variantes de la library solo cuando son la misma función por los nombres de CoreAnimation (etiqueta de la función, o pipeline de la library por su etiqueta), y las dos etapas del mismo origen. Si el compilador rechaza lo pedido, y solo entonces, compila la variante cercana y lo dice con el motivo (backboardd aborta al segundo fallo de un pipeline); `metal_strict` da el rechazo | `81dd364` · sin prueba de host | `merge-4`: 0 `stands in for it`, 4 pipelines «its own module» |
 | N-24, N-08 | `luma_boost` omitido en todos los frames; `luma_boost`/`edr_scale` sustituidos por `inplace_copy` | Se dibuja; las funciones pedidas son las que se compilan | `81dd364` · sin prueba de host | El `(+1 no)` desaparece; un draw más a pantalla completa con fetch por frame |
-| N-18 | Un draw que lee su target en sysmem se ordenaba solo con la barrera previa: entre las primitivas del propio draw, nada | `GRAS_SC_CNTL.SINGLE_PRIM_MODE = FLUSH_PER_OVERLAP_AND_OVERWRITE`, como los dos drivers de Mesa (`fd6_emit.cc:564-570`, `tu_pipeline.cc:3373-3376`); la barrera se queda. Se apaga con `metal_gmem_off=8192` | `4c3a83d` · `a_draw_that_reads_its_target_gets_the_target_as_a_texture_and_a_barrier_before_it` | `merge-5`, sin medir |
-| N-04 | Scissor de anchura 0 = «sin scissor» (el draw cubría el target); de altura 0, draw rechazado | No deja pasar nada: se escribe como turnip un scissor vacío, (1,1)-(0,0) (`tu_pipeline.cc:2669-2672`); el draw abre su pase y no toca ningún bin | `4cf8232` · `an_empty_scissor_passes_no_fragment_and_is_no_refusal`, `a_scissor_of_no_area_through_the_c_interface_is_drawn_as_one` | `merge-5`, sin medir |
-| N-07 | El dispositivo no declaraba la alineación de 64 B que necesitan las filas de una textura sobre IOSurface o buffer | `iosurfaceTextureAlignmentBytes`, `iosurfaceReadOnlyTextureAlignmentBytes`, `linearTextureAlignmentBytes`, `deviceLinear(ReadOnly)TextureAlignmentBytes` y `minimumLinearTextureAlignmentForPixelFormat:` contestan 64 (los selectores existen en el Metal de 20H392) | `e22b881` · sin prueba de host | Sin medir. Solo alcanza a las superficies que crea backboardd |
-| N-14 | Swizzle del descriptor: nil en texturas propias, ignorado sobre IOSurface | La textura se crea igual y se lee a través del swizzle, como una vista con swizzle | `e22d7bf` · sin prueba de host del plug-in | Sin medir |
+| N-18 | Un draw que lee su target en sysmem se ordenaba solo con la barrera previa: entre las primitivas del propio draw, nada | `GRAS_SC_CNTL.SINGLE_PRIM_MODE = FLUSH_PER_OVERLAP_AND_OVERWRITE`, como los dos drivers de Mesa (`fd6_emit.cc:564-570`, `tu_pipeline.cc:3373-3376`); la barrera se queda. Se apaga con `metal_gmem_off=8192` | `4c3a83d` · `a_draw_that_reads_its_target_gets_the_target_as_a_texture_and_a_barrier_before_it` | Va desde `merge-5`; sin comprobación a la vista de un caso que lo ejercite |
+| N-04 | Scissor de anchura 0 = «sin scissor» (el draw cubría el target); de altura 0, draw rechazado | No deja pasar nada: se escribe como turnip un scissor vacío, (1,1)-(0,0) (`tu_pipeline.cc:2669-2672`); el draw abre su pase y no toca ningún bin | `4cf8232` · `an_empty_scissor_passes_no_fragment_and_is_no_refusal`, `a_scissor_of_no_area_through_the_c_interface_is_drawn_as_one` | Va desde `merge-5`; sin comprobación a la vista de un caso que lo ejercite |
+| N-07 | El dispositivo no declaraba la alineación de 64 B que necesitan las filas de una textura sobre IOSurface o buffer | Hecho y **apagado**: `iosurfaceTextureAlignmentBytes`, `iosurfaceReadOnlyTextureAlignmentBytes` (bit 1 de `metal_align`) y `linearTextureAlignmentBytes`, `deviceLinear(ReadOnly)TextureAlignmentBytes`, `minimumLinearTextureAlignmentForPixelFormat:` (bit 2) contestan 64 solo con su bit; sin él contesta la clase base, como antes. Declararlas hace invisibles los widgets mientras N-12 no esté resuelta (§10.7) | `e22b881`, `96d9bac` · sin prueba de host | `merge-6` (todas a 64): widgets de fondo opaco invisibles. `merge-7` (apagadas): como `merge-5` |
+| N-14 | Swizzle del descriptor: nil en texturas propias, ignorado sobre IOSurface | La textura se crea igual y se lee a través del swizzle, como una vista con swizzle. Se apaga con `metal_swizzle=0` | `e22d7bf` · sin prueba de host del plug-in | Va desde `merge-6`; ninguna textura lo pide en las trazas (`swizzled=1`: 0): sin ejercitar |
 
 Qué mide el host del cambio de memoryless (escena S de `drawbench`: los programas del teléfono, 110 draws, dos
 attachments, 78 tiles): 78 cargas y 156 guardados (4,88 MB leídos, 9,77 MB escritos) pasan a 78 y 78 (4,88 y
@@ -528,7 +568,7 @@ attachment escrito, doble si mezcla). Las muestras son las que ese pase pasó la
 instantáneas `ZPASS_DONE` del contador de muestras, al empezar y al acabar (`:642-733`). Sin historia, sysmem solo con
 5 draws o menos (`:504-517`); con un draw que lee su target, GMEM siempre (`:548-554`).
 
-[O] `render::gmemWorth` (`src/render.cpp`, `include/hakios-metal/render.hpp`) usa la misma desigualdad con D supuesto
+[O] `render::gmemWorth` (`src/render.cpp:2532`, `include/hakios-metal/render.hpp:574-580`) usa la misma desigualdad con D supuesto
 proporcional al número de draws y calibrado por `metal_gmem_draws=56`: supone ~1/23 de pantalla por draw, cierto para
 un home de iconos y 20 veces corto para capas a pantalla completa. Además la regla de apertura deja en sysmem, sin
 grabar para tiles, todo pase cuyo «semejante» tuvo menos de 28 draws en sus últimas 16 veces, sin saber si lleva un
@@ -566,28 +606,3 @@ fences y colas por cliente con prioridad al servidor de ventanas; cuotas; caché
 semilla del sistema de solo lectura. No determinado: qué procesos abrieron el dispositivo en la tanda de prueba, si
 alguno aborta con él, y el coste real por proceso.
 
-### 10.6 Qué queda
-
-- **Parpadeo del widget de Tiempo cuando algo se le superpone** [M, observación del usuario con `merge-4`]. Sin causa
-  establecida. Hipótesis, todas [H]: el mismo pase sale unas veces en tiles y otras en sysmem (§10.4) y los dos lados
-  no dan lo mismo (N-18 es un candidato); el degradado del widget (`TimgA2Xhfn_IsrcN3Oc3mtc4`) es uno de los
-  pipelines que ahora se compilan del módulo propio; `luma_boost`; la copia por CPU de superficies con filas no
-  múltiplo de 64 B (N-06; 2 848 B = 712 px, el ancho de un widget mediano). Lo decide: si ocurre con `merge-3`; con
-  `merge-4`, `metal_skip=luma_boost`, `metal_gmem_draws=1` y `metal_gmem=0` uno a uno; `merge-5` con y sin
-  `metal_gmem_off=8192`; y una traza de 40 command buffers con el parpadeo en pantalla.
-- **Destellos de colores al abrir apps**: la traza no tiene nada mal formado; candidatos a la vista son los pipelines
-  sustituidos (corregido), la imagen de lanzamiento en ASTC 4×4 de 750×1624 y un relleno blanco opaco del 90 % bajo
-  una textura de 752×1626 mezclada durante 20 frames. Hace falta una captura de pantalla del frame del destello.
-- **Elección tiles/sysmem por muestras medidas** (§10.4).
-- **N-02** (command buffer `Completed` con trabajo omitido): con N-03 servido no queda ningún rechazo en uso normal;
-  marcar `Error` por defecto pide saber antes qué hace CoreAnimation con un command buffer en error. **N-09** (un
-  estado rechazado envenena el encoder): no aparece en ninguna consola.
-- **N-05, N-06** (YCbCr y superficies no alineadas por copia de CPU al enlazar): lo conforme es leerlas en la GPU al
-  ejecutar, con una pasada propia antes del pase que las muestrea; no está hecho. N-07 solo alinea lo que crea
-  backboardd.
-- **Memoria de las texturas memoryless**: siguen teniendo filas (4,9 MB cada una a pantalla completa) para los pases
-  en sysmem; asignarlas solo cuando un pase en sysmem las necesita no está hecho.
-
-## Estado al cerrar
-
-(se completa al final de la sesión)

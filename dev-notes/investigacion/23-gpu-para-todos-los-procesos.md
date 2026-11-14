@@ -52,7 +52,8 @@ informes de trabajo `A`-`D`, scripts, lecturas del teléfono en `telefono/`).
    ellos reinician apagando y encendiendo GX y CX.
 9. **Diseño** (§4): en el kernel, tarea, cola y trabajo como objetos; una tabla por tarea con globales compartidos y
    privilegiados; `CP_PROTECT`; fences por cola; `TF_GPU_DENIED` y prioridades con los entitlements de iOS; un
-   planificador sin expulsión que da paso al servidor de ventanas; recuperación con culpable que reejecuta a los
+   planificador que da paso al servidor de ventanas (primero sin expulsión; después, la expulsión por ring que kgsl usa
+   en el A610); recuperación con culpable que reejecuta a los
    inocentes y castiga con las reglas de iOS; memoria en el ledger de la tarea y reparto del pool. En el driver,
    dispositivo para todos, errores con la tabla de IOGPU, caché por proceso con semilla del sistema y configuración sin
    ficheros públicos. Para backboardd no cambia nada visible.
@@ -272,7 +273,9 @@ que es lo que devuelve `clientHasPrivilege` a una tarea denegada; en ese caso to
 lugar de la normal; si esa prioridad de fondo es 3 guarda en la cola el valor 6, que es el código
 `kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted` de la tabla de §2.6 [H la correspondencia]. Es
 decir: una app sin concesión ve fallar sus command buffers con `MTLCommandBufferErrorNotPermitted`, salvo en colas a
-las que el proceso dio una prioridad de fondo, que siguen a esa prioridad. Si el envío mismo falla con
+las que el proceso dio una prioridad de fondo, que siguen a esa prioridad; `setBackgroundGPUPriority:` lo usan
+PosterBoard, CoreImage, Espresso, Vision, PencilKit, CMImaging y MediaCoreUI [O, cadenas de selector, `B2` §1.4]. Si
+el envío mismo falla con
 `kIOReturnNotPermitted` (métodos `kIOUCForegroundOnly`), IOGPU completa cada command buffer con el código 7
 (0x1ece1836c-0x1ece18390), también `NotPermitted`.
 
@@ -423,7 +426,8 @@ cualquier servicio. Lo que en iOS hace el perfil, en el port solo lo puede hacer
   cabecera que exige la versión exacta del compilador del dispositivo.
 - **[O] Quién compila:** el servicio XPC `com.apple.MTLCompilerService` del propio Metal.framework
   (`XPCCompilerConnection::setupConnection`, 0x181a41908). **[M]** En el teléfono hay uno en el dominio XPC de
-  backboardd (`launchctl procinfo`: `domain = pid/1235 [backboardd]`, 14 nov, 14:08): una instancia por proceso cliente.
+  backboardd (`launchctl procinfo`: `domain = pid/1235 [backboardd]`, 14 nov, 14:08): el servicio vive en el dominio de
+  su cliente, como todo servicio XPC de un framework, una instancia por proceso cliente [H la generalización].
 - **Por qué por proceso [H]:** el compilador procesa shaders arbitrarios del cliente; en un proceso aparte, con la
   identidad y el sandbox del cliente, un fallo o un exploit del compilador no compromete a nadie más, y una caché en el
   contenedor de cada app no deja que una app ponga código de GPU en otra.
@@ -498,17 +502,17 @@ crea QuartzCore.
 | chronod (instantáneas de widgets) | instantánea en formato RenderBox | formato de archivo de CoreAnimation [H] |
 | SiriUICore (esfera de Siri, en SpringBoard) | pipeline library propia | registra el error y sigue ([M] en el teléfono) |
 | Teclado | rastro de la escritura deslizando en un `MTKView`; el resto del teclado no usa Metal (UIKitCore no lo enlaza; dibuja con CoreGraphics sobre IOSurface) | `MTKView` sin dispositivo: sin rastro [H] |
-| Legibilidad sobre el fondo (`SBUILegibilityMetalEngine`) | motor Metal | aserción (`NSInternalInconsistencyException`); hay un motor por defecto sin Metal y no está verificado cuál usa SpringBoard |
+| Legibilidad sobre el fondo (`SBUILegibilityMetalEngine`) | motor Metal | aserción (`NSInternalInconsistencyException`); no es el motor por defecto (`SBUILegibilityDefaultEngine`, `B2`) |
 | Imágenes de fondo (`SBFCARendererImpl`, en `SBRendererService.xpc`) y vistas previas de PosterBoard | IOSurface → textura → `CARenderer` | no comprueban: imagen sin pintar [H] |
 | CoreImage (`CIContext`) | Metal | cae a OpenGL ES, que en iOS 16 es `AppleMetalGLRenderer` y también pide Metal: `CIContext` sale nil. **No hay ruta de CPU**: `kCIContextUseSoftwareRenderer` se convierte en una petición de prioridad baja |
-| SwiftUI / RenderBox (`drawingGroup`, `Canvas`) | RenderBox en GPU | `RBNullDevice` y rutas a `CGContext` |
+| SwiftUI / RenderBox (`drawingGroup`, `Canvas`) | SwiftUI no enlaza Metal: dibuja en GPU a través de RenderBox | `-[RBLayer _displayWithBounds:callback:lock:]` no dibuja sin dispositivo (0x1e68a763c); RenderBox tiene rutas a `CGContext` pero `RBLayer` no cae a ellas. Qué hace SwiftUI con `drawingGroup`/`Canvas`: no verificado |
 | SpriteKit (y el póster de emoji) | Metal sin mirar si hay dispositivo; su alternativa GL también necesita Metal | sin ruta que funcione [H] |
 | SceneKit, MPS, Vision | GPU | nil y un error registrado; el detector de Vision devuelve error |
 | CoreML (Espresso) | GPU | `std::logic_error("Metal device not found.")`; que las API lo capturen no está verificado |
 | Cámara (mediaserverd) | efectos y preparación de shaders | casi todo comprueba y se salta el paso |
 | Pósters del Tiempo y Orgullo | efectos por Metal | comprueban y se saltan los efectos |
 | Póster Astronomía (NanoUniverse) | Metal | el ejecutable comprueba; NanoUniverse recibe nil sin comprobar. Por qué se reiniciaba en bucle en el port no está verificado |
-| WebKit | el proceso GPU (`com.apple.WebKit.GPU`) dibuja canvas y WebGL (ANGLE sobre Metal, MSL generado en ejecución) y reproduce medios; WebContent no abre la GPU salvo con una extensión de sandbox (§2.8; `C` §5.2) | sin WebGL ni canvas acelerado [H] |
+| WebKit | el proceso GPU (`com.apple.WebKit.GPU`, código en WebKit, WebCore, libANGLE y WebGPU) hace WebGL con ANGLE sobre Metal (MSL generado en ejecución) y WebGPU; atribuye la memoria a cada WebContent (`setOwnerWithIdentity:`); WebContent no abre la GPU salvo con una extensión de sandbox (§2.8; `C` §5.2) | `angle::IsMetalRendererAvailable()` falso y `DisplayMtl::initialize` sale por error: sin WebGL; WebGPU sin adaptador; canvas 2D y DOM, con CoreGraphics sobre IOSurface [H] |
 | Notas | precalentamiento | nada |
 | ImageIO, CoreUI, HomeUI | disposición de texturas ASTC; detección de capacidades | ruta de CPU; menos efectos |
 
@@ -884,8 +888,8 @@ Todo fuera de git, en `~/sapphire-angel/research/metal/multiproceso/`:
 | Ruta | Qué es |
 |---|---|
 | `ipsw/kernelcache.release.iphone10b{,.decompressed}` | Kernelcache de 20H392 para iPhone10,3/10,6 (im4p sha256 `2d6a13d0…`), leído del IPSW por rangos (`ios-graficos/ios-20H392/scripts/catmember.py`) |
-| `ipsw/087-86593-047.dmg`, `ipsw/mnt-systemos/` | Cryptex SystemOS de 20H392 (APFS crudo, 2,74 GB) y su montaje de solo lectura |
-| `dsc/` | dyld shared cache con la cabecera corregida (`objcOptsSize = 0x38`) y la caché de símbolos de ipsw (`dsc.a2s`) |
+| `ipsw/087-86593-047.dmg` | Cryptex SystemOS de 20H392 (APFS crudo, 2,74 GB). Se monta de solo lectura con `hdiutil attach -imagekey diskimage-class=CRawDiskImage -readonly -nobrowse -noverify -noautofsck -mountpoint ipsw/mnt-systemos ipsw/087-86593-047.dmg` |
+| `dsc/` | dyld shared cache con la cabecera corregida (`objcOptsSize = 0x38`; los subcachés son enlaces a `ipsw/mnt-systemos`, que tiene que estar montado) y la caché de símbolos de ipsw (`dsc.a2s`) |
 | `A-kernelcache-ios.md`, `A/` | Informe de trabajo del kernelcache (IOGPUFamily, AGXG10P, IOSurface, Sandbox) y sus guiones (`kc.py`, `xref.py`, `ana.py`, `disp.py`) |
 | `B1-userland-metal-iogpu.md`, `B1/` | Informe de trabajo de Metal, IOGPU, AGXMetalA11, RunningBoard y libCoreFSCache; desensamblados y guiones |
 | `B2-clientes-y-entitlements.md`, `B2/` | Informe de trabajo de clientes de Metal, `.metallib` del sistema y entitlements de 2784 binarios (`raw/`) |
