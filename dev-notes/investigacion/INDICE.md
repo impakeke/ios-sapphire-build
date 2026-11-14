@@ -24,6 +24,7 @@ Todo es **observación medida**, **fuente primaria citada** o **hipótesis marca
 | 04 | [04-auditoria-documentacion-heredada.md](04-auditoria-documentacion-heredada.md) | Auditoría del resto de docs: arranque/recovery, **seguridad** (hash en spwd.db, .supdate root sin firma, shell 2323), qué funciona, reproducibilidad, licencias, correcciones y riesgos |
 | 05 | [05-parche-0330-ruta-de-datos.md](05-parche-0330-ruta-de-datos.md) | Parche 0330: ruta de datos v2 tras `sweetusb_dp=2` — diseño, invariantes, verificación, riesgos, boot-args del A/B |
 | 06 | [06-parche-0334-ufs-raw-io.md](06-parche-0334-ufs-raw-io.md) | Parche 0334: panic de `sweet_ufs` en E/S cruda (memcpy a VA de usuario vía physio; no es PAN), arreglo con `uiomove` |
+| 07 | [07-plan-cpu-stutter.md](07-plan-cpu-stutter.md) | **Siguiente sesión**: plan para descartar CPU como causa del stutter antes de Metal (hipótesis H1-H6 y protocolo) |
 | — | [../acceso-al-telefono.md](../acceso-al-telefono.md) | Receta para entrar: `fastboot continue`, 192.168.7.x, `nc 2323`, `ssh sapphire` |
 | — | [../angel.cmdline](../angel.cmdline) · [../bootargs.py](../bootargs.py) | Boot-args reales de expG y el extractor |
 
