@@ -50,7 +50,7 @@ Los archivos descargados (incluido el overlay con `master.passwd`/`spwd.db`) que
 | "The first install ERASES ANDROID" | docs/INSTALL.md:30-33 | RESPALDADA | sapphire-install.sh:211-218,298-316; hay borrado diferido si quedó `format-pending` | Alto |
 | Requiere "OrangeFox installed" | INSTALL.md:19 | RESPALDADA | `twrp install`, `/dev/fuse`. No dice **dónde** va OrangeFox | Medio |
 | Cadena "ABL → fastboot boot → shim → XNU" | README.md:15,34-42 | OBSOLETA | Ahora es ABL → BootShim → UEFI Mu-Silicium → SapphireXnuBoot → shim → XNU (uefi/README.md:7) | Medio |
-| "No USB link… (only when booted with fastboot boot)" | notas de la release | RESPALDADA (n=1 por ruta) | 03 E1, 02 §P4 | Medio |
+| "No USB link… (only when booted with fastboot boot)" | notas de la release | RESPALDADA para kernels sin 0331 | 03 E1-E2 (0/3 por la ruta normal), 02 §P4. Con UTMI como reloj PIPE (0331, por defecto desde 0332) enumera también por la ruta normal (03 E3-E6) | Medio |
 
 ## 2. Seguridad
 
@@ -104,7 +104,6 @@ No hay entradas en NOTES.md después del 2026-11-08 (0299). Todo lo de 0.1.7/0.1
 | Duración del build | README.md:54; HANDOFF.md:27; codemagic.yaml:3 | Inconsistente | Medido en el fork: 8m40s (run 43562358335) | Bajo |
 | "Kernels build on Codemagic or GitHub Actions" | AGENTS.md:8-9 | OBSOLETA para Angel / RESPALDADA en el fork | NOTES.md:186-189: Angel compila en WSL desde 0241. Fork: run 43562358335 OK, Xcode 16.0 (16A242d), 327 parches aplicados | Medio |
 | darwin-xnu-build salta parches sin avisar | fetch-ci-kernel.sh:7-10 | RESPALDADA | dxb `build.sh` l.472-478; también tools/xnu-linux/xprep.sh:27-30; `MAKEFLAGS -k`; `|| true` en Collect (codemagic.yaml:77-78) | Alto |
-| 03: "ejecución 43561459873" | investigacion/03:76 | CONTRADICHA (menor) | Esa terminó en failure; la buena es 43562358335 | Bajo |
 | "Xcode 21" | build-recipes.md; continuar-en-otra-maquina.md; toolchain-findings.md | CONTRADICHA (nombre) | Esa versión no existe: es Apple clang 21.0.0 de CommandLineTools / SDK 26.x | Bajo |
 | "toolchain roto" / "probado correcto" | toolchain-findings.md:23-38 | CONTRADICHA | investigacion/01 | Medio |
 | El shim necesita `aarch64-linux-gnu-gcc` | README.md:75 | RESPALDADA | shim/build.sh. build-recipes.md:42 cita `shim/build-mac.sh`, que no existe; el real es dev-notes/shim-build-mac.sh | Bajo |
@@ -151,7 +150,7 @@ No hay entradas en NOTES.md después del 2026-11-08 (0299). Todo lo de 0.1.7/0.1
 6. **scrub.py**: añadir `pwd.db`, `spwd.db`, `passwd` y `/redwood/share/btshim/bdaddr`, y regenerar el overlay.
 7. **.gitignore:4**: cambiar `recovery/` por `/recovery/` para que `installer/recovery/` entre en git.
 8. **README.md**: tabla de qué funciona y qué no, la cadena con UEFI, el ring en `iosroot` y la sección de build (xnu-4k en macos-15/Xcode 16.0; la release se compila en local con tools/xnu-linux).
-9. **codemagic.yaml:12** (0128 → 0141), **xnu.yml** (macos-14 y `main`) y **03:76** (run 43562358335).
+9. **codemagic.yaml:12** (0128 → 0141) y **xnu.yml** (macos-14 y `main`).
 10. **"Xcode 21" → "Apple clang 21 / SDK 26.x"**; corregir la ruta de shim-build-mac.sh.
 11. **dev-notes/README.md:23-34**: que remita a investigacion/INDICE.md.
 12. **NOTES.md**: añadir las entradas de 0300-0329 y de 0.1.7/0.1.8 (separando lo medido de lo que dicen los commits) y avisar de que lo anterior a L451 es de sweet.

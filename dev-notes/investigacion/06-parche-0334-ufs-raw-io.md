@@ -2,9 +2,9 @@
 
 **Autor:** agente Claude Opus 5.5. Revisión: sesión principal. **Bug:** panic de E5 (`03-experimentos-y-datos.md`).
 
-## Correcciones a la premisa (con evidencia)
+## Qué es el fallo
 
-- **No es PAN.** Los Cortex-A53/A73 son ARMv8.0 y no tienen PAN: el parche 0081 quita `__ARM_PAN_AVAILABLE__` y `pexpert/pexpert/arm64/SWEET.h:37` lo dice expresamente ("Cortex-A53/A73 have no PAN").
+- **Sin PAN.** Los Cortex-A53/A73 son ARMv8.0 y no tienen PAN: el parche 0081 quita `__ARM_PAN_AVAILABLE__` y `pexpert/pexpert/arm64/SWEET.h:37` lo dice expresamente ("Cortex-A53/A73 have no PAN").
 - **Qué dice la ESR 0x9600004f:** EC 0x25 (data abort en EL1), WnR=1 (escritura), DFSC 0x0f (permission fault de nivel 3). El kernel escribió en una página de usuario cuya PTE era RO en ese instante.
 - **La zona del log se lee del disco.** `sweet_log_ring` solo se usa para append, copy y flush; ninguna lectura se sirve desde el ring en memoria.
 
@@ -41,7 +41,8 @@ Rutas del replay `~/sapphire-angel/research/auditoria-sweet_usb/replay/xnu`:
 - 0329-0333 solo tocan `sweet_usb.c`.
 - 0334 pasa `git apply --check` en el replay y, en orden, 0329→0334 sobre una copia; el resultado es idéntico al fichero editado.
 - `clang -fsyntax-only` (Apple clang 21, `-target arm64-apple-ios16.0`, macros de kernel, cabeceras del replay): rc=0, sin avisos nuevos con `-Wextra -Wshorten-64-to-32 -Wsign-compare -Wconversion`. Se confirmó que el bloque se compila de verdad inyectando un error.
-- Falta enlace (lo hace el CI) y la prueba en el teléfono.
+- CI: run 43570770230, compila y enlaza (kernel sha `ffcc981f…`).
+- En el teléfono (03 E7): el `dd` de E5 completa 30/30 sin panic; lecturas de 4 MiB ×4 (10/10) y de 1 MiB ×64 completas; offset desalineado → EINVAL.
 
 ## Riesgos
 
@@ -49,4 +50,4 @@ Rutas del replay `~/sapphire-angel/research/auditoria-sweet_usb/replay/xnu`:
 - Semántica nueva en los bordes: EOF, EINVAL por desalineación, rechazo de escrituras que no caben. fsck y newfs usan offsets alineados.
 - `kalloc_data` de hasta 1 MiB (ENOMEM bajo presión de memoria). Rendimiento igual o mejor: comandos de 1 MiB frente a 64 KiB.
 - Un `dd` de la zona del log puede ver una instantánea a medias, igual que antes.
-- Prueba pendiente en el teléfono: el mismo `dd` (bs=4096 count=1025 y bs=4m), y escritura/lectura con `ufsrw=1`.
+- No probado en el teléfono: escritura cruda con `ufsrw=1`.

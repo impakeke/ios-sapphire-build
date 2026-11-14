@@ -13,7 +13,7 @@ Las citas de Linux corresponden al tag `v6.12` de torvalds/linux (raw.githubuser
 | P1 (CMDSTATUS=1) | Cubierta con fuente primaria |
 | P2 (ciclo de vida / HWO) | Cubierta para Linux y U-Boot; **PENDIENTE** el orden HWO→evento según el databook |
 | P3 (polling / caché / eventos perdidos) | Cubierta; **PENDIENTE** el gate de versión de EVNT_HANDLER_BUSY y la coherencia en SM6225 |
-| P4 (ABL) | **Parcial:** código de ABL para fastboot, continue, reboot y ExitBootServices, más binarios stock desensamblados; **no se obtuvo** el estado final del PHY |
+| P4 (ABL) | **Parcial:** código de ABL para fastboot, continue, reboot y ExitBootServices, más binarios stock desensamblados; sin el cuerpo de `PreparePlatformHardware`. El estado del PHY y de GCC en cada vía se midió en el teléfono (03 E2) |
 | P5 (erratas/quirks) | Cubierta |
 
 ## P1. Start Transfer con status 1
@@ -144,7 +144,7 @@ Origen: `Project-Silicium/Device-Binaries` @af63402ef522, `tapas/QcomPkg/Drivers
 
 ### ¿Encaja "timeout de Set Endpoint Config en ep0" con un PHY o reloj ausente?
 
-Hay fuentes que lo apoyan, pero no lo prueban para este chip:
+Sí. Las fuentes de abajo lo apoyan en general, y en el teléfono se midió (03 E2-E3): en la ruta normal el reloj PIPE del PHY USB3 está apagado, y seleccionar UTMI como reloj PIPE (`dwc3_qcom_select_utmi_clk`) elimina el timeout.
 
 - **UG1087, GUSB2PHYCFG ENBLSLPM[8]:** "Before issuing any device endpoint command when operating in 2.0 speeds, disable this bit... if mac2_clk (utmi_clk) is gated off, the command will not get completed."
 - **Linux `gadget.c` L320-329** cita la "DWC_usb3 3.30a programming guide section 3.2.2".
@@ -158,11 +158,12 @@ Hay fuentes que lo apoyan, pero no lo prueban para este chip:
 3. Los DXE stock registran limpieza en ExitBootServices. Que sea un deinit completo es inferencia, y no se sabe qué registros toca. *Observación propia de C1: tras `continue`, el DWC3 seguía configurado (DCFG, DEVTEN y DALEPENA puestos, buffer de eventos del ABL), así que esa limpieza no lo resetea.*
 4. Un SO independiente necesita: el GDSC y los relojes de GCC, el reset `QUSB2PHY_PRIM_BCR`, los reguladores L4A/L12A/L15A, la secuencia del PHY femto y el override de VBUS en QSCRATCH.
 
+5. *Medido en el teléfono (03 E1-E3):* el PHY femto queda inicializado igual en ambas vías; en arranque normal el reloj PIPE del PHY USB3 (GCC CBCR 0x1a058) está apagado y `GENERAL_CFG` no selecciona UTMI. VBUS no influye.
+
 **PENDIENTE:**
 
-- el estado real del PHY en cada vía (lo dará el parche 0329);
-- si depende de VBUS (R1 sugiere que no);
 - `PreparePlatformHardware`;
+- qué toca el deinit de `UsbConfigDxe` en ExitBootServices;
 - la fuente de los DXE.
 
 ## P5. Erratas y quirks

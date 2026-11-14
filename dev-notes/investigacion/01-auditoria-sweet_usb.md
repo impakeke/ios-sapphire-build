@@ -8,18 +8,16 @@
   - `anexos/replay-parches-apply.log`
   - Lo pesado está en `~/sapphire-angel/research/auditoria-sweet_usb/`: Mach-O de expG, `ud_thread.dis`, fuentes de referencia, transcripción.
 
-> **Corrección posterior (Experimento 1, R1 y C1, 2026-11-14).** La sección 3 atribuía la observación A en parte a un confusor de VBUS. R1 repitió la ruta de reboot **con VBUS presente** (PMIC `usb 0x10`) y falló igual, con los mismos registros. Así que el confusor queda **descartado**. Además, la ruta mala tenía **ENBLSLPM = 1** (GUSB2PHYCFG 0x2500 frente a 0x2400 en C1). La premisa de 0328 era parcialmente correcta, pero limpiar ese bit no basta. Ver `03-experimentos-y-datos.md`.
-
 ## Resultado en breve
 
 - **B es una regresión de 0327.** La misma finalización se consume dos veces: por sondeo de HWO (`ud_reclaim_fast`, L1068-1074) y por su evento, que el manejador acepta sin comprobar nada (L881-893). El segundo consumo lanza Start Transfer sobre una transferencia viva, y el controlador responde estado 1 (No Resource).
 - **El estado permanente lo crea el propio driver** (lo más probable, no observado directamente). Cada intento reescribe el TRB que posee el controlador. Si la transferencia en vuelo termina entre el volcado del TRB (L300) y la escritura de DEPCMD (L272), el controlador borra HWO del TRB recién escrito y acepta el Start sobre un TRB sin HWO. Linux usa ese estado a propósito. Ninguna ruta emite End ni Update Transfer para EP_TX.
 - **`tx 2 688 980` cuenta intentos, no tramas.** Cada intento fallido imprime una línea, que el hilo de log convierte en otra trama dentro del mismo bucle.
 - **No hay evidencia de que RX se parara a nivel USB.** "Host is down" y la falta de ARP se explican solo con TX muerto.
-- *(Ver la corrección de arriba.)* La observación A estaba confundida: en el arranque malo el PMIC no veía VBUS (`usb 0x26`, PLUGIN a 0) desde antes del probe USB. Aun así el DWC3 estaba en valores de reset, luego el ABL no lo había tocado.
-- **0328 parte de una premisa falsa en cuanto a SUSPHY**, que ya era 0. *(Corrección: ENBLSLPM sí era 1.)*
+- **Observación A (no enumera en arranque normal):** el DWC3 está en valores de reset cuando el driver toma el control; el ABL no lo configura en esa ruta. VBUS no influye: el arranque malo del 13 nov no tenía VBUS (PMIC `usb 0x26`), pero R1, con VBUS presente, falló con los mismos registros (03 E1). La causa es que el reloj PIPE del PHY USB3 está apagado en esa ruta; se corrige seleccionando UTMI como reloj PIPE (0331, 03 E2-E3).
+- **0328 no ataca la causa.** SUSPHY ya era 0; ENBLSLPM sí era 1 en la ruta mala (GUSB2PHYCFG 0x2500 frente a 0x2400), pero limpiarlo no basta: el timeout de DEPCFG sigue.
 - **Afirmaciones de las notas contradichas:** "se pierden eventos", "0327 cura / es un ring", "el toolchain está roto", "el parche está probado correcto" y "`fastboot boot` brickea".
-- **Todos los parches aplican.** Los 322 pasan `git apply --check` en orden, y el kernel de expG contiene 0327 y 0328 (comprobado por desensamblado). El borrador del 0329 de reclaim **no** pasaba `--check` y el CI lo habría saltado en silencio (descartado; copia en research/).
+- **Todos los parches aplican.** Los 322 pasan `git apply --check` en orden, y el kernel de expG contiene 0327 y 0328 (comprobado por desensamblado). El borrador del 0329 de reclaim **no** pasaba `--check` y el CI lo habría saltado en silencio (no se usó; copia en research/).
 
 ## 0. Qué se verificó y cómo
 
@@ -180,7 +178,7 @@ Lo observado (unas 140-200 tramas) cae en torno al p10. Es compatible, con n=1.
 - DCFG 0x00080804, DCTL 0x00f00000;
 - DSTS 0x00520004 (COREIDLE 0).
 
-DEPSTARTCFG se completa, pero DEPCFG da timeout. Las órdenes de endpoint necesitan la señal del PHY [10]. La suposición que falla es: "el ABL deja el controlador en modo dispositivo, parado y con el PHY listo". No se sabe si falta el PHY, el mux o ambos, porque nadie lee esos registros. Eso es lo que hace ahora el parche 0329.
+DEPSTARTCFG se completa, pero DEPCFG da timeout. Las órdenes de endpoint necesitan la señal del PHY [10]. La suposición que falla es: "el ABL deja el controlador en modo dispositivo, parado y con el PHY listo". El volcado del parche 0329 (03 E2) localiza la diferencia: el PHY femto está inicializado igual en ambas rutas, pero en la ruta normal el reloj PIPE del PHY USB3 (GCC CBCR 0x1a058) está apagado y QSCRATCH `GENERAL_CFG` no selecciona UTMI. Con UTMI como reloj PIPE (paso 5 de abajo; parche 0331) enumera sin fastboot (03 E3).
 
 **PHY:** el DT del fabricante confirma que es el femto (`qcom,usb-hsphy-snps-femto` en `hsphy@1613000`) [12]. El `sm6115.dtsi` de mainline declara ahí un QUSB2, que **no vale** para SM6225.
 
@@ -199,7 +197,7 @@ DEPSTARTCFG se completa, pero DEPCFG da timeout. Las órdenes de endpoint necesi
 |---|---|---|
 | "Se pierden eventos bajo carga" | Contradicha | `NOTES.md:389`: "not a lost event: kern.sweet_usb_stats shows none". Hoy: "without event: rx 0 tx 0". El comentario de 0224 dice "late event". |
 | "0327 cura el bloqueo" / "es un ring" | Contradicha | Observación B; sigue siendo un TRB por endpoint (L190-191). |
-| "0328 despierta el PHY" | Contradicha en efecto | Timeout idéntico. Corrección: ENBLSLPM era 1, no SUSPHY. |
+| "0328 despierta el PHY" | Contradicha en efecto | Timeout idéntico. SUSPHY ya era 0; ENBLSLPM era 1 y limpiarlo no basta (03 E1). |
 | "El toolchain está roto (ExpB/ExpC)" | Contradicha | ExpB fue un fallo de enlazado ("NO era omagic", `build-recipes.md`). El kernel de expG, con Apple LLVM 21.0.0 y SDK 26.5, arranca iOS y enumera. ExpC: no verificado. |
 | "El parche USB y la config están probados correctos" | Contradicha | Un kernel que murió en la entrada no ejecutó el parche; además está D1. |
 | "`fastboot boot` brickea este ABL" | Contradicha | README (9/15/102/107), HANDOFF, RECOVERY y NOTES (194/383/466) la dan como vía normal. La prueba del fork usó un shim sin cabecera ARM64, que este ABL rechaza (`NOTES.md:466`); `fastboot boot` no escribe en flash. expG sí tiene la cabecera. No está probado que funcione hoy. |
@@ -247,7 +245,7 @@ DEPSTARTCFG se completa, pero DEPCFG da timeout. Las órdenes de endpoint necesi
 - **usb-status:**
   - "El fallo es anterior al SETEPCONFIG": contradicha, es justo ese timeout.
   - Formato del ring: apoyado.
-- **acceso-al-telefono:** n=1 apoyada (con la corrección de VBUS); sshd sin claves, apoyada.
+- **acceso-al-telefono:** n=1 apoyada (VBUS no influye, 03 E1); sshd sin claves, apoyada.
 - **toolchain-findings:**
   - "zig filtra -N": contradicha.
   - El ring en iosroot: apoyado.
@@ -289,8 +287,8 @@ El boceto completo está en `anexos/sweet_usb_design_sketch.c` (no compila: es p
 
 ## 6. Experimentos decisivos (propuestos)
 
-1. **Arranque en frío con cable**: 3 por la ruta R y 3 por la ruta C. → **Hecho en parte:** R1 y C1, ver 03.
-2. **Volcado de solo lectura** en ambas rutas. → **Parche 0329** (compilando).
+1. **Arranque en frío con cable**: 3 por la ruta R y 3 por la ruta C. → Ver 03 E1 y el acumulado de 03.
+2. **Volcado de solo lectura** en ambas rutas. → Parche 0329; ver 03 E2.
 3. **Inicialización escalonada** ante el timeout de DEPCFG: mux, luego PHY, luego reset del core.
 4. **Repetir el `dd`** con fotos y sin `printf`:
    - si es α: un "Start aceptado sin HWO y sin evento", y después solo rechazos con el FIFO de TX vacío;
@@ -298,7 +296,7 @@ El boceto completo está en `anexos/sweet_usb_design_sketch.c` (no compila: es p
 5. **Sonda con el enlace atascado:** TRB válido más Update Transfer (orden 7).
    - α: sale la trama;
    - β: nada.
-6. **A/B con `ud_reclaim_fast` desactivable** (`sweetusb_reclaim=0`, ya en 0329), 10 × 30 MB por sentido.
+6. **A/B con `ud_reclaim_fast` desactivable** (`sweetusb_reclaim=0`, en 0329), 10 × 30 MB por sentido. → No se hizo; la ruta 0330 pasó 10 × 30 MB por sentido (03 Carga-1 dp=2).
 7. **Lo mismo con memoria no cacheable:** "late rx" debería ir a 0.
 8. **`fastboot boot` de expG** (solo RAM).
 
@@ -306,7 +304,6 @@ El boceto completo está en `anexos/sweet_usb_design_sketch.c` (no compila: es p
 
 - si fue α o β;
 - qué paso libera el endpoint;
-- el estado del PHY y de QSCRATCH;
 - la causa de ExpC;
 - la prueba de 30 MB de Angel;
 - AppleUserECM ante errores;

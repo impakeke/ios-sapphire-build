@@ -2,7 +2,9 @@
 
 - **Autor:** agente Claude Opus 5.5 (64 herramientas, unos 26 min), con el diseño de la auditoría (01 §5).
 - **Verificado de forma independiente** (sesión principal): 0329 + 0330 pasan `git apply --check` y `apply` en orden sobre el post-0328 reconstruido (2187 líneas).
-- **No probado todavía** en el teléfono. Compilación en CI pendiente.
+- **CI:** run 43564692243, compila y enlaza.
+- **En el teléfono:** 20 copias de 30 MB (10 por sentido) íntegras, `start refused 0`, `noevt(alpha) 0` (03, Carga-1 dp=2).
+- **Por defecto** desde 0332/0333; `sweetusb_dp=0` selecciona la ruta vieja.
 
 ## Elección: dos rutas en el mismo kernel
 
@@ -80,7 +82,7 @@
 2. **Compilación.**
    - `clang -fsyntax-only` (Apple clang 21) contra las cabeceras reales de XNU del replay, con `KERNEL`, `XNU_KERNEL_PRIVATE`, `BSD_KERNEL_PRIVATE`, `__arm64__` y `ARM64_BOARD_CONFIG_SWEET`: **0 errores**. Se comprobó inyectando un error que el bloque nuevo se compila de verdad.
    - Con las WARNFLAGS de XNU no aparecen clases de aviso nuevas.
-   - **El enlazado no se verificó** (`ml_io_map_unmappable`, `clear_wait`, `current_thread`).
+   - El enlazado (`ml_io_map_unmappable`, `clear_wait`, `current_thread`) lo verifica el CI (run 43564692243).
 3. **Modelo DES** de la máquina nueva con un controlador adversarial (`~/sapphire-angel/research/auditoria-sweet_usb/sim/usbsim_dp.py`).
    - Escenarios: A1-A3, más eventos antes del write-back, eventos perdidos, duplicados, recurso tardío, transferencias ocultas, End atascado 8 ms y ep0 fuera de SETUP. 20 × 5 s cada uno, 9 escenarios en total.
    - Resultado: 0 escrituras de TRB poseído, 0 TX falsas, 0 duplicados, 0 RX perdidas o duplicadas. Bloqueo máximo con cola: 0,5 ms (nominal) y 10 ms ("todo junto").
@@ -91,7 +93,7 @@
 
 ## Riesgos y limitaciones conocidos
 
-- **DMA no cacheable.** Es la primera vez que se usa `ml_io_map_unmappable` sobre DRAM gestionada en este port (antes solo sobre el carveout del splash). Si falla: `sweetusb_dpnc=0`. Los alias cacheables siguen existiendo, como en Linux.
+- **DMA no cacheable.** Es la primera vez que se usa `ml_io_map_unmappable` sobre DRAM gestionada en este port (antes solo sobre el carveout del splash). En el teléfono funciona (`nc 1` en `kern.sweet_usb_dp`, 03 Carga-1 dp=2). Alternativa: `sweetusb_dpnc=0`. Los alias cacheables siguen existiendo, como en Linux.
 - **ep0 sin cambios.** Sigue usando `delay(1)` y `delay(100)` (bloquea solo en las transferencias de control). En modo cacheable, los TRB OUT e IN de ep0 comparten línea.
 - **Índice de recurso 0 tras un rechazo.** Si el último índice aceptado no coincide, queda un ciclo rechazo/End cada ~1 ms. Está contado y sin tormenta de printf.
 - **Transferencia oculta en el controlador.** Puede perder o duplicar una trama de TX (TCP lo recupera).
@@ -105,6 +107,8 @@
 - **Longitud del cmdline.** Si supera 575 caracteres, el shim deja de pasar `sweet_splash` (lo dice el empaquetador). Para el A/B, que todas las variantes tengan la misma longitud.
 
 ## Boot-args para el A/B (mismo kernel, `sweetusb=2`)
+
+Solo se ha medido B (03 Carga-1 dp=2). A, A' y B' no se han ejecutado. Desde 0332/0333, B es el valor por defecto y no necesita boot-arg.
 
 | Variante | Boot-args | Para qué |
 |---|---|---|
@@ -124,4 +128,4 @@
 | β | STARTED con HWO=1, sin eventos y con la cola llena |
 | Rechazos | las fotos de start-refused |
 
-**Árbol de trabajo:** `/private/tmp/claude-501/-Users-allen/023de825-673e-4660-ae00-c398ca82af1e/scratchpad/usb0330`. Se copió a `~/sapphire-angel/research/parche-0330/`.
+**Árbol de trabajo:** `~/sapphire-angel/research/parche-0330/` (fuera de git).
