@@ -831,3 +831,41 @@ reinicio de backboardd, 58 s de espera y `tools/perf/vistas.sh` (`medicion/shots
   En M10 esa corrupción se anotó junto al gobernador y a 1260 MHz: coincide con el modo seguro, no con ellos.
 
 Queda `merge-7` sin opciones, fuera del modo seguro, con el home normal (`medicion/shots/sm2-0.png`).
+
+## M26 — TILE6_3 y UBWC en los render targets propios de CoreAnimation (2026-11-14)
+
+Kernel 0353 (sin 0370), GPU a 820 MHz, salida por copia con pool, parciales activas.
+
+**Autocomprobación** (`hakios-metal-tilecheck --reps 7`, cliente propio del servicio de la GPU, sin Metal;
+`research/metal/blur/tilecheck-1.txt`): 0 fallos y ningún reinicio de la GPU. Compara byte a byte, contra lineal,
+BGRA8 y RGBA8 a 752×1626, 99×209 y 270×12 en sysmem (clear, draw, blend, fetch), muestreo 1:1, GMEM y copias 2D.
+Registros leídos: `RB/TPL1/SP_NC_MODE_CNTL` 0x2, `UCHE_MODE_CNTL` 0x00200000. Medianas de 7, en µs:
+
+| Operación | Lineal | TILE6_3 | UBWC |
+|---|---|---|---|
+| clear 756×1630 (2D) | 676 | 559 | 383 |
+| draw 752×1626 (escritura) | 718 | 562 | 385 |
+| blend 752×1626 (lectura y escritura) | 1 780 | 1 162 | 788 |
+| fetch 752×1626 (sysmem) | 1 868 | 1 178 | 882 |
+| muestreo 1:1 a 752×1626 | 3 306 | 2 059 | 1 553 |
+| muestreo 1/4 bilineal a 188×406 | 842 | 643 | 431 |
+| GMEM carga y guardado 752×1626 | 1 319 | 1 081 | 614 |
+| copia 2D hacia lineal / desde lineal | 2 014 / 1 989 | 1 568 / 1 286 | 972 / 1 130 |
+
+**Centro de Control** con el bundle `blur-tile` (96d9bac más el interruptor `metal_tile` para las texturas privadas
+de CoreAnimation que son render target), 3 trazas de 45 command buffers por condición
+(`trace/capturas-tile/{A,B,C,A2}`), GPU media por frame de animación (40-41 frames por traza):
+
+| Condición | GPU media por frame |
+|---|---|
+| A: sin `metal_tile` | 19,8 · 20,0 · 19,9 ms |
+| B: `metal_tile=1` (TILE6_3) | 19,7 · 19,4 · 19,6 ms |
+| C: `metal_tile=2` (UBWC) | 19,2 · 19,5 ms (una tercera traza de 3 frames, descartada) |
+| A2: sin `metal_tile`, de nuevo | 20,1 · 20,3 · 20,2 ms |
+
+Las capturas con el Centro de Control abierto son iguales en A, B y C (`medicion/shots/hoja-tile.png`).
+
+**Interpretación.** El Adreno 610 dibuja, mezcla, muestrea y copia correctamente en TILE6_3 y en UBWC, y en UBWC
+las operaciones a resolución completa tardan la mitad que en lineal. En el frame real del Centro de Control eso
+quita 0,3-0,7 ms de ~20: las texturas a las que se aplica son pocas, y el grueso del tiempo está en pasadas sobre
+la superficie de pantalla, que sigue lineal.
