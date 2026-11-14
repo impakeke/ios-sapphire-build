@@ -568,3 +568,20 @@ scanout directo funciona, pero CoreAnimation usa dos superficies de pantalla: la
 puede reutilizar, más de la mitad de los frames vuelven a la copia y el plano alterna entre los dos modos; así
 no gana. Pasadas de siete draws a pantalla completa cuestan 6-8 ms de GPU: el coste lo fija lo que cubren, no
 cuántos draws son.
+
+## M13 — Qué procesos reciben el dispositivo Metal, y los widgets (2026-11-14)
+
+Kernel 0352 a 820 MHz, driver `merge-3` cargado.
+
+- `tools/perf/mtlprobe.m` (un proceso cualquiera que llama a `MTLCreateSystemDefaultDevice`): sin opciones devuelve
+  `nil`, y el driver escribe `mtlprobe is not shown the device: the window server alone is (metal_all=1: every
+  process)`. Con `metal_all=1` en `/var/tmp/metal.args` devuelve `Adreno (hakios-metal, chip 0x6010001)` y crea una
+  cola; tras reiniciar backboardd, SpringBoard pasa a ser cliente de `SapphireGPU` junto a backboardd. Una tanda de
+  `homeswipe.sh 8` con `metal_all=1`: 43,6 buffers/s, 16 µs por draw, commit→fin 21,4 ms (n=1). Queda sin la opción.
+- El widget de Calendario sale en blanco y `CalendarWidgetExtension` consume el 99 % de un núcleo, con y sin
+  `metal_all=1`; la extensión no es cliente de la GPU. Su informe de límite de CPU (`medicion/crash/`): 90 s de CPU
+  en 96 s; pila más pesada XPC → WidgetKit → SwiftUI → AttributeGraph → CalendarWidget → EventKitUI.
+- La app Tiempo se abre y dibuja (captura `medicion/shots/app1-0.png`).
+
+**Interpretación.** Fuera del servidor de ventanas ningún proceso tiene Metal, cuando en iOS toda aplicación cuenta
+con él. El bucle del widget de Calendario no depende de Metal; su causa está sin establecer (20).
