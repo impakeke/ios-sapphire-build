@@ -88,7 +88,7 @@ gh run download "$RUN" -R "$REPO" -n "$ARTIFACT" -D "$ART" || fail "gh run downl
 [ -f "$ART/SHA256SUMS" ] || fail "el artefacto no trae SHA256SUMS"
 
 # 4. sumas
-grep -qE "[[:space:]]\*?$KERNEL\$" "$ART/SHA256SUMS" || fail "SHA256SUMS no lista $KERNEL"
+grep -qE "[[:space:]]\*?(\./)?$KERNEL\$" "$ART/SHA256SUMS" || fail "SHA256SUMS no lista $KERNEL"
 (cd "$ART" && shasum -a 256 -c SHA256SUMS) || fail "SHA256SUMS no cuadra"
 UUID=$(python3 -I - "$ART/$KERNEL" <<'PY'
 import struct, sys
