@@ -16,6 +16,7 @@ scp psamp sapphire:/var/root/
 | `symb.py SALIDA_PSAMP BINARIO_HakiosMetal` | En la Mac: perfil por imagen, self e inclusivo, simbolizando HakiosMetal con `nm` |
 
 | `gxfreq INTERVALO_MS N` | Frecuencia real del núcleo de la GPU: contadores de ciclos del CP y del RBBM frente al de 19,2 MHz |
+| `prof-phone.sh` | `psamp` del hilo de render de backboardd durante `homeswipe.sh 8` (en el teléfono) |
 | `cpuacct.sh SEGUNDOS [home]` | CPU por proceso durante el intervalo, en reposo o durante `homeswipe.sh 8` |
 
 La carga reproducible es `homeswipe.sh N` (en el teléfono): despierta, desbloquea, va al home y hace N rondas de
