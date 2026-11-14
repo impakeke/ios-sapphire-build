@@ -40,12 +40,16 @@ informes de trabajo `A`-`D`, scripts, lecturas del teléfono en `telefono/`).
    lectura; las opciones vienen del entorno del propio proceso.
 7. **El userland espera** (§3): dispositivo en todo proceso que el sistema deja abrir la GPU, aislamiento, errores
    con su causa, `NotPermitted` en segundo plano, memoria en su footprint. Los procesos que hoy piden Metal en el
-   teléfono (SpringBoard por la esfera de Siri, chronod, MapKit) son de los que iOS deja, y ningún framework del sistema
-   depende solo de binarios de GPU de Apple: todos traen AIR, lo que deja sin base el motivo de la puerta.
+   teléfono (SpringBoard, chronod, MapKit) son de los que iOS deja. La mayoría de los clientes del sistema degradan sin
+   dispositivo (sin efectos, sin rasterizado de RenderBox), pero CoreImage y OpenGL ES no tienen ruta sin Metal y
+   SpriteKit tampoco. Ningún framework depende solo de binarios de GPU de Apple: todos traen AIR, lo que deja sin base
+   el motivo de la puerta.
 8. **El Adreno 610 del teléfono puede hacerlo** (§4.1.2-§4.1.3; `D`): su microcódigo SQE (`016ee206`) cambia la tabla
    de páginas desde el ring con `CP_SMMU_TABLE_UPDATE` (dentro de un IB es un NOP), kgsl ya usa tablas por proceso en
    este mismo teléfono, `CP_PROTECT` con la tabla `a630` funciona en este SQE y los paquetes privilegiados se ignoran en
    los IB. Hay que dejar TTBR1 en una tabla válida, abrir la apertura del SMMU por SCM y programar `CP_PROTECT` antes.
+   La recuperación de hoy usa el reset por software, que drm/msm y kgsl evitan en el A610 por un defecto del chip;
+   ellos reinician apagando y encendiendo GX y CX.
 9. **Diseño** (§4): en el kernel, tarea, cola y trabajo como objetos; una tabla por tarea con globales compartidos y
    privilegiados; `CP_PROTECT`; fences por cola; `TF_GPU_DENIED` y prioridades con los entitlements de iOS; un
    planificador sin expulsión que da paso al servidor de ventanas; recuperación con culpable que reejecuta a los
@@ -88,7 +92,7 @@ Código del árbol con la serie hasta 0353 (`~/sapphire-angel/research/metal/dis
 | Envío | Se valida la entrada de comando (tipo, que el buffer sea del cliente, alineación y límites) y se emite `CP_INDIRECT_BUFFER` a la VA del usuario; el contenido no se mira (G6418-6436) | Un IB puede escribir registros y memoria de GPU a voluntad |
 | Protección de registros | Ninguna línea del archivo programa `CP_PROTECT`; la cabecera del cliente lo dice: «one address space for all clients, no register protection» (G4166-4189) | Un IB puede reprogramar el SMMU, el CP o el RBBM |
 | Colas y fences | Un ring, un candado (`service_lock`), una secuencia `msm_seq` para todos (G2379, G6440-6445); `SUBMITQUEUE_NEW` devuelve un número y descarta la prioridad (G6606-6608); `PRIORITIES` = 1 (G6497) | Sin prioridad del servidor de ventanas ni reparto; cualquier cliente puede esperar la fence de otro |
-| Fallos | `msm_hung` (G5548-5577): si alguien espera 2 s o el ring está lleno 2 s, reinicio global y las fences saltan al último número (todo lo pendiente de todos se da por hecho); `gpu_faults` es un contador global (G6498, `GET_PARAM` FAULTS) | Sin culpable: los inocentes pierden su trabajo y lo ven como completado; el culpable no recibe error |
+| Fallos | `msm_hung` (G5548-5577): si alguien espera 2 s o el ring está lleno 2 s, reinicio global con `RBBM_SW_RESET_CMD` (que drm/msm y kgsl evitan en el A610, §4.1.6) y las fences saltan al último número (todo lo pendiente de todos se da por hecho); `gpu_faults` es un contador global (G6498, `GET_PARAM` FAULTS) | Sin culpable: los inocentes pierden su trabajo y lo ven como completado; el culpable no recibe error |
 | Superficies | `SapphireGPUClient::surface` importa cualquier IOSurface por su ID global sin comprobar nada (G6263-6325); `IOSurfaceRootUserClient` busca por ID para cualquier tarea y acepta e ignora la propiedad (`SweetSurface.cpp:1479-1488`, `1526`) | Cualquier proceso lee y escribe con la GPU las superficies de otro, incluida la pantalla |
 | Memoria | BOs en un pool físico fuera de la VM de XNU (09 §4.1); sin cuenta por tarea ni límite | Jetsam no ve la memoria de GPU de nadie |
 | Acceso | `SapphireGPUClient::initWithTask` no comprueba nada (G5761-5797) | Cualquier proceso abre la GPU |
@@ -127,9 +131,11 @@ runningboardd registra 157 `Set Darwin GPU to "allow"/"deny"` y 156 `setGPURole:
 | `AccessibilityUIServer` | 0 | 4 |
 | `GradientPoster`, `CollectionsPoster` de PosterBoard, `ExtragalacticPoster` | 0 | 1-2 |
 
-Con un aserto de dominio `com.apple.posterkit.provider:Rendering-Entitled`, la extensión de póster pasa a «allow»
-mientras pinta. Los widgets solo reciben «deny». chronod y SpringBoard aparecen como «not GPU managed». Qué hace
-RunningBoard con eso, en §2.5.
+La extensión de póster pasa a «allow» cuando SpringBoard le pide pintar: en una captura en vivo (`telefono/oslog-45s-1711.txt`,
+14:12), al atenuarse la pantalla SpringBoard adquiere sobre `CollectionsPoster` un aserto «updateToSceneVisualState:…» de
+2,75 s como máximo con `RBSGPUAccessGrant role:Background`, y runningboardd registra «1250 Set Darwin GPU to "allow"»;
+al retirarse los asertos, en el mismo segundo, «deny». Los widgets solo reciben «deny». chronod y SpringBoard aparecen como «not GPU managed». Qué hace RunningBoard
+con eso, en §2.5.
 
 ## 2. Cómo lo hace iOS 16
 
@@ -237,7 +243,7 @@ Los roles de `RBSGPURole` son 0 «(unknown)», 1 «None», 2 «Background», 3 �
 | App visible sin foco (`Workspace-ForegroundActive`, `-ForegroundUtility`) | UserInteractive | UserInteractiveNonFocal | 100 |
 | App activa en segundo plano, instantánea de escena, terminación ordenada (`Workspace-BackgroundActive`, `SceneSnapshotAction`, `GracefulTermination`) | Background | NonUserInteractive | 40 |
 | Extensión de póster mientras pinta (`PosterKit` `FinishRender`, restringido al punto de extensión `com.apple.posterkit.provider`) | UserInteractive | UserInteractiveNonFocal | 40 |
-| WebKit en primer plano (`webkit` `Foreground`) / reproducción de medios | UserInteractive / Background | | 100 |
+| WebKit en primer plano (`webkit` `Foreground`) / reproducción de medios (`MediaPlayback`) | UserInteractive / Background | UserInteractiveFocal / NonUserInteractive | 100 |
 | Ejecución de una extensión de widget (`chronod` `WidgetExtensionRun`) | **ninguno** (con `RBSCPUMaximumUsageLimitation`) | NonUserInteractive | |
 
 **Cómo se aplica [O].** `-[RBProcess _lock_applyGPU]` (RunningBoard 0x1f5e9ff90), solo para procesos «GPU
@@ -480,7 +486,43 @@ Lo que un proceso de iOS 16 puede dar por hecho, con la fuente que lo fija:
 
 ### 3.2 Por cliente
 
-(En redacción.)
+Qué hace cada cliente que corre en el teléfono con el dispositivo y sin él. Llamadas a `MTLCreateSystemDefaultDevice`
+en 96 de las 153 imágenes de la caché que enlazan Metal, más 4 por soft-link y algunos ejecutables; las 60
+instrucciones que siguen a cada llamada están en `B2/raw/sites/` [O, `B2` §1]. backboardd no la llama: su dispositivo lo
+crea QuartzCore.
+
+| Cliente | Con dispositivo | Con nil [O salvo indicación] |
+|---|---|---|
+| Extensión de widget | archiva vistas (WidgetKit, ChronoKit y ChronoCore no enlazan Metal) | lo mismo: no lo usa. Apple: «Your view code only runs during archiving… rendered by the system process» [D] |
+| Widgets en SpringBoard (ChronoKit) | `[RBDevice isSupported]` → rasterizado asíncrono con RenderBox | «RenderBox hosting disabled» y el render por defecto de SwiftUI |
+| chronod (instantáneas de widgets) | instantánea en formato RenderBox | formato de archivo de CoreAnimation [H] |
+| SiriUICore (esfera de Siri, en SpringBoard) | pipeline library propia | registra el error y sigue ([M] en el teléfono) |
+| Teclado | rastro de la escritura deslizando en un `MTKView`; el resto del teclado no usa Metal (UIKitCore no lo enlaza; dibuja con CoreGraphics sobre IOSurface) | `MTKView` sin dispositivo: sin rastro [H] |
+| Legibilidad sobre el fondo (`SBUILegibilityMetalEngine`) | motor Metal | aserción (`NSInternalInconsistencyException`); hay un motor por defecto sin Metal y no está verificado cuál usa SpringBoard |
+| Imágenes de fondo (`SBFCARendererImpl`, en `SBRendererService.xpc`) y vistas previas de PosterBoard | IOSurface → textura → `CARenderer` | no comprueban: imagen sin pintar [H] |
+| CoreImage (`CIContext`) | Metal | cae a OpenGL ES, que en iOS 16 es `AppleMetalGLRenderer` y también pide Metal: `CIContext` sale nil. **No hay ruta de CPU**: `kCIContextUseSoftwareRenderer` se convierte en una petición de prioridad baja |
+| SwiftUI / RenderBox (`drawingGroup`, `Canvas`) | RenderBox en GPU | `RBNullDevice` y rutas a `CGContext` |
+| SpriteKit (y el póster de emoji) | Metal sin mirar si hay dispositivo; su alternativa GL también necesita Metal | sin ruta que funcione [H] |
+| SceneKit, MPS, Vision | GPU | nil y un error registrado; el detector de Vision devuelve error |
+| CoreML (Espresso) | GPU | `std::logic_error("Metal device not found.")`; que las API lo capturen no está verificado |
+| Cámara (mediaserverd) | efectos y preparación de shaders | casi todo comprueba y se salta el paso |
+| Pósters del Tiempo y Orgullo | efectos por Metal | comprueban y se saltan los efectos |
+| Póster Astronomía (NanoUniverse) | Metal | el ejecutable comprueba; NanoUniverse recibe nil sin comprobar. Por qué se reiniciaba en bucle en el port no está verificado |
+| WebKit | el proceso GPU (`com.apple.WebKit.GPU`) dibuja canvas y WebGL (ANGLE sobre Metal, MSL generado en ejecución) y reproduce medios; WebContent no abre la GPU salvo con una extensión de sandbox (§2.8; `C` §5.2) | sin WebGL ni canvas acelerado [H] |
+| Notas | precalentamiento | nada |
+| ImageIO, CoreUI, HomeUI | disposición de texturas ASTC; detección de capacidades | ruta de CPU; menos efectos |
+
+Consecuencias para el port:
+
+- Ningún framework del sistema depende de binarios de GPU de Apple: cada pipeline library trae al lado su
+  `default.metallib` en AIR (QuartzCore, RenderBox, SiriUICore, TextInputUI, VectorKit…); los únicos binarios de AGX sin
+  pareja en el mismo fichero son de CoreImage y tienen su gemelo AIR (`B2` §2). El motivo que da la puerta del driver
+  (§1.1) no se sostiene.
+- WebKit, ANGLE y SpriteKit generan MSL en ejecución y lo compilan con `newLibraryWithSource:` [H, `B2` §2]: el driver
+  tiene que compilar MSL o devolver el error de Metal.
+- Un proceso sin dispositivo no tiene CoreImage ni OpenGL ES (los dos acaban en Metal), y SpriteKit no tiene
+  alternativa: con la puerta de hoy, una app que pida un `CIContext`, filtre una imagen con CoreImage o use SpriteKit
+  se queda sin esa función [H, consecuencia de lo anterior; no probado app por app].
 
 ## 4. Diseño para el port
 
@@ -499,7 +541,7 @@ además de la MMU por contexto hace falta protección de registros.
 | Memoria de GPU de un proceso | Su propia VA de GPU (GART por contexto, MMU de la GPU) | Su propia tabla del SMMU, cambiada desde el ring |
 | Trabajo enviado | Opaco para el kernel | Opaco para el kernel, con `CP_PROTECT` |
 | Quién puede enviar ahora | RunningBoard → `TF_GPU_DENIED` + rol | Igual: el kernel lee `TF_GPU_DENIED` y el rol |
-| Prioridad | Por cola, 0..5; tiempo real con entitlement; el firmware planifica y expulsa | Por cola con los mismos permisos; el kernel ordena la entrada al ring (sin expulsión) |
+| Prioridad | Por cola, 0..5; tiempo real con entitlement; el firmware planifica y expulsa | Por cola con los mismos permisos; el kernel ordena la entrada al ring; la expulsión por ring, después |
 | Cuelgue o fallo | El firmware lo detecta; culpable con error y castigo; víctimas | El kernel lo detecta; culpable con error y castigo; víctimas reejecutadas |
 | Memoria | En el footprint de la tarea (jetsam) | Crédito explícito al footprint de la tarea; reparto del pool |
 | IOSurface entre procesos | Por puerto; búsqueda global por ID desactivada | Importar exige tener la superficie |
@@ -551,8 +593,8 @@ CONTEXTIDR y, al terminar, **deja activos los recorridos de TTBR0 y de TTBR1** (
   sube además el bit de privilegio `CP_MISC_CNTL[0]` alrededor para escribir su registro privilegiado
   (`adreno_iommu.c:146-186, 281-355`). Con una sola tarea dibujando (backboardd sola, el caso de hoy) no se emite nada.
 - **ASID:** drm/msm usa el 0 para todas las tablas y este SMMU lleva `qcom,no-dynamic-asid`; el SQE invalida la TLB
-  entera del banco en cada cambio (`TLBIALL`). El port puede seguir con ASID 0; liberar un buffer invalida lo de su
-  tarea (hoy `TLBIASID 0`).
+  entera del banco en cada cambio (`TLBIALL`). El port puede seguir con ASID 0, y liberar un buffer sigue invalidando
+  la TLB de ese ASID común (`TLBIASID 0`, como hoy) antes de reutilizar su memoria.
 - **Apertura del SMMU para el CP:** kgsl en este teléfono y Linux ≥ 6.13 hacen antes una llamada SCM (servicio `0x0c`,
   comando `0x1b`, cuatro argumentos: `0xffff0000 | banco` y tres `0xffffffff`; `kgsl_iommu.c:1213-1234`,
   `qcom_scm.c:1196-1220` de v7.3). El `scm()` del port pasa tres (G546-563). Si en khaje hace falta no está verificado:
@@ -607,30 +649,49 @@ mapeos privilegiados y `CP_PROTECT`. Una violación de protección detiene el CP
 
 #### 4.1.5 Planificación y prioridad
 
-- **Clase efectiva de una cola** = prioridad pedida (escala de Metal 0..5) limitada por los entitlements de la tarea
-  (tiempo real y alta solo con los de iOS, §2.6) y combinada con el rol de la tarea (Focal, UserInteractive,
-  Background, §2.5). El servidor de ventanas pide prioridad alta desde QuartzCore (`setGPUPriority:` en
-  `CA::OGL::new_metal_context`, 19 §2.7).
-- **Sin expulsión** (el A610 no la tiene en este port: §4.1.3), la prioridad actúa al decidir qué entra en el ring:
-  los trabajos de la clase del servidor de ventanas entran siempre; de las clases inferiores puede haber como mucho uno
-  en el ring mientras el servidor tenga trabajo reciente; dentro de una clase, turno rotatorio por tarea con déficit
-  por tiempo de GPU (las marcas de tiempo por envío ya existen desde 0336, `gpu_marks`).
+- **Clase efectiva de una cola** = prioridad pedida (escala de Metal 0..5, 0 la más alta) limitada por los
+  entitlements de la tarea (tiempo real solo con el de iOS, §2.5) y combinada con el rol de la tarea (Focal,
+  UserInteractive, Background, §2.5). El servidor de ventanas pide 0 desde QuartzCore (§2.5).
+- **Primera forma, sin expulsión:** la prioridad actúa al decidir qué entra en el ring, como en drm/msm con un ring y en
+  el dispatcher de kgsl (`D` §6.2): los trabajos de la clase del servidor de ventanas entran siempre; de las clases
+  inferiores, como mucho uno en el ring mientras el servidor tenga trabajo reciente (kgsl deja 4 en vuelo con varios
+  clientes y 5 seguidos por contexto); dentro de una clase, turno rotatorio por tarea con déficit por tiempo de GPU (las
+  marcas de tiempo por envío existen desde 0336, `gpu_marks`). Ningún proceso llena el ring (hoy uno puede tenerlo lleno
+  2 s con el candado tomado, G6359).
 - **Peor caso:** un trabajo de una app que ya está en el ring retrasa el frame del servidor hasta que termina. Lo acota
   el plazo del vigilante de la app (§4.1.6) y lo suaviza el presupuesto: si los trabajos de una tarea pasan de un
   tiempo de GPU dado, sus envíos se espacian a uno por intervalo de frame.
+- **Después, expulsión por ring:** el SQE del teléfono tiene lo que usa kgsl para expulsar entre ringbuffers en el A610
+  (`IN_PREEMPT`, `CP_CONTEXT_SWITCH_YIELD`, `CP_SET_PSEUDO_REG`, `CP_CONTEXT_SWITCH`; kgsl 4.19 crea 4 ringbuffers con
+  `ADRENO_PREEMPTION`, que el A610 tiene, `adreno_ringbuffer.c:378-397`, `adreno_a6xx_preempt.c`), sin GMU. Exige
+  buffers privilegiados por ring y por contexto (~1,2 MB por ring y 192 KB por contexto en kgsl) y un paquete por envío;
+  va detrás de las tablas por tarea y es lo que acerca el port al firmware de Apple, que expulsa (`D` §6.2-§6.3) [H: no
+  medido en el teléfono].
 
 #### 4.1.6 Fallos: culpable, recuperación y castigo
 
-- **Detección** sin interrupciones (el port no atiende IRQ de dispositivo, 09 §3.2), en el mismo sondeo de fences:
-  (a) fallo del SMMU del banco de la GPU (registro FSR distinto de 0); (b) error del CP (violación de protección,
-  opcode ilegal); (c) vigilante: el trabajo en cabeza no avanza en su plazo (por clase: menos para apps que para el
-  servidor de ventanas, que hoy tiene 2 s).
-- **Culpable:** el trabajo en cabeza del ring (el CP ejecuta en orden) o, en un fallo del SMMU, la tarea de la tabla
-  activa en el banco.
-- **Recuperación:** el reinicio que ya existe (`msm_hung` → `gpu_recover`, G5548-5577), reponer tablas y contextos,
-  y **volver a emitir** los trabajos posteriores al culpable, que no habían empezado; el culpable termina con su error
-  (vencimiento, fallo de página con su VA, protección). Si el reinicio no basta, los demás terminan con el error de
-  víctima, como en iOS (§2.6) y en Asahi (`Killed`).
+- **Detección** sin interrupciones (el port no atiende IRQ de dispositivo, 09 §3.2), con un sondeo periódico propio
+  mientras haya trabajo en el ring, no ligado a quien espera (hoy un cuelgue solo se ve si alguien espera 2 s,
+  `D` §5.1): (a) progreso: la fence y los registros que mira `a6xx_progress` de drm/msm (`CP_IB1_BASE`, `CP_IB2_BASE`,
+  tamaños restantes, `CP_ROQ_AVAIL_*`; `a6xx_gpu.c:2082-2113`), con un plazo del orden de 1 s como el hangcheck de
+  drm/msm, menor para apps que para el servidor de ventanas; (b) `RBBM_INT_0_STATUS` (`RBBM_HANG_DETECT`, que el port ya
+  configura, G2094; `CP_HW_ERROR`; `CP_AHB_ERROR`); (c) el FSR del banco del SMMU.
+- **Culpable:** el primer trabajo no terminado del ring (el modelo de drm/msm, `find_submit`); en un fallo del SMMU, la
+  tarea cuyo TTBR0 está en el banco en ese momento (el modelo de kgsl, `kgsl_iommu.c:718-739`). El SMMU sigue en
+  *terminar* con `HUPCF` (lo de hoy y lo de kgsl): sin interrupciones, *detener* congelaría la GPU hasta el siguiente
+  sondeo.
+- **Reinicio sin el reset por software:** drm/msm y kgsl no usan `RBBM_SW_RESET_CMD` en el A610 («11nm chips (e.g. ones
+  with A610) have hw issues with the reset line!», `a6xx_gpu.c:1801-1815`; kgsl `adreno.c:2480-2499`), y la
+  recuperación de hoy sí (0317, G5504-5509). El reinicio correcto es un ciclo de GX y CX como el de `a6xx_recover` con
+  envoltorio sin GMU (`a6xx_gpu.c:1224-1298`): parar el SQE y el bus, apagar y encender los dominios (el port ya tiene
+  `gdsc_on` y `power_down`, G669, G1102, G1121, G1473), `hw_init` completo con `CP_PROTECT`, reprogramar el SMMU (está en
+  el dominio de CX) y reanudar la zap.
+- **Después:** **volver a emitir** los trabajos de las demás tareas que estaban en el ring detrás del culpable (no
+  habían empezado; drm/msm reemite todo lo pendiente, `msm_gpu.c:355-451`) y terminar el culpable con su error
+  (vencimiento, fallo de página con su VA, protección). drm/msm señala la fence del culpable sin error y kgsl acaba
+  invalidando el contexto con `-EDEADLK` (`adreno_drawctxt.c:255-296`); el contrato de Metal pide lo segundo: un error
+  en el command buffer culpable. Si el reinicio no basta, los demás terminan con el error de víctima, como en iOS
+  (§2.6) y en Asahi (`Killed`).
 - **Castigo, con las reglas de iOS (§2.6):** la cuenta es por cola; el segundo fallo culpable (vencimiento, cuelgue o
   fallo de página) deja la cola denegada y sus command buffers terminan con `AccessRevoked`; 1001 buenos
   borran la cuenta; con `com.apple.private.graphics-restart-no-kill` (backboardd, §2.8) solo se registra. El kernel no
@@ -658,9 +719,11 @@ mapeos privilegiados y `CP_PROTECT`. Una violación de protección detiene el CP
 - Abre cualquier proceso. Lo que iOS reserva, con sus mismos entitlements: prioridad explícita y tiempo real,
   información de memoria ajena, inmunidad al castigo (§2.8).
 - `task_is_gpu_denied` en cada envío; el error es el de iOS para segundo plano (§2.6).
-- **Rol de GPU para RunningBoard:** un servicio de clase `IOGPU` que responda lo que usa `IOGPUDeviceCreate` y
-  `IOGPUDeviceSetAppGPURole` (§2.1, §2.6) para que `-[RBXNUWrapper init]` encuentre dispositivo; hasta entonces, el rol
-  Darwin de la tarea, que RunningBoard sí escribe («Set darwin role to …», §1.4), como aproximación.
+- **Rol de GPU para RunningBoard:** un servicio de clase `IOGPU` que responda lo que usa IOGPU.framework en
+  `IOGPUDeviceCreate` (abrir con tipo 1 y los selectores 2, 0 y 4, con las salidas de 0x218, 0x40 y 0x20 bytes) y el
+  selector 0x22 de `IOGPUDeviceSetAppGPURole` (pid, rol) (`B1` §3), para que `-[RBXNUWrapper init]` encuentre
+  dispositivo. Es un subconjunto pequeño de una interfaz binaria de Apple que hay que mantener; hasta tenerlo, el rol
+  Darwin de la tarea, que RunningBoard sí escribe («Set darwin role to …», §1.4), sirve de aproximación.
 - **IOSurface:** importar exige que la tarea tenga la superficie (creada o recibida por puerto en su
   `IOSurfaceRootUserClient`); la búsqueda por ID en `SweetSurface` deja de ser global salvo para superficies marcadas
   como globales y con un boot-arg de depuración, como `iosurface_debug` en iOS (§2.3).
@@ -699,6 +762,13 @@ mapeos privilegiados y `CP_PROTECT`. Una violación de protección detiene el CP
    el error de Metal, nunca aborta. Un servicio de compilación por cliente, como `MTLCompilerService`, queda como mejora
    posterior: el contrato no lo exige, pero aísla al cliente de los fallos del compilador y saca su memoria del límite
    de jetsam del cliente.
+8. **Un dispositivo completo para clientes que no son el servidor de ventanas** (`B2` §5): pipeline libraries
+   (`newPipelineLibraryWithFilePath:` con un `targetDeviceInfo` válido o un error limpio, que SiriUICore y ARUI ya
+   tratan), respuestas veraces a `supportsFamily:`, `supportsFeatureSet:` y a lo que pregunta CoreImage
+   (`CIMetalDeviceIsSupported`), porque muchos clientes eligen ruta por ellas (Astronomía mira `MTLGPUFamilyApple6`;
+   ANGLE, SceneKit, Espresso y HomeUI también), y los protocolos SPI que piden MPS, la cámara y QuartzCore. Los abortos
+   que el comentario de la puerta atribuye a la falta de shaders son de este tipo: selectores sin responder y un
+   `targetDeviceInfo` nulo (19 §2.1) [H, `B2` §5].
 
 ### 4.3 backboardd y la migración
 
@@ -723,7 +793,7 @@ Cada etapa es un arranque de prueba en `boot_a` con su interruptor a 0 por defec
 | 1. Objetos y política sin aislamiento | `SapphireGpuTask`/`Queue`/`Job`, fences por cola, rechazo con `TF_GPU_DENIED` y prioridad de fondo, prioridades con sus entitlements, cuenta en los ledgers, importación de superficies por posesión, `SweetSurface` sin búsqueda global | homeswipe igual (n ≥ 3); `mtlprobe` en segundo plano recibe `NotPermitted`; el footprint de `mtlprobe` crece con lo que asigna; una superficie ajena no se importa | Interruptor a 0 |
 | 2. Tablas por tarea | E0 (lectura de `SMMU_IDR*`, `TCR`/`TTBR1`, `CP_PROTECT*`, apertura disponible), E1 (apertura y cambio a la misma tabla), E2 (dos tablas que difieren en una página; coste del cambio), después tablas por tarea con globales en su hueco, TTBR1 vacío y tablas fuera de la vista de la GPU | E1/E2 con n ≥ 3 arranques; una prueba que lee una VA de backboardd recibe fallo de página y backboardd sigue; coste por cambio medido | Cambio desde la CPU con la GPU ociosa (§4.1.2) |
 | 3. Protección | Tabla `CP_PROTECT` y su control; ring y microcódigo de solo lectura; E3 (uso normal sin violaciones; un IB que escribe `RBBM_SW_RESET_CMD` para el CP) y E4 (¿escribe `CP_EVENT_WRITE` en un mapeo privilegiado?) | E3 n ≥ 3 sesiones sin violaciones; la negativa detiene el CP y se recupera | Tabla con menos rangos y la lista de la violación |
-| 4. Fallos con culpable | Vigilante por clase, lectura de FSR y del estado del CP, reinicio, reemisión de inocentes, cuenta por cola (2 fallos → cola denegada; 1001 buenos → borrón) | Una prueba que se cuelga recibe Timeout y, a la segunda, `AccessRevoked`; backboardd sigue dibujando (frames perdidos contados); una que lee fuera de su VA recibe PageFault | Recuperación de hoy |
+| 4. Fallos con culpable | Sondeo propio de progreso, `RBBM_INT_0_STATUS` y FSR; reinicio por ciclo de GX/CX en lugar del reset por software; reemisión de inocentes; cuenta por cola (2 fallos → cola denegada; 1001 buenos → borrón) | Una prueba que se cuelga recibe Timeout y, a la segunda, `AccessRevoked`; backboardd sigue dibujando (frames perdidos contados); una que lee fuera de su VA recibe PageFault | Recuperación de hoy |
 | 5. Planificación | Clases, límite de trabajo en vuelo de clases bajas, presupuesto por tiempo de GPU | homeswipe con y sin una prueba que satura la GPU (n ≥ 3): retraso de commit a fin del servidor acotado | Orden de llegada (hoy) |
 | 6. Driver | Dispositivo para todos, prioridades al kernel, errores de §2.6, cachés por proceso y semilla, configuración sin ficheros públicos | `mtlusers` (§1.1) con SpringBoard, chronod y MapKit con dispositivo; sin «Failed to get Metal device» en el log; ningún proceso relanzado en bucle en 30 min | Puerta cerrada (hoy) |
 | 7. Lo quitado por falta de Metal | Pósters Astronomía y Emoji, widgets de App Store (21 §4) | Se eligen y pintan; CPU y memoria de sus procesos | Volver a quitarlos |
@@ -738,10 +808,10 @@ servicio de compilación por cliente van detrás, cada uno con su medida.
 | VA por proceso | `IOGPUTask`, GART por contexto (§2.2) | tabla por proceso, `CP_SMMU_TABLE_UPDATE`, globales en TTBR1 | tabla por proceso, globales copiados, apertura SCM | 63 contextos de usuario con TTB0 propio y TTB1 común |
 | Qué valida el kernel | solo el canal de comandos del kernel (§2.4) | nada del PM4; `CP_PROTECT` | nada del PM4; `CP_PROTECT` | campos del comando; nada de shaders ni punteros |
 | Memoria del kernel en la VA del usuario | zonas privadas del firmware | ring/microcódigo de solo lectura, rptr privilegiado; fences no en el A610 | igual | TTB1 sin mapear en contextos de usuario (G13/G14) |
-| Prioridad | 0..5 por cola, tiempo real con entitlement; el firmware expulsa | (§4.1.5; `D` §6) | (`D` §6) | 4 colas del firmware; HIGH/REALTIME rechazadas hoy |
+| Prioridad | 0..5 por cola, tiempo real con entitlement; el firmware expulsa | un ring en a6xx; drm_sched por prioridad; ningún permiso para pedir alta | 4 ringbuffers con expulsión en el A610; prioridad por contexto; dispatcher con ráfagas y tope en vuelo | 4 colas del firmware; HIGH/REALTIME rechazadas hoy |
 | Segundo plano | `TF_GPU_DENIED` + prioridad de fondo | — | — | — |
-| Cuelgue | culpable con error, víctimas `Internal`, cola denegada al segundo | (`D` §5) | (`D` §5) | culpable `ETIMEDOUT`/`EIO`, otros `ECANCELED`; firmware caído = reiniciar |
-| Memoria | ledger de gráficos → jetsam | (`D` §7) | (`D` §7) | sin cuentas ni límites |
+| Cuelgue | culpable con error, víctimas `Internal`, cola denegada al segundo | hangcheck ~1 s; culpable = primer envío no terminado, fence señalada sin error; reemite el resto; ciclo de GX/CX en el A610, sin reset por software | «long IB» de 2 s; repetir, saltar y al final invalidar el contexto (`-EDEADLK`); GUILTY/INNOCENT; sin reset por software en el A610 | culpable `ETIMEDOUT`/`EIO`, otros `ECANCELED`; firmware caído = reiniciar |
+| Memoria | ledger de gráficos → jetsam | `fdinfo` por fichero; sin límites por proceso | estadísticas por proceso en sysfs; sin cuotas | sin cuentas ni límites |
 | Compartir | puerto de IOSurface | dma-buf | dma-buf | dma-buf |
 
 ### 4.6 Riesgos
@@ -752,8 +822,9 @@ servicio de compilación por cliente van detrás, cada uno con su medida.
   mitad alta recorre memoria física 0 (`D` §1.2). E1 lo descarta antes de usar dos tablas.
 - **Coste del cambio de tabla** (halt de bus y dos `TLBIALL` por cambio): irrelevante con backboardd solo; con una app
   que dibuja a la vez puede haber dos cambios por frame. Se mide en E2 y, si pesa, se agrupan los trabajos por tarea.
-- **Sin expulsión**, un trabajo largo de una app retrasa al servidor de ventanas hasta su vigilante. El árbol de
-  dispositivo de Android no tiene ninguna propiedad de preempción para esta GPU (`D`): kgsl tampoco expulsa aquí.
+- **Sin expulsión**, un trabajo largo de una app retrasa al servidor de ventanas hasta su vigilante. La expulsión por
+  ring que kgsl usa en el A610 está al alcance del SQE (§4.1.5) pero pide buffers privilegiados y un paquete por
+  envío: es una etapa posterior, no medida.
 - **Detección por sondeo:** sin IRQ un fallo se ve en el siguiente sondeo o al vencer el vigilante.
 - **Fences escribibles por los IB** (como en drm/msm y kgsl en el A610): el diseño no confía en ellas para la seguridad
   (§4.1.3), pero un error en esa disciplina es un fallo de aislamiento; E4 puede quitar el riesgo.
@@ -761,6 +832,9 @@ servicio de compilación por cliente van detrás, cada uno con su medida.
   tienen que aceptar nil (es el contrato de Metal), y el reparto evita que eso le pase al servidor de ventanas.
 - **Jetsam:** con la memoria de GPU en el footprint, una app que la use mucho pasa a ser candidata a jetsam, como en
   iOS.
+- **Búsqueda de superficies por ID:** el userland de iOS no depende de ella (en producción está desactivada, §2.3), pero
+  las herramientas o el código propio del port que la usen (capturas, el import del driver por ID de una superficie que
+  el proceso no tiene) dejarán de funcionar y tienen que pasar por puertos; se mide en la etapa 1 contando los rechazos.
 - **Rutas del driver nunca ejercitadas:** procesos que hoy reciben nil (SiriUICore, chronod, MapKit, pósters) entrarán
   en el driver por caminos que backboardd no usa (compilación desde MSL, CoreImage, SceneKit). Un fallo del driver ahí
   es un fallo en ese proceso, no en el servidor de ventanas; la etapa 6 mide relanzamientos en bucle.
@@ -770,7 +844,38 @@ servicio de compilación por cliente van detrás, cada uno con su medida.
 
 ## 5. Sin verificar y experimentos que lo deciden
 
-(En redacción.)
+**Del hardware** (ensayos de `D` §8.2, en arranques de prueba de `boot_a`, n ≥ 3):
+
+| Pregunta | Ensayo |
+|---|---|
+| ¿Existe y hace falta la apertura SCM del SMMU para el CP en khaje? | E0: `is_call_available(0x0c, 0x1b)`; E1 con y sin la llamada |
+| ¿Qué dirección del banco usa el SQE (variante `0x10000` o `0x28000`)? ¿Qué dejan el firmware y el reset en `SMMU_IDR*`, `TCR`/`TTBR1`, `CP_PROTECT*`, `CP_MISC_CNTL`? | E0 (solo lectura) |
+| ¿Funciona `CP_SMMU_TABLE_UPDATE` con TTBR1 en una tabla vacía, y cuánto cuesta un cambio? | E1 (misma tabla), E2 (dos tablas, `CP_ALWAYS_ON_COUNTER` antes y después) |
+| ¿Escribe el driver Metal registros que la tabla `a630` protege? ¿Para el CP una escritura protegida? | E3 (uso normal sin violaciones; negativa con `RBBM_SW_RESET_CMD`) |
+| ¿Puede `CP_EVENT_WRITE` escribir en un mapeo privilegiado con `CP_MISC_CNTL[0]` a 1? | E4; decide si las fences pueden ser privilegiadas (§4.1.3) |
+| ¿Qué cuesta en uso real un cambio de tabla por frame, y la expulsión por ring? | E6 de `D` y la etapa 5 de §4.4 |
+
+**De iOS** (no se ha podido leer en los binarios ni en fuentes públicas):
+
+- Qué hace IOGPUFamily con el rol 0/1/2 de `IOGPUDeviceSetAppGPURole` (`B1` §5.3): bandas de prioridad [H].
+- Qué opción de Metal pone el bit de «sin footprint» de `IOGPUNewResourceArgs` (`A` §7).
+- El perfil de sandbox de contenedor exacto de 20H392: está compilado en el kernelcache; se puede decompilar con
+  SandBlaster (`ipsw kernel sbopts` + `reverse_sandbox.py`, `C` §4.2). Y qué abre `ts.opengl-or-metal` en
+  `temporary-sandbox` [H: la GPU].
+- Qué proceso pinta los widgets en iOS 16 (chronod tiene `ts.opengl-or-metal` y pide Metal en el teléfono; Apple solo
+  dice «a system process», `C` §5.1).
+- Dónde usa el kernel `allow-explicit-graphics-priority` y qué limita `gpu-restricted` en Metal.
+
+**Del contrato en el teléfono**, una vez hechas las etapas 1-6 (con `mtlprobe` y variantes, n ≥ 3):
+
+| Caso | Resultado esperado (§3.1) |
+|---|---|
+| Proceso en segundo plano sin concesión | command buffer con `NotPermitted`; con prioridad de fondo, ejecuta |
+| IB que lee una VA ajena | `PageFault` al culpable; nadie más afectado |
+| IB que no termina | `Timeout`; a la segunda, `AccessRevoked` en esa cola; backboardd sigue |
+| Asignación más allá de su límite | nil o `OutOfMemory`; jetsam lo cuenta en su footprint |
+| Importar una superficie que no tiene | rechazo |
+| Entrada corrupta en su caché | fallo de caché y recompilación, sin caída |
 
 ## 6. Material
 

@@ -787,3 +787,25 @@ activas. `merge-7` (96d9bac) cargado. n=1.
   el otro proceso escribe después no se ve (13). En `merge-7` esa declaración queda tras `metal_align` y apagada.
 
 Queda instalado `merge-7`; el instalador lleva ese build y `metal/hakios-metal/patches/` su serie (42 parches).
+
+## M24 — Centro de Control: reloj de la GPU frente a memoria; voto del DDR (2026-11-14)
+
+Kernel 0353, salida por copia con pool, parciales activas, `merge-7` con `metal_trace=frame`. Tras una apertura
+previa sin capturar, se abre y se cierra el Centro de Control capturando 45 command buffers cada vez, con
+`kern.sweet_gpu_khz` en 820000 (capturas 1-3 y 10-12) y en 1260000 (capturas 4-9). Trazas en
+`research/metal/ios-graficos/trace/capturas-cc-4cond/`. Tiempo de GPU por frame de animación (los de 4 o más pasadas,
+39-41 por captura):
+
+| Reloj de la GPU | n (capturas) | GPU media por frame | Máximo |
+|---|---|---|---|
+| 820 MHz | 4 analizadas | 19,7 · 19,7 · 20,3 · 19,7 ms | 30,4-34,3 ms |
+| 1260 MHz | 6 | 16,9 · 16,7 · 16,9 · 16,6 · 16,6 · 16,6 ms | 28,3-29,9 ms |
+
+- Temperatura de la GPU durante la serie: 55,2-57,5 °C.
+- **Voto del DDR (0347):** con `kern.sweet_gpu_ddr=1`, `kern.sweet_gpu_ddr_stats` dice `voted 1761719 kHz for the GPU
+  at 820000 kHz … (answer 0)` y `voted 2042969 kHz for the GPU at 1260000 kHz … (answer 0)`, y en los dos casos `DDR
+  1555210 kHz before, 1555210 kHz 20 ms after`. Queda en 0.
+
+**Interpretación.** Un 54 % más de reloj quita un 16 % del tiempo de GPU de la animación: lo que limita estas
+pasadas no es el reloj del núcleo (22: memoria lineal en sysmem). El RPM acepta el voto del DDR y el DDR no se
+mueve de 1555 MHz: el escalado de relojes del RPM sigue apagado (17 §8).
