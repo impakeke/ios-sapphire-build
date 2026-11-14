@@ -1,9 +1,14 @@
 # Acceso al teléfono en iOS: USB, shell, SSH (estado 2026-11-13)
 
-**Resultado:** el gadget USB de iOS **sí funciona** con nuestro kernel (expG = 0328 + shim zig)
-**cuando iOS arranca saliendo de fastboot** (`fastboot set_active a` + `fastboot continue`).
-Con `set_active a` + reboot normal **no enumera**. El fallo estaba en la ruta de arranque, no en
-el kernel ni en los parches.
+**Observación (n=1 por ruta, 2026-11-13):** con la misma imagen expG (0328 + shim zig), el gadget
+USB de iOS **enumeró y pasó tráfico** cuando iOS arrancó saliendo de fastboot
+(`fastboot set_active a` + `fastboot continue`). En un arranque anterior por `set_active a` +
+reboot normal **no enumeró** (ring: `ep0 cmd 0x1 timeout`).
+
+**Hipótesis (NO verificada):** la diferencia la causa el estado en que el ABL deja el
+controlador/PHY según la ruta. Falta: repetir cada ruta varias veces, comparar registros de ambas
+rutas en el mismo kernel, y contrastar con lo que dice la evidencia de Angel y la documentación
+de DWC3/PHY femto (auditoría en curso).
 
 ## El experimento (misma imagen, dos rutas de arranque)
 
@@ -21,10 +26,11 @@ GSNPSID 0x5533330a GCTL 0x00102000 GSTS 0x7e800000 GUSB2PHYCFG 0x00002500
 DCFG 0x00080804 DCTL 0x00f00000 DEVTEN 0 DSTS 0x00520004 DALEPENA 0
 GEVNTADR 0 GEVNTSIZ 0 GEVNTCOUNT 0
 ```
-Angel siempre arrancó con `fastboot boot` (NOTES.md:809), que también sale de fastboot con el
-USB del ABL vivo; por eso a él nunca le pasó. En la ruta de reboot normal el ABL no inicializa
-el modo dispositivo ni el PHY femto HS (0x01613000), que `sweet_usb.c` deja "como lo puso el
-ABL" (parche 0142). Ese es el arreglo real pendiente: inicializar el PHY nosotros.
+Contexto (sin conclusión todavía): en su etapa temprana Angel arrancaba con `fastboot boot`
+(NOTES.md:809), que también sale de fastboot. Su instalador actual termina con `set_active` +
+`reboot`; falta comprobar si con esa ruta el USB le enumeraba. `sweet_usb.c` deja el PHY femto
+HS (0x01613000) "como lo puso el ABL" (parche 0142). Si la hipótesis se confirma, el arreglo
+sería inicializar el PHY nosotros.
 
 ## Cómo entrar (receta)
 
@@ -79,4 +85,24 @@ en **196608 bytes** (192 KiB) y el enlace quedó muerto: `ping` → "Host is dow
 shell 2323 y SSH no responden, pero el dispositivo **sigue enumerado** (`1209` en `ioreg`, `en5`
 "active"). Antes de la carga: `kern.sweet_usb_stats: configured 1 events 372 resets 1; rx 190
 tx 76; without event: rx 0 tx 0, late rx 1; rx rearms 10; halt clears 2`.
-⇒ 0327 no basta: el modo de fallo "muere bajo carga" sigue presente con el ring de TRBs.
+Observación: el modo de fallo "muere bajo carga" sigue presente con 0327 (nota: 0327 NO es un
+ring de TRBs; sigue siendo un TRB por endpoint, solo reclama por HWO en cada poll).
+Recuperación: desconectar/reconectar el cable (bus reset) devolvió el enlace sin reiniciar iOS;
+después: `tx 2688980 frames`, `rx 837`, `resets 2`. El ring tenía 130538 líneas
+`SWEET USB: ep3 cmd 0x6 status 1` (ep3 = bulk IN/TX, 0x6 = Start Transfer rechazado).
+Hipótesis en revisión (no compilada): 0327 rearma el endpoint al ver HWO=0 antes de que el
+controlador retire la transferencia. Pendiente de contrastar con fuentes primarias (Linux dwc3).
+
+## Experimento 1 (2026-11-14): ruta de arranque con VBUS controlado
+
+| Ensayo | Ruta | PMIC (VBUS) | Resultado | DWC3 al tomar control |
+|---|---|---|---|---|
+| R1 | `set_active a` + reboot, cable puesto | `usb 0x10`, cargando, apsd 0x1 | NO enumera; `ep0 cmd 0x1 timeout` | GCTL 0x00102000, GUSB2PHYCFG 0x2500, DCFG 0x00080804, DCTL 0x00f00000, DEVTEN 0, GEVNTADR 0 (reset) |
+| C1 | fastboot → `set_active a` + `continue` | `usb 0x10` | enumera (1209:0001, ping 1.5 ms) | GCTL 0x00112000, GUSB2PHYCFG 0x2400, DCFG 0x004808dc, DCTL 0x10f00000, DEVTEN 0x277, DALEPENA 0xf, GEVNTADR propio del ABL; QSCRATCH GENERAL_CFG 0x4, HS_PHY_CTRL 0 |
+
+Observación: con VBUS presente en ambas, la diferencia sigue la ruta de arranque (n=1 c/u; R1 idéntico
+byte a byte al arranque malo del 13 nov). ENBLSLPM=1 en la ruta mala; 0328 lo limpia y aun así falla
+⇒ no basta. Fuente primaria (código de ABL, CodeLinaro `clo/la/abl/tianocore/edk2`,
+`LinuxLoader.c`/`FastbootMain.c`/`FastbootCmds.c`): en arranque normal ABL no arranca el USB device;
+solo lo hace dentro de fastboot, y `continue` solo libera buffers antes de `BootLinux()`.
+Siguiente: kernel 0329 (diagnóstico de solo lectura del PHY femto/QSCRATCH/GCC en ambas rutas).
