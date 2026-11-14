@@ -809,3 +809,25 @@ previa sin capturar, se abre y se cierra el Centro de Control capturando 45 comm
 **Interpretación.** Un 54 % más de reloj quita un 16 % del tiempo de GPU de la animación: lo que limita estas
 pasadas no es el reloj del núcleo (22: memoria lineal en sysmem). El RPM acepta el voto del DDR y el DDR no se
 mueve de 1555 MHz: el escalado de relojes del RPM sigue apagado (17 §8).
+
+## M25 — Qué declaración de alineación quita los widgets; segunda caída de SpringBoard (2026-11-14)
+
+Kernel 0353, salida por copia con pool, parciales activas, `merge-7`. Un cambio cada vez en `/var/tmp/metal.args`,
+reinicio de backboardd, 58 s de espera y `tools/perf/vistas.sh` (`medicion/shots/hoja-align.png`). n=1.
+
+| Opción | Consola del driver | Widgets de fondo opaco |
+|---|---|---|
+| `metal_align=1` | `over an IOSurface 64 bytes (the base class's: 4), over a buffer 64` | invisibles (solo se ve el de Tiempo) |
+| `metal_align=2` | `over an IOSurface 4 bytes (the base class's: 4), over a buffer 64` | visibles los cuatro |
+
+- La declaración que cambia el comportamiento de CoreAnimation es la de las texturas sobre IOSurface (26).
+- En la sesión de `metal_align=2` SpringBoard estaba en el modo seguro del cargador de tweaks: se cayó al relanzarse
+  (`SpringBoard-2026-11-14-150557.ips`: SIGSEGV en la dirección 0, hilo principal en CoreTelephony
+  `ReregisterClientForAllEvents`). Es la segunda caída de SpringBoard del día al relanzarse tras un reinicio de
+  backboardd; la primera (11:41:57, M10) fue un SIGBUS en CoreServices al cargar la biblioteca de aplicaciones. Las
+  dos son posteriores a quitar el mantenimiento de caché antes de WFI; no hay ninguna registrada antes hoy.
+- En el modo seguro el fondo de pantalla sale con bloques negros y trozos descolocados en su mitad inferior
+  (`v-align2-home-0.png`; igual en `hoja-v2.png` de M10, con `merge-1`); fuera de él, con el mismo bundle, sale bien.
+  En M10 esa corrupción se anotó junto al gobernador y a 1260 MHz: coincide con el modo seguro, no con ellos.
+
+Queda `merge-7` sin opciones, fuera del modo seguro, con el home normal (`medicion/shots/sm2-0.png`).
