@@ -21,7 +21,7 @@ REPO=${REPO:-giovannipodesta/ios-sapphire}
 WORKFLOW=xnu-4k
 ARTIFACT=xnu-kernel-4k
 KERNEL=kernel.development.sweet
-PATCH=${PATCH:-0334-sapphire-ufs-raw-io-no-user-memcpy.patch}
+PATCH=${PATCH:-0338-sapphire-fb-hold-swap-experiment.patch}
 INTERVAL=${INTERVAL:-30}
 
 fail() { printf '\n\033[1;31m*** FALLO: %s ***\033[0m\n' "$*" >&2; exit 1; }
