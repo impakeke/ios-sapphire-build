@@ -454,3 +454,23 @@ sin ningún cooling device activo. kgsl y devfreq no son legibles sin root.
 cluster P) y las 4-7 los pequeños, al revés que en Linux. Los draws que el driver contaba en "cpu0-3" corrían en
 los A73. Con `sweetsched=15`, los hilos de QoS por defecto (el hilo principal de backboardd y varios de
 SpringBoard) van al cluster pequeño.
+
+## M9 — Las ramas del driver en la GPU del teléfono (2026-11-14)
+
+Kernel 0342 a 820 MHz, `kern.sweet_fb_queue=1`, `kern.sweet_gpu_flush=1`. Bundles instalados por renombrado y
+con backboardd como cliente de `SapphireGPU` comprobado en cada uno (`driver-en-uso.sh`). Carga
+`homeswipe.sh 8`; captura de la Biblioteca de Apps (`medicion/shots/hoja-real.png`). n=1 por bundle, en la misma
+tanda: orientativo.
+
+| Bundle | Blur | Buffers/s | A tiempo / tarde / paradas | CPU/draw | Hecho→commit | Commit→fin | GPU ocupada | Pasada más cara |
+|---|---|---|---|---|---|---|---|---|
+| `propio-args` (base) | bien | 22,3 | 28 / 218 / 155 | 142 µs | 24,9 ms | 23,0 ms | 51 % | `39 draws in sysmem` 22,8 ms; principal 102 tiles ~22 ms |
+| `cpu-A-wip` (rama `cpu-draw`) | bien | 29,4 | 99 / 414 / 75 | 59 µs | 13,6 ms | 27,6 ms | 81 % | principal `102-112 draws in 102 tiles` 21,8-22,7 ms |
+| `gpu-G3b` (rama `gpu-pass`, 0a65a5b) | bien | 21,8 | 2 / 413 / 71 | 160 µs | 26,4 ms | 17,1 ms | 37 % | `30 draws in sysmem` 23,5 ms |
+| `gpu-G4` (92ed3e7) | bien | 23,1 | 7 / 313 / 98 | 171 µs | 28,6 ms | 16,8 ms | 38 % | principal `104-106 draws in 78 tiles` 13,3-13,5 ms |
+
+**Interpretación.** Las dos ramas hacen lo que buscaban, cada una en su cuello: `cpu-draw` baja la CPU por draw
+de ~150 a 59 µs y con ello suben los buffers por segundo y los frames a tiempo, hasta que manda la GPU (81 %);
+`gpu-pass` baja la pasada principal de ~22 a ~13 ms y deja la GPU al 38 %, con la CPU como límite. Falta la
+fusión de las dos. Las pasadas en sysmem a pantalla completa (30-39 draws, 20-23 ms) son ahora lo más caro de GPU.
+Queda instalado `cpu-A-wip`.
