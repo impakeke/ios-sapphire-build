@@ -99,7 +99,7 @@ Respaldos (fuera de git), en `~/sapphire-angel/backups/`:
   `sha256-telefono.txt`.
 - `ring-*.bin/txt`: rings de experimentos.
 
-Imágenes de `boot_a` ya construidas: `~/sapphire-angel/boot_a-*.img`. Kernels de CI:
+Imágenes de `boot_a` ya construidas: `~/sapphire-angel/boot_a-*.img`; la que está en el teléfono, en §9.1. Kernels de CI:
 `~/sapphire-angel/ci-kernels/<run>/`. El respaldo del `boot_a` original de Angel
 (`boot_a-ios-original.img`, sha256 `d5cceea5…`) no está en esta Mac.
 
@@ -197,11 +197,11 @@ que un run verde no garantiza nada. El script exige `conclusion=success`, que el
 `Applying patch: …/<PATCH>`, que el artefacto cuadre con `SHA256SUMS`, e imprime el LC_UUID. Lista
 como aviso cualquier otro `Skipping patch` (`STRICT=1` lo convierte en fallo).
 
-El parche que se comprueba es la variable `PATCH`, por defecto el último del fork
-(`0334-sapphire-ufs-raw-io-no-user-memcpy.patch`). Al añadir un parche nuevo, pasarlo:
+El parche que se comprueba es la variable `PATCH`, por defecto el último integrado
+(`0350-sapphire-fb-scanout-vig-scaler.patch`). Al añadir un parche nuevo, pasarlo:
 
 ```sh
-PATCH=0335-sapphire-loquesea.patch dev-notes/fetch-ci-kernel.sh <run>
+PATCH=0351-sapphire-loquesea.patch dev-notes/fetch-ci-kernel.sh <run>
 ```
 
 (o cambiar el valor por defecto en el script). Salida: `~/sapphire-angel/ci-kernels/<run>/{artifact/,run.log}`.
@@ -396,3 +396,135 @@ de particiones; por eso el slot `b` lleva el GKI de Infinity-X y OrangeFox ofici
 
 ### 8.5 Un run de CI verde con un kernel que no cambia nada
 `fetch-ci-kernel.sh` con el `PATCH` correcto (§4.2). Un parche que no aplica se salta en silencio.
+
+## 9. Gráficos: driver Metal y kernel de la GPU
+
+Estado y plan: [../GPU-ROADMAP.md](../GPU-ROADMAP.md). Mediciones: [investigacion/03](investigacion/03-experimentos-y-datos.md)
+M1-M10. Herramientas: [`tools/perf/`](../tools/perf/README.md); sus copias de trabajo y los datos están en
+`~/sapphire-angel/research/metal/medicion/`.
+
+### 9.1 Configuración en uso
+
+- Imagen: `~/sapphire-angel/boot_a-0350-vco2-820.img` (kernel de CI run 43632182225, parches hasta 0350). Boot-args:
+  los de [angel.cmdline](angel.cmdline) con `gpu_mhz=820`, `sweet_reboot=2` y `gpu_vco2=1`
+  (`python3 dev-notes/bootargs.py <img>` los imprime).
+- `/redwood/boot.d/80-gfx.sh` (en el teléfono, fuera de git) pone en cada arranque
+  `kern.sweet_fb_queue=1 kern.sweet_gpu_flush=1 kern.sweet_idle_cache=0`.
+- Driver: el bundle `merge-1` instalado por renombrado (§9.3). Gobernador de la GPU apagado; GPU a 820 MHz fijos.
+
+### 9.2 Compilar el driver
+
+El driver es `hakios-metal` del upstream de HackiOS (`63fc2b4`) con los parches A610 propios; receta, dependencias y
+pasos en [investigacion/08](investigacion/08-hakiosmetal-binario-vs-fuente.md) §5-§6. Todo vive fuera de git:
+
+```sh
+cd ~/sapphire-angel/research/metal/rebuild
+./receta.sh                      # upstream 63fc2b4 + patches/a610 -> out/propio
+SRC_KIND=opcional ./receta.sh    # ... + patches/opcional (metal.args) -> out/propio-args
+```
+
+Las ramas de trabajo están en `rebuild/hakios-upstream` (worktrees `wt-cpu` = `cpu-draw`, `wt-gpu` = `gpu-pass`);
+`build-bundle.sh` construye un árbol cualquiera (`SRC=…`) en `out/<nombre>/`. El binario `HakiosMetal` de
+`installer/update/files/` es el heredado: no es el driver en uso.
+
+### 9.3 Instalar y comprobar que está cargado
+
+```sh
+tools/perf/bundle.sh NOMBRE          # rebuild/out/NOMBRE/HakiosMetal al teléfono, por renombrado
+ssh sapphire 'killall backboardd'    # Metal carga el driver al arrancar backboardd
+tools/perf/driver-en-uso.sh          # "DRIVER EN USO" = backboardd es cliente de SapphireGPU
+```
+
+- **Por renombrado, nunca copiando encima**: el kernel guarda en el vnode la firma del primer binario cargado en ese
+  arranque y dyld rechaza cualquier binario cuya firma empiece más allá; entonces Metal no tiene dispositivo y
+  CoreAnimation compone por software (materiales planos, blur oscuro con rayas, backboardd a varios núcleos, ninguna
+  línea `fps:`). Investigacion/14, "Lo primero".
+- Sin la comprobación, ni una captura ni una medida dicen nada del driver.
+- `bundle.sh angel` restaura el binario heredado (guardado en el teléfono como `HakiosMetal.angel`).
+- La primera vez que corre un build nuevo recompila sus stages (hasta ~1 s cada uno): el primer ensayo tras instalar
+  no es comparable.
+
+### 9.4 Medir: carga, arnés A/B y capturas
+
+- **Carga:** `homeswipe.sh N` (en el teléfono, `/var/root/`): despierta, desbloquea, va al home y hace N rondas de
+  cambio de página; verificada con capturas. `userland/tests/swipetest.sh` no desbloquea: sus gestos actúan sobre la
+  pantalla de bloqueo.
+- **Opciones del driver sin reflashear:** `/var/tmp/metal.args` (se suma a los boot-args que lee el driver; se aplica
+  al reiniciar backboardd). `metal_fps=1` saca una línea `fps:` por periodo a la consola.
+- **A/B:** `tools/perf/ab.sh ETIQUETA "ARGS"` (Mac) lanza `ab-phone.sh` en el teléfono (escribe `metal.args`, reinicia
+  backboardd, captura la consola con `conscat` durante `homeswipe.sh 8`, CPU por proceso y las líneas `SWEET FB`), trae
+  los datos y los resume con `ab-sum.py`: buffers/s, a tiempo/tarde/paradas, draws por buffer, CPU por draw,
+  hecho→commit, commit→fin. n≥3 por condición; alternar las condiciones.
+- **Capturas:** `tools/perf/shot.sh NOMBRE` (vuelca las dos IOSurface de 750×1624 del doble buffer con `fbshot` y las
+  pasa a PNG); `glshot.sh BUNDLE NOMBRE` instala un bundle y captura la Biblioteca de Apps (fondo con blur). Con el
+  panel apagado la captura es el último frame: despertar antes (`hidtouch press 0`).
+- **Frecuencia real de la GPU:** `gxfreq` (`tools/perf/gxfreq.c`): contadores de ciclos del núcleo frente al de 19,2 MHz.
+- **Perfil de CPU:** `thrtop`, `psamp` y `symb.py` (`tools/perf/README.md`).
+- `SWEET FB: 5 s … N by the GPU` en el log cuenta swaps, no frames mostrados, y con `sweetfb_scale=2` (todas las
+  imágenes en uso) sus tiempos salen siempre a 0 (investigacion/09 §1). Los frames que llegan al panel los da
+  `kern.sweet_fb_diag`.
+
+### 9.5 Boot-args gráficos
+
+| Boot-arg | Imagen en uso | Efecto |
+|---|---|---|
+| `gpu=3 gpu_mmu=1 gpu_service=1` | sí | Arranque de la GPU, tablas de páginas propias y servicio que usan la copia al panel, Mesa y el driver Metal (0145-0154) |
+| `gpu_vco2=1` | `1` | Programa `gpu_cc_pll0` como Android: `gpu_mhz` es la frecuencia del núcleo (0337). Sin él, `gpu_mhz` fija el VCO y el núcleo va a la mitad (`gpu_mhz=1260` → 630,00 MHz, investigacion/03 M3) |
+| `gpu_mhz=N` | `820` | Con `gpu_vco2=1`, una fila de la tabla de stock: 320 465 600 785 820 980 1025 1100 1114 1260, sin pasar del speed bin (`gpu_bin=N`, `gpu_anybin=1`) |
+| `gpu_cx=N`, `gpu_mx=N`, `gpu_ipeak=0` | — | Niveles de raíl a votar en lugar de los de stock; sin votos de corriente de pico de CX (0337) |
+| `gpu_div=N` | `1` | Ruta antigua del reloj (GPLL0/N), sin efecto cuando `gpu_vco2=1` toma la ruta de stock |
+| `sweetmetal=N` | `2` | Driver Metal que nombra el acelerador: 2 `HakiosMetal`, 1 `SapphireMetal` (`metal/`), 0 ninguno (0319; también `kern.sweet_metal`) |
+| `sweetfb_scale=2 sweetfb_w=750` | sí | iOS dibuja a 2x (750×1624) y el kernel escala ×1,5 al panel |
+| `sweetfb_hz=N` | `120` | Frecuencia que el kernel publica a CoreAnimation y periodo de su temporizador; el panel refresca a 120 Hz siempre (investigacion/09 §2.4) |
+| `sweetfb_gpucopy=1` | sí | La GPU hace la copia de cada frame al panel |
+| `sweetfb_queue=1`, `sweetfb_queue_hold=N` | — | Como `kern.sweet_fb_queue` y `kern.sweet_fb_queue_hold_ms` desde el arranque (0340) |
+| `sweetfb_scanout=1` | — | Como `kern.sweet_fb_scanout` desde el arranque (0350) |
+| `sweetfb_hold=N` | — | Como `kern.sweet_fb_hold_ms` (0338) |
+| `gpu_flush=N`, `gpu_tlb=N`, `gpu_bocache=N` | — | Como sus sysctl (0339, 0341, 0342) |
+| `gpu_gov=1`, `gpu_ddr=1`, `gpu_hwcg=1` | — | Gobernador, voto del DDR y clock gating desde el arranque (0346-0348) |
+| `gpu_opp_drain=N`, `gpu_opp_park=1` | — | Espera máxima a la GPU ociosa al cambiar de nivel (100 ms); cambio por la vía larga (0345) |
+| `gpu_clkdiag=1` | — | Relojes y temperaturas al log del arranque tras encender la GPU (0343) |
+| `sweet_idle_cache=N` | — | Como `kern.sweet_idle_cache` desde el arranque (0344) |
+| `sweetgl=1`, `glenv=…`, `glwait=0` | sí | Ruta OpenGL ES (Mesa y el puente EAGL, `userland/src/eagl.c`; `glwait` es la espera del puente a la GPU al final de cada frame). Con `sweetmetal=2` CoreAnimation dibuja por el driver Metal (sus líneas `fps:`, 03 M2-M10) |
+| `sweet_glload=1` | sí | Cargador de las apps desde el arranque (0238, 0241), con los tweaks de ElleKit |
+
+### 9.6 Sysctls de 0336-0350
+
+Todos se leen o se escriben en caliente (`sysctl -w`). "Por defecto" es el valor sin boot-arg.
+
+| Sysctl | Parche | Por defecto | Efecto |
+|---|---|---|---|
+| `kern.sweet_fb_diag` | 0336 | solo lectura | Presentación: intervalos entre swaps y entre flips en refrescos reales del panel, latencia swap→flip, frames pisados (`overwritten`), retraso de los ticks. Acumulado: leer antes y después |
+| `kern.sweet_gpu_diag` | 0336 | solo lectura | Submits (tiempo dentro, candado, limpieza de caché), `GEM_NEW`, TLB, esperas de fence, copias al panel. Acumulado |
+| `kern.sweet_gpu_marks` | 0336 | 0 | 1: tiempo de GPU de cada submit y cada copia con `CP_ALWAYS_ON_COUNTER` |
+| `kern.sweet_gpu_pll` | 0337 | solo lectura | Modo, L, alpha, `USER_CTL`, RCG, votos y speed bin de la GPU, leídos de los registros |
+| `kern.sweet_fb_hold_ms` | 0338 | 0 | Retener `SwapEnd` hasta la copia anterior. Sin efecto en este teléfono: actúa en una rama que aquí no se toma (investigacion/15 §0.1) |
+| `kern.sweet_gpu_flush` | 0339 | 0 | 1: limpiar de caché una superficie solo si la CPU pudo tocarla desde la última limpieza (1,70 → 0,01 ms por submit, 03 M7); 2: además niega la memoria de cliente de las superficies |
+| `kern.sweet_gpu_flush_stats` | 0339 | solo lectura | Superficies nombradas, limpiadas, omitidas |
+| `kern.sweet_fb_queue` | 0340 | 0 | 1: cola de presentación: presenta en `SwapEnd`, tres flip buffers, flip en cuanto termina la copia (frames pisados 10,6 % → 0, 03 M7) |
+| `kern.sweet_fb_queue_depth`, `_hold_ms`, `_poll_us` | 0340 | 2, 50, 500 | Frames en espera antes de frenar `SwapEnd`, espera máxima, periodo del hilo que hace los flips |
+| `kern.sweet_fb_queue_diag` | 0340 | solo lectura | Estado y contadores de la cola |
+| `kern.sweet_gpu_tlb` | 0341 | 3 | Bit 0: sin invalidar la TLB del SMMU al solo mapear; bit 1: espera de la sincronización sin dormir. 0 = como antes |
+| `kern.sweet_gpu_tlb_stats` | 0341 | solo lectura | Invalidaciones con y sin dormir |
+| `kern.sweet_gpu_bocache` | 0342 | 0 | 1: guarda los buffers que un cliente cierra y se los reentrega borrados; 2: sin borrar (Metal promete buffers a cero: con cuidado) |
+| `kern.sweet_gpu_bocache_stats` | 0342 | solo lectura | Guardados, reentregados, liberados |
+| `kern.sweet_gpu_clocks` | 0343 | solo lectura | Mide GPU, buses, DDR y CPU con el contador de relojes de Qualcomm (~0,2 s) |
+| `kern.sweet_ddr_khz` | 0343 | solo lectura | Reloj del DDR (1 555 210 kHz bajo iOS, 03 M10) |
+| `kern.sweet_thermal`, `kern.sweet_gpu_temp` | 0343 | solo lectura | Los 16 sensores TSENS por zona de stock, en milésimas de °C; el 15 es la GPU |
+| `kern.sweet_idle_cache` | 0344 | 1 | Mantenimiento de caché antes de WFI: 1 = L1 y la L2 del cluster (lo de upstream), 2 = solo L1, 0 = nada (la imagen en uso pone 0 por `80-gfx.sh`: 62-68 → 25-26 µs por draw, 03 M10) |
+| `kern.sweet_idle_stats`, `kern.sweet_cpuregs` | 0344 | solo lectura | Entradas en reposo y tiempo de mantenimiento por CPU; MIDR, MPIDR, CLIDR, CCSIDR… de cada CPU |
+| `kern.sweet_gpu_khz` | 0345 | frecuencia de arranque | Escribir una fila de la tabla en kHz (p. ej. `1260000`) cambia el nivel en caliente con sus votos (312-1344 µs, 03 M10). Requiere `gpu_vco2=1`; con el gobernador activo da EBUSY |
+| `kern.sweet_gpu_opp`, `kern.sweet_gpu_opp_park` | 0345 | solo lectura, 0 | Cambios hechos y sus tiempos; 1 = cambio por la vía larga (RCG a GPLL0/2, PLL rearrancado) |
+| `kern.sweet_gpu_gov` | 0346 | 0 | 1: gobernador por ocupación (cada 50 ms) con tope térmico; en reposo baja a 320 MHz |
+| `kern.sweet_gpu_khz_max`, `_khz_min`, `_temp_max` | 0346 | arranque, 320000, 95000 | Cima y suelo del gobernador; temperatura de la GPU (m°C) a partir de la que baja de nivel |
+| `kern.sweet_gpu_gov_ms`, `_gov_up`, `_gov_down`, `_gov_idle_ms` | 0346 | 50, 80, 40, 100 | Periodo, umbrales de subida y bajada (% ocupado) y tiempo ocioso para el nivel mínimo |
+| `kern.sweet_gpu_gov_stats` | 0346 | solo lectura | Subidas, bajadas, pasos a reposo, temperatura máxima |
+| `kern.sweet_gpu_ddr`, `kern.sweet_gpu_ddr_floor` | 0347 | 0, 0 | 1: vota el DDR según el nivel de la GPU, como kgsl; suelo en kHz. Sin probar en el teléfono (investigacion/17 §8) |
+| `kern.sweet_gpu_ddr_stats` | 0347 | solo lectura | Votos, rechazos, DDR antes y 20 ms después |
+| `kern.sweet_gpu_hwcg` | 0348 | 0 | 1: clock gating por hardware de los bloques de la GPU (tabla `a612_hwcg`). Sin probar en el teléfono |
+| `kern.sweet_fb_regs`, `kern.sweet_fb_latch` | 0349 | solo lectura | Registros del DPU (MDP TOP, CTL0, VIG0 y su escalador, LM0, PP0, INTF1) y cómo toma el MDP cada flush |
+| `kern.sweet_fb_scanout` | 0350 | 0 | 1: el VIG0 escanea la superficie de iOS con su escalador, sin copia de la GPU (reiniciar backboardd tras activarlo); 2: solo el pool. Sin probar en el teléfono (investigacion/18) |
+| `kern.sweet_fb_scanout_diag` | 0350 | solo lectura | Estado del scanout y por qué se apagó si lo hizo |
+
+Con el gobernador activo y la GPU a 1260 MHz hubo una incidencia sin causa establecida (SIGBUS de SpringBoard y fondo
+con bloques descolocados, n=1, 03 M10): la imagen en uso queda a 820 MHz fijos.
