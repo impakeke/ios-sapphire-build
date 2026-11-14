@@ -198,10 +198,10 @@ que un run verde no garantiza nada. El script exige `conclusion=success`, que el
 como aviso cualquier otro `Skipping patch` (`STRICT=1` lo convierte en fallo).
 
 El parche que se comprueba es la variable `PATCH`, por defecto el último integrado
-(`0350-sapphire-fb-scanout-vig-scaler.patch`). Al añadir un parche nuevo, pasarlo:
+(`0352-sapphire-fb-scanout-fixes-flush-taken.patch`). Al añadir un parche nuevo, pasarlo:
 
 ```sh
-PATCH=0351-sapphire-loquesea.patch dev-notes/fetch-ci-kernel.sh <run>
+PATCH=0353-sapphire-loquesea.patch dev-notes/fetch-ci-kernel.sh <run>
 ```
 
 (o cambiar el valor por defecto en el script). Salida: `~/sapphire-angel/ci-kernels/<run>/{artifact/,run.log}`.
@@ -459,7 +459,10 @@ tools/perf/driver-en-uso.sh          # "DRIVER EN USO" = backboardd es cliente d
   pasa a PNG); `glshot.sh BUNDLE NOMBRE` instala un bundle y captura la Biblioteca de Apps (fondo con blur). Con el
   panel apagado la captura es el último frame: despertar antes (`hidtouch press 0`).
 - **Frecuencia real de la GPU:** `gxfreq` (`tools/perf/gxfreq.c`): contadores de ciclos del núcleo frente al de 19,2 MHz.
-- **Perfil de CPU:** `thrtop`, `psamp` y `symb.py` (`tools/perf/README.md`).
+- **Perfil de CPU:** `thrtop`, `psamp` y `symb.py`; `prof-phone.sh` perfila el hilo de render durante `homeswipe.sh 8`
+  (`tools/perf/README.md`).
+- **Tiempo real de GPU:** `kern.sweet_gpu_marks=1` y `kern.sweet_gpu_diag`: tiempo de cada submit y de cada copia al
+  panel con el contador de 19,2 MHz de la GPU (03 M11).
 - `SWEET FB: 5 s … N by the GPU` en el log cuenta swaps, no frames mostrados, y con `sweetfb_scale=2` (todas las
   imágenes en uso) sus tiempos salen siempre a 0 (investigacion/09 §1). Los frames que llegan al panel los da
   `kern.sweet_fb_diag`.
@@ -488,7 +491,7 @@ tools/perf/driver-en-uso.sh          # "DRIVER EN USO" = backboardd es cliente d
 | `sweetgl=1`, `glenv=…`, `glwait=0` | sí | Ruta OpenGL ES (Mesa y el puente EAGL, `userland/src/eagl.c`; `glwait` es la espera del puente a la GPU al final de cada frame). Con `sweetmetal=2` CoreAnimation dibuja por el driver Metal (sus líneas `fps:`, 03 M2-M10) |
 | `sweet_glload=1` | sí | Cargador de las apps desde el arranque (0238, 0241), con los tweaks de ElleKit |
 
-### 9.6 Sysctls de 0336-0350
+### 9.6 Sysctls de 0336-0352
 
 Todos se leen o se escriben en caliente (`sysctl -w`). "Por defecto" es el valor sin boot-arg.
 
@@ -511,7 +514,7 @@ Todos se leen o se escriben en caliente (`sysctl -w`). "Por defecto" es el valor
 | `kern.sweet_gpu_clocks` | 0343 | solo lectura | Mide GPU, buses, DDR y CPU con el contador de relojes de Qualcomm (~0,2 s) |
 | `kern.sweet_ddr_khz` | 0343 | solo lectura | Reloj del DDR (1 555 210 kHz bajo iOS, 03 M10) |
 | `kern.sweet_thermal`, `kern.sweet_gpu_temp` | 0343 | solo lectura | Los 16 sensores TSENS por zona de stock, en milésimas de °C; el 15 es la GPU |
-| `kern.sweet_idle_cache` | 0344 | 1 | Mantenimiento de caché antes de WFI: 1 = L1 y la L2 del cluster (lo de upstream), 2 = solo L1, 0 = nada (la imagen en uso pone 0 por `80-gfx.sh`: 62-68 → 25-26 µs por draw, 03 M10) |
+| `kern.sweet_idle_cache` | 0344, 0351 | 1 hasta 0350; 0 desde 0351 | Mantenimiento de caché antes de WFI: 1 = L1 y la L2 del cluster (lo de upstream), 2 = solo L1, 0 = nada (la imagen en uso pone 0 por `80-gfx.sh`: 62-68 → 25-26 µs por draw, 03 M10). 0351 además corrige el límite de niveles de los bucles por set/way |
 | `kern.sweet_idle_stats`, `kern.sweet_cpuregs` | 0344 | solo lectura | Entradas en reposo y tiempo de mantenimiento por CPU; MIDR, MPIDR, CLIDR, CCSIDR… de cada CPU |
 | `kern.sweet_gpu_khz` | 0345 | frecuencia de arranque | Escribir una fila de la tabla en kHz (p. ej. `1260000`) cambia el nivel en caliente con sus votos (312-1344 µs, 03 M10). Requiere `gpu_vco2=1`; con el gobernador activo da EBUSY |
 | `kern.sweet_gpu_opp`, `kern.sweet_gpu_opp_park` | 0345 | solo lectura, 0 | Cambios hechos y sus tiempos; 1 = cambio por la vía larga (RCG a GPLL0/2, PLL rearrancado) |
@@ -524,7 +527,8 @@ Todos se leen o se escriben en caliente (`sysctl -w`). "Por defecto" es el valor
 | `kern.sweet_gpu_hwcg` | 0348 | 0 | 1: clock gating por hardware de los bloques de la GPU (tabla `a612_hwcg`). Sin probar en el teléfono |
 | `kern.sweet_fb_regs`, `kern.sweet_fb_latch` | 0349 | solo lectura | Registros del DPU (MDP TOP, CTL0, VIG0 y su escalador, LM0, PP0, INTF1) y cómo toma el MDP cada flush |
 | `kern.sweet_fb_scanout` | 0350 | 0 | 1: el VIG0 escanea la superficie de iOS con su escalador, sin copia de la GPU (reiniciar backboardd tras activarlo); 2: solo el pool. Sin probar en el teléfono (investigacion/18) |
-| `kern.sweet_fb_scanout_diag` | 0350 | solo lectura | Estado del scanout y por qué se apagó si lo hizo |
+| `kern.sweet_fb_scanout_diag` | 0350, 0352 | solo lectura | Estado del scanout, por qué se apagó si lo hizo, y qué regla toma los flips |
+| `kern.sweet_fb_flush_taken` | 0352 | 0 | 1: todo flip, también los de copia, se da por tomado cuando los bits de `CTL_FLUSH` se leen limpios (0 = por el contador de frames, como 0340). Boot-arg `sweetfb_flush_taken`. 0352 corrige además tres fallos del scanout de 0350. Sin probar en el teléfono |
 
 Con el gobernador activo y la GPU a 1260 MHz hubo una incidencia sin causa establecida (SIGBUS de SpringBoard y fondo
 con bloques descolocados, n=1, 03 M10): la imagen en uso queda a 820 MHz fijos.

@@ -43,8 +43,11 @@ imagen), `read-ring.py` (parsea el ring del log), `shim-build-mac.sh` (shim con 
 | 0344 | Mantenimiento de caché antes de WFI conmutable (`kern.sweet_idle_cache`): XNU vaciaba la L2 del cluster A73 en cada reposo (investigacion/16). |
 | 0348 | Clock gating por hardware de la GPU (investigacion/17). |
 | 0349, 0350 | Diagnóstico del DPU y scanout directo con el escalador del VIG0 (investigacion/18). |
+| 0351 | Nada antes de WFI por defecto y límite de niveles correcto en el mantenimiento por set/way (investigacion/16). |
+| 0352 | Correcciones del scanout directo y flips tomados por `CTL_FLUSH` (`kern.sweet_fb_flush_taken`). |
 
-Los conmutadores de 0336-0350 y su valor por defecto están en OPERACION.md §9.6. Los parches siguientes empiezan en 0351.
+Los conmutadores de 0336-0352 y su valor por defecto están en OPERACION.md §9.6. 0351 y 0352 están sin probar en el
+teléfono.
 
 ## Estado
 
@@ -56,5 +59,6 @@ Medido en el teléfono del fork (datos en [investigacion/03](investigacion/03-ex
   (n=1 arranque).
 - La E/S cruda de `sweet_ufs` funciona con 0334 (30/30 lecturas del ring, EINVAL en offsets desalineados).
 - CoreAnimation dibuja en la GPU por el driver Metal compilado desde fuente (bundle `merge-1`): 44-48 command buffers
-  por segundo en el home, con la GPU como límite (23-27 ms por frame), n=1-2 (investigacion/03 M10).
+  por segundo en el home (n=1-2); por frame, 8,3 ms de GPU dibujando más 4,15 ms de copia al panel y ~13,7 ms de CPU
+  del hilo de render (n=1) (investigacion/03 M10-M11).
 - Siguiente: [investigacion/INDICE.md](investigacion/INDICE.md), "Gráficos: siguiente trabajo".
