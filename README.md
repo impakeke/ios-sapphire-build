@@ -8,7 +8,7 @@ The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory 
 
 > Experimental bring-up, not a usable phone OS. Many things are missing or stubbed, and Apple's security model is mostly switched off. The installer (`docs/INSTALL.md`) puts iOS in its own `iosroot` partition next to Android; the first install shrinks `userdata` and so **erases Android's user data**. It flashes the iOS kernel into `boot_<the slot Android is not using>`; `fastboot boot` (RAM only) is for testing kernels.
 >
-> *This README was corrected on 2026-11-14 by the fork giovannipodesta. Where a claim rests only on commit messages or release notes (versions 0.1.7/0.1.8: `NOTES.md` stops on 2026-11-08), it says "no recorded measurement". Sources: `NOTES.md`, `dev-notes/investigacion/` (03: measurements, 04: audit of these docs).*
+> Where a claim rests only on commit messages or release notes (versions 0.1.7/0.1.8; `NOTES.md` has no entries for them), this README says "no recorded measurement". Sources: `NOTES.md`, `dev-notes/investigacion/` (03: measurements, 04: audit of these docs). The fork's development loop is in `dev-notes/OPERACION.md`; agents start at `AGENTS.md`.
 
 ## What works on sapphire
 
@@ -18,7 +18,7 @@ The Redmi Note 12 4G (topaz) and the Redmi Note 13 4G share the SoC, the memory 
 | Storage | UFS host driver; the iOS root is a journaled HFS+ volume in the `iosroot` partition (`ufsroot=iosroot`), read/write. Shutdown from Settings unmounts it cleanly |
 | GUI | Apple logo, lock screen with passcode, home screen, apps; CoreAnimation drawn on the Adreno 610 through Mesa and an OpenGL ES bridge (`NOTES.md` 2026-10-22 to 10-27). OpenGL ES apps draw; Metal apps do not (`NOTES.md` 2026-10-27 night). "Real Metal on the GPU" (release notes): no recorded measurement |
 | Touch | FocalTech FT3519T (chip id `54:52`) on QUP0 SE2, calibrated for sapphire by boot args (patch 0140) |
-| USB | DWC3 in device mode as a CDC-ECM network card: `192.168.7.2` on the phone, live kernel log over UDP. On a normal boot (`set_active` + reboot) it only enumerated after fastboot `continue` until patches 0331-0333 (UTMI as the PIPE clock, on by default): 8 of 8 normal boots enumerated since (fork's phone, 2026-11-14). Data path 0330 (default since 0332/0333): 20 × 30 MB transfers intact. Small samples; see `dev-notes/investigacion/03` |
+| USB | DWC3 in device mode as a CDC-ECM network card: `192.168.7.2` on the phone. Enumerates on a normal boot (`set_active` + reboot) with patches 0331-0333 (UTMI as the PIPE clock, on by default): 8 of 8 normal boots on the fork's phone, 0 of 3 without them. Data path 0330 (on by default): 20 × 30 MB transfers intact. Small samples; see `dev-notes/investigacion/03`. Release 0.1.8 does not include these patches: there the USB only enumerates when iOS is started from fastboot |
 | Modem | Firmware read from the stock `modem_a`, authenticated by TrustZone, modem up with its QMI services (patch 0143); SIM PIN, signal, SMS, calls with audio, LTE data for every app (`NOTES.md` 2026-10-25 to 10-28). "Other carriers via APN": no recorded measurement |
 | Wi-Fi | WCN3988; joins WPA2-PSK networks and auto-joins after the first unlock (`NOTES.md` 2026-10-20, 2026-11-04). "Wi-Fi seconds after boot" (0.1.8): no recorded measurement |
 | Audio | Playback through the RedwoodAudio HAL plug-in, call audio both ways, microphones (`NOTES.md` 2026-10-28) |
@@ -64,7 +64,7 @@ Ways to build it:
   ```
 - **Codemagic** (`codemagic.yaml`, workflows `xnu` and `xnu-4k`, free personal tier: 500 macOS minutes a month): start it on `sapphire`, download the kernel zip. It uses Xcode 16.0; patch 0141 makes the kernel build with it.
 - **Locally on Linux/WSL** (`tools/xnu-linux/`, LLVM clang 18 patched with Apple's builtins, iig-lite): this is how the original author built kernels from 0241 on, including the 0.1.8 release kernel (`NOTES.md` 2026-10-28; audit in `dev-notes/investigacion/04` §4: the release kernel cannot be reproduced exactly from the tagged tree).
-- **Locally on macOS**: the fork builds with Apple clang 21 / SDK 26.x from the Command Line Tools (`dev-notes/build-recipes.md`).
+- **Locally on macOS**: Apple clang 21 / SDK 26.x from the Command Line Tools (`dev-notes/build-recipes.md`).
 
 ### 2. Build the iOS root image
 
@@ -220,10 +220,10 @@ driver (Mesa freedreno) behind CoreAnimation.
 | --- | --- |
 | `shim/` | Bare-metal boot shim (C + asm), boot image v4, Gold hand-off, GIC setup, payload loader |
 | `xnu/patches/` | XNU patch series, applied in order: sweet's 0001–0079, topaz's 0080–0139, sapphire's 0140+ |
-| `codemagic.yaml`, `.github/workflows/xnu.yml` | Kernel builds |
+| `codemagic.yaml`, `.github/workflows/xnu-4k.yml`, `xnu.yml` | Kernel builds (`xnu-4k`: the 4 KiB kernel the phone runs) |
 | `tools/` | ADT, payload, root image, boot image, log, modem and HFS+ tools |
 | `NOTES.md` | Engineering log (sweet, topaz, sapphire) |
-| `dev-notes/` | The fork's notes (Spanish); `dev-notes/investigacion/INDICE.md` is the current USB investigation |
+| `dev-notes/` | The fork's notes (Spanish): `OPERACION.md` (development loop), `investigacion/INDICE.md` (state, measurements, audits) |
 | `RECOVERY.md` | Getting back to recovery / Android on sapphire |
 
 Not in git: partition dumps, live device trees, Apple firmware and root images, boot logs, build trees.

@@ -1,6 +1,6 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-> Note (2026-11-14): from the section "Agent handoff / active work (2026-10-15, latest)" down (about line 500 now), entries without the `sapphire:` prefix are about the earlier device, **sweet** (Redmi Note 10 Pro, SM7150), not sapphire.
+> From the section "Agent handoff / active work (2026-10-15, latest)" down, entries without the `sapphire:` prefix are about the earlier device, **sweet** (Redmi Note 10 Pro, SM7150), not sapphire.
 
 ## 2026-11-14 (fork giovannipodesta): iOS USB on a normal boot, a data path that survives load (patches 0329-0334)
 

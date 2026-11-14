@@ -1,19 +1,22 @@
 # Build recipes — kernel, shim, empaquetado, flasheo
 
-Todo **desde fuente, limpio**. Probado en macOS 26 / x86_64 con Apple clang 21 / SDK 26.x de las
-Command Line Tools (las notas antiguas decían "Xcode 21", que no existe). En otra
-máquina ajusta rutas. Lo que NO va al repo (pesado / de terceros): IPSW, KDK, zig,
-binarios de Angel — ver `continuar-en-otra-maquina.md` para obtenerlos.
+Todo **desde fuente, limpio**, para compilar en local. Probado en macOS 26 / x86_64 con Apple clang 21 /
+SDK 26.x de las Command Line Tools. El kernel que corre el teléfono se compila normalmente en CI
+(`OPERACION.md` §4); estas recetas son para iterar en local. En otra máquina ajusta rutas. Lo que no va
+al repo (pesado o de terceros: IPSW, KDK, zig, binarios de Angel) está en `continuar-en-otra-maquina.md`.
 
 ## 1) Kernel XNU (dev) con nuestros parches — vía darwin-xnu-build (DXB)
 
 DXB = `blacktop/darwin-xnu-build`: clona el XNU de Apple, aplica `xnu/patches/*.patch`
-(los del port, incluidos 0327/0328), compila `arm64/cortex-a53`,
+(toda la serie del port), compila `arm64/cortex-a53`,
 `DEVELOPMENT/SWEET`, `TOPAZ_4K=1`.
 
 Requisitos:
 - **Apple clang 21 / SDK 26.x** (Command Line Tools) o Xcode 16; el proyecto nació con 16 y el CI
-  (`xnu-4k.yml`, macos-15) usa Xcode 16.0 (16A242d). Ver toolchain-findings.md.
+  (`xnu-4k.yml`, macos-15) usa Xcode 16.0 (16A242d). Un kernel compilado en local con Apple clang 21 /
+  SDK 26.5 (el de la imagen expG) arranca iOS y enumera el USB.
+  Observación sin repetir (n=1, octubre): el shim de Angel con un kernel local anterior llegó a
+  `xnu jumping` y terminó en pantalla roja; no se sabe si fue el compilador o el kernel.
 - **KDK 13.5** → `/Library/Developer/KDKs/KDK_13.5_22G74.kdk`
   (instalar con `sudo installer -pkg KDK_13.5_22G74.dmg/*.pkg -target /` en Terminal).
 - **ccache** (rebuilds incrementales rápidos): cableado con `base_dir` + sloppiness.
@@ -46,12 +49,12 @@ el SHA cambió (`shasum -a 256`) y que `sweet_usb.o` se recompiló.
 El shim arranca XNU (ABL → BootShim → XNU). El build original de Angel usa
 `aarch64-linux-gnu-gcc`. En macOS lo portamos a **zig cc** (clang+lld 0.13.0).
 
-**Las claves que lo hacen bootear** (ver toolchain-findings.md para el porqué):
+**Las claves que lo hacen bootear:**
 - `-target aarch64-freestanding-none`, `-mcpu=generic+el3-neon-fp_armv8`
   (sin NEON, con el3), `-mgeneral-regs-only -mstrict-align -fno-jump-tables`.
 - Enlazar con **`-Wl,-e,_head -Wl,--no-gc-sections`**: si no, la GC tira
   `.text.head`/`_head` y se pierde el **magic ARM\x64 @ offset 56** y el
-  `image_size @ 16` → handoff roto. Esto fue el bug real del shim (NO era omagic).
+  `image_size @ 16` → el ABL no arranca la imagen o el handoff a XNU se rompe.
 - `out/compat.c` con `strcmp/strncmp/strlen/memcmp` (gcc los daba, zig no).
 - `zig objcopy -O binary`, truncar a `_end`, padding 4K, **append del payload**,
   escribir `image_size` (u64 @ 16) = tamaño final, y `mkbootimg.py` v4.
@@ -81,15 +84,15 @@ Guárdalo junto al ADT.
 
 ## 4) Flasheo + boot
 
-*Corregido 2026-11-14:* `fastboot boot` **no** brickea este ABL: es solo RAM (`CmdBoot` =
-`CmdContinue`, investigacion/02 §P4). La pantalla negra de la prueba v1 vino de una imagen sin la
-cabecera ARM64 (magic `ARM\x64` @56) que este ABL exige (NOTES.md:466); ver la puerta de la receta 2.
-Si queda en negro: `fastboot reboot bootloader` (uefi/README.md). Para probar un kernel sin tocar
-flash vale `fastboot boot img`; para dejarlo instalado, respaldar y flashear `boot_a`. Nunca
-escribir `boot_b` (Android).
+`fastboot boot img` es solo RAM (`CmdBoot` = `CmdContinue`, investigacion/02 §P4) y sirve para probar
+un kernel sin tocar flash. Este ABL solo arranca imágenes v4 con la cabecera ARM64 (magic `ARM\x64`
+@56, ver las puertas de la receta 2); sin ella la pantalla queda negra y `fastboot reboot bootloader`
+la recupera (uefi/README.md). Para dejarlo instalado, respaldar y flashear `boot_a`. Nunca escribir
+`boot_b` (Android). Para cambiar solo el kernel de una imagen buena, `repack-boot.py`
+(OPERACION.md §4.3) es más corto que estas recetas.
 
 ```sh
-# el teléfono en fastboot (apagar, combo fastboot); respaldar boot_a antes.
+# el teléfono en fastboot; respaldar boot_a antes. En la Hackintosh: ~/adb-bridge/fbusb (OPERACION.md §1).
 fastboot flash boot_a shim/out/shim-boot.img
 fastboot set_active a        # slot a = iOS ; slot b = Android
 fastboot reboot
@@ -98,7 +101,7 @@ Restaurar Android usable: `fastboot set_active b` + reboot.
 Restaurar iOS original de Angel: `fastboot flash boot_a <backup> && fastboot set_active a`.
 
 ## 5) Verificar enumeración USB en el Mac
-`system_profiler SPUSBDataType` está **colgado** en este macOS (devuelve 0 líneas).
+`system_profiler SPUSBDataType` no devuelve nada en la Hackintosh del fork.
 Usa **`ioreg`**:
 ```sh
 ioreg -rc IOUSBHostDevice -l -w 0 | grep -A3 '"idVendor" = 4617'   # 4617 = 0x1209

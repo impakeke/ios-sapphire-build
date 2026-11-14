@@ -6,7 +6,7 @@
 # 1. espera a que la ejecución termine (gh run watch) y exige conclusion=success;
 # 2. guarda el log y exige "Applying patch: …0334-sapphire-ufs-raw-io-no-user-memcpy.patch".
 #    darwin-xnu-build se salta EN SILENCIO (solo un [warning]) los parches que no
-#    aplican, así que un "Skipping patch …0329…" o la ausencia de la línea es un fallo;
+#    aplican, así que un "Skipping patch …$PATCH…" o la ausencia de la línea es un fallo;
 #    los demás "Skipping patch" se listan como aviso (STRICT=1 los convierte en fallo);
 # 3. gh run download del artefacto xnu-kernel-4k en un directorio nuevo y vacío;
 # 4. shasum -a 256 -c SHA256SUMS, e imprime el LC_UUID del kernel.
@@ -60,7 +60,7 @@ CONC=$(info conclusion)
 [ "$CONC" = success ] || fail "la ejecución $RUN terminó con conclusion=$CONC (¿cancelada por otro dispatch? concurrency cancel-in-progress)"
 say "terminada: success"
 
-# 2. log y parche 0329
+# 2. log y parche esperado ($PATCH)
 gh run view "$RUN" -R "$REPO" --log > "$LOG.raw" || fail "no se pudo bajar el log"
 # quitar los colores de darwin-xnu-build (running/warning usan echo -e con ESC[..m)
 sed $'s/\x1b\\[[0-9;]*m//g' "$LOG.raw" > "$LOG" && rm -f "$LOG.raw"
@@ -68,7 +68,7 @@ say "log en $LOG ($(wc -l < "$LOG" | tr -d ' ') líneas)"
 
 if grep -F "Skipping patch" "$LOG" | grep -qF "$PATCH"; then
 	grep -F "Skipping patch" "$LOG" | grep -F "$PATCH" >&2
-	fail "darwin-xnu-build SE SALTÓ $PATCH: el kernel NO lleva el diagnóstico USB. No lo flashees."
+	fail "darwin-xnu-build SE SALTÓ $PATCH: el kernel NO lleva ese parche. No lo flashees."
 fi
 APPLIED=$(grep -F "Applying patch:" "$LOG" | grep -F "/$PATCH" || true)
 [ -n "$APPLIED" ] || fail "el log no dice 'Applying patch: …/$PATCH' (¿el parche no está en xnu/patches de ese commit?)"

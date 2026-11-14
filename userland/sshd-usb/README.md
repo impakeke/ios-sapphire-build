@@ -1,9 +1,9 @@
 # sshd-usb: SSH solo con clave y solo por la red USB
 
-Esta pieza sustituye a la shell root sin autenticación de `org.sapphire.usbshell` (puerto 2323) como forma
-habitual de entrar al teléfono. Ya está desplegada en el teléfono de pruebas del fork y verificada en
-`dev-notes/investigacion/03-experimentos-y-datos.md`, E6. Todavía no la instala ni el instalador ni ninguna
-`.supdate`.
+Es la forma habitual de entrar al teléfono en lugar de la shell root sin autenticación de
+`org.sapphire.usbshell` (puerto 2323). Está desplegada en el teléfono de pruebas del fork y verificada en
+`dev-notes/investigacion/03-experimentos-y-datos.md`, E6. No la instala ni el instalador ni ninguna
+`.supdate`. Uso diario: `dev-notes/OPERACION.md` §3.
 
 | Archivo | Va en el teléfono a | Qué hace |
 |---|---|---|
@@ -23,7 +23,7 @@ Sin esto, sshd se cierra al arrancar y `KeepAlive` lo relanza cada 10 s.
   las trae, a propósito: `scrub.py` las quita para que cada teléfono tenga las suyas.
 - **`/var/root/.ssh/authorized_keys`** con la clave pública: directorio en 700, archivo en 600, dueño root.
 - **`/var/jb/etc/pwd.db` y `spwd.db` válidos.** libiosexec solo busca los usuarios ahí. Si faltan, sshd
-  responde "Invalid user root". Desde este cambio, `scrub.py` los genera con todas las cuentas bloqueadas
+  responde "Invalid user root". `scrub.py` los genera con todas las cuentas bloqueadas
   (`*`). Con clave no hace falta contraseña.
 - **La interfaz USB con `192.168.7.2`.** Si aún no existe cuando se carga el job, sshd no puede hacer
   `bind` y sale; `KeepAlive` lo reintenta.

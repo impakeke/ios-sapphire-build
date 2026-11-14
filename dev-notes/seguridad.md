@@ -1,14 +1,14 @@
 # Seguridad de Sapphire: amenazas y mitigaciones
 
-Fecha: 14 nov 2026. Parte de la auditoría `investigacion/04-auditoria-documentacion-heredada.md` (§2 y los
+Desarrolla la auditoría [investigacion/04](investigacion/04-auditoria-documentacion-heredada.md) (§2 y los
 puntos 1-3 de "Lo más importante"). Las rutas son del repo salvo que se indique otra cosa. Nada de lo que
 aquí se llama "propuesta" está aplicado.
 
-Ya corregido en el repo (sin regenerar todavía el overlay de la release):
-- `installer/overlay/scrub.py` vuelve a generar `pwd.db`/`spwd.db` desde el `master.passwd` limpio, con todas
+Estado del repo (el overlay publicado de la release no se ha regenerado con esto):
+- `installer/overlay/scrub.py` genera `pwd.db`/`spwd.db` desde el `master.passwd` limpio, con todas
   las cuentas en `*`. También limpia `passwd`, cambia todos los `bdaddr` por `@BDADDR@` y se detiene si queda
   algún hash crypt en cualquier archivo del overlay.
-- `.gitignore`: `/recovery/`. `installer/recovery/` ya se versiona (ver su README).
+- `.gitignore`: `/recovery/`. `installer/recovery/` está versionado (ver su README).
 - `userland/sshd-usb/`: SSH solo con clave en 192.168.7.2.
 
 **Pendiente urgente fuera del repo.** El `sapphire-overlay.tar.gz` de v0.1.8 sigue publicado con un
@@ -210,7 +210,7 @@ rechace symlinks.
 **Qué es.** Una receta del instalador (`installer/recipes/launchd/org.sapphire.usbshell.plist`) que se
 instala en **todos** los teléfonos. Es un job de launchd con `inetdCompatibility`, `UserName root` y
 `SessionCreate`. Cada conexión TCP a `192.168.7.2:2323` recibe `bash -i` como root, sin contraseña ni
-clave. Se creó para el bring-up (`dev-notes/acceso-al-telefono.md`) y no está documentado para usuarios.
+clave. Sirve para el bring-up (`dev-notes/OPERACION.md` §3) y no está documentado para usuarios.
 
 **Riesgo.**
 - Cualquier host USB al que se conecte el teléfono con la red USB activa (`sweetusb=2`) tiene root
@@ -240,7 +240,7 @@ exista.
 
 ## 3. SSH solo con clave por la red USB (`userland/sshd-usb/`)
 
-Ya desplegado en el teléfono de pruebas del fork (E6 en `investigacion/03`). Se añade ahora al repo:
+Desplegado en el teléfono de pruebas del fork (E6 en `investigacion/03`). En el repo:
 
 - `userland/sshd-usb/com.sapphire.sshd-usb.plist`: va en `/redwood/launchd/`. Ejecuta `sshd -D` como root
   con `ListenAddress=192.168.7.2`, `UsePAM=no`, `PasswordAuthentication=no`,

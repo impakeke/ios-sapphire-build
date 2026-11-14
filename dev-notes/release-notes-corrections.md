@@ -1,24 +1,25 @@
-# Correcciones a las notas de la release v0.1.8-test (texto propuesto)
+# Notas de la release v0.1.8-test: texto propuesto
 
 Las notas de la release están en GitHub (`Angelpro09xd/ios-sapphire`, tag `v0.1.8-test`) y este fork no
-puede editarlas. Aquí está el texto corregido, listo para pegar si se publica una release desde el fork o
-se propone al autor original. Las notas están en inglés, así que el texto propuesto también.
+puede editarlas. Este archivo contrasta cada afirmación de esas notas con la evidencia y da un texto que
+se ajusta a ella, listo para pegar si se publica una release desde el fork o se propone al autor original.
+Las notas están en inglés, así que el texto propuesto también.
 
 Fuentes: [investigacion/04](investigacion/04-auditoria-documentacion-heredada.md) (auditoría, con los
 assets de la release descargados en solo lectura), [investigacion/03](investigacion/03-experimentos-y-datos.md)
 (mediciones del 13-14 nov), el código del instalador (`installer/`) y `git log`.
 
-## Qué cambia y por qué
+## Afirmaciones y evidencia
 
-| Afirmación de la release | Corrección | Evidencia |
+| Afirmación de la release | Lo que muestra la evidencia | Fuente |
 |---|---|---|
 | "The `mobile` and `root` accounts have no password" | `root` está bloqueada (`!`), pero `mobile` tiene un hash `$6$` real en `/var/jb/etc/spwd.db`, que es lo único que lee libiosexec | 04 §2; `installer/overlay/scrub.py` solo limpiaba `master.passwd` |
-| "if you use SSH … set one with `passwd`" | El sshd de la release no tiene job de launchd, ni claves de host, ni `authorized_keys`: no arranca. `PermitRootLogin yes`, `UsePAM yes` | 04 §2; medido el 13 nov (`acceso-al-telefono.md`) |
+| "if you use SSH … set one with `passwd`" | El sshd de la release no tiene job de launchd, ni claves de host, ni `authorized_keys`: no arranca. `PermitRootLogin yes`, `UsePAM yes` | 04 §2; medido en el teléfono del fork (investigacion/03, E0) |
 | (no lo dice) | Shell root **sin autenticación** en `192.168.7.2:2323` | `installer/recipes/launchd/org.sapphire.usbshell.plist` |
 | (no lo dice) | Cualquier `*.supdate` del inbox de `iosroot` se ejecuta como root en cada arranque, sin firma | 04 §2 (`sapphire-update.sh` del zip) |
 | Fila `SHA256SUMS` en la tabla de archivos | Ese asset no existe | lista de assets de la release |
 | `sapphire-kernel.img` = "Apple's open-source XNU with Sapphire's patches" | Es un build local (WSL, clang 18 parcheado + iig-lite, `tools/xnu-linux`), con firma `Fri Nov 13 17:37:11 CET 2026`: 7 min antes del commit 1cdcbfb (17:44:34) que añade 0323-0325 y 51 min antes del tag (be9c5aa, 18:28:09). Se reempaquetó sobre un `BASE.img` local que no está en el repo. No se puede reproducir exactamente desde el tag | 04 resumen punto 4; `git log` |
-| "No USB link to the PC while iOS runs from the phone's storage (only when booted with `fastboot boot`)" | Cierto para 0.1.8. Medido: el USB enumera saliendo de fastboot (`continue`) y no en arranque normal. Arreglado en el fork con 0331-0333, que **no** están en 0.1.8 | 03 E1, E3, E4, E6 |
+| "No USB link to the PC while iOS runs from the phone's storage (only when booted with `fastboot boot`)" | Cierto para 0.1.8: el USB enumera saliendo de fastboot (`continue`) y no en arranque normal. Los parches 0331-0333 del fork, que **no** están en 0.1.8, hacen que enumere también en arranque normal | 03 E1, E3, E4, E6 |
 | "Wi-Fi works seconds after boot", "Bluetooth … headphones tested", "Mobile data on other carriers", "Battery percentage from real charge counting", "Real Metal on the GPU" | Sin medición registrada: `NOTES.md` acaba el 2026-11-08 y solo los commits lo respaldan. La última entrada sobre BT dice "to be tried with headphones" | 04 §3 |
 
 ## Texto propuesto (inglés)

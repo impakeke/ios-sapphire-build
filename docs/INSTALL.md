@@ -7,8 +7,8 @@ switch between them with an app on each side.
 > **Test release.** The current version is 0.1.8 (`installer/VERSION`; GitHub tag `v0.1.8-test`). Expect
 > rough edges. Back up everything you care about on Android before you start.
 >
-> *Corrected on 2026-11-14 by the fork giovannipodesta from the installer's code and the 0.1.8 release
-> assets; see `dev-notes/investigacion/04-auditoria-documentacion-heredada.md`.*
+> This guide follows the installer's code and the 0.1.8 release assets
+> (`dev-notes/investigacion/04-auditoria-documentacion-heredada.md`).
 
 ---
 
@@ -99,8 +99,8 @@ Sapphire Dual Boot (Android) can also browse iOS's files and photos and show the
 - **Tweaks**: Cylinder, SnowBoard, Filza and others are **not** included (they are not ours to
   redistribute). Install them from Sileo: the usual repos are already added.
 - **Passwords**: the 0.1.8 overlay locks `root` (`!`), but its `/var/jb/etc/spwd.db` still holds a real
-  password hash for `mobile`, from the phone the overlay was taken from (`master.passwd` was scrubbed to
-  `*`, but libiosexec only reads `pwd.db`/`spwd.db`). So "no password" is wrong. Setting your own with
+  password hash for `mobile`, from the phone the overlay was taken from (`master.passwd` is scrubbed to
+  `*`, but libiosexec only reads `pwd.db`/`spwd.db`), so `mobile` is not passwordless. Setting your own with
   `passwd` from a root shell has not been verified to update `spwd.db`.
 - **SSH**: the release's sshd has no launchd job, no host keys and no `authorized_keys`, so it does not
   run; its `sshd_config` has `PermitRootLogin yes` and `UsePAM yes`. The fork giovannipodesta adds a
