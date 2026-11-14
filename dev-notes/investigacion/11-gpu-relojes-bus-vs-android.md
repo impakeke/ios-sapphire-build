@@ -40,8 +40,9 @@ Convenciones: **G123** = línea 123 de `iokit/Kernel/arm/SapphireGpu.cpp` recons
 8. El resto de diferencias de `hw_init` (acceso mínimo de 64 bytes, clock gating por hardware, contadores
    de rendimiento) son menores o de consumo; tabla en §11.
 
-El parche [`0337-sapphire-gpu-pll-vco.patch`](#8-parche-0337) programa el PLL, los raíles y los votos como
-Android tras `gpu_vco2=1`. Está en `~/sapphire-angel/research/metal/relojes/parche/`.
+El parche [`0337-sapphire-gpu-pll-vco.patch`](#8-parche-0337) (`xnu/patches/`) programa el PLL, los raíles
+y los votos como Android tras `gpu_vco2=1`. El borrador 0339 (§8.1, fuera del repo) mide los relojes, el
+del DDR incluido.
 
 ## 2. Material y método
 
@@ -50,7 +51,7 @@ Todo el material pesado está fuera de git, en `~/sapphire-angel/research/metal/
 | Carpeta | Contenido |
 |---|---|
 | `xnu/` | Árbol reconstruido a 0335: el replay de `auditoria-sweet_usb` más 0329-0335 con `git apply`. Idéntico (`diff -rq`) al de `kernel-gpu/` |
-| `xnu-0336/`, `xnu-0337/` | El mismo árbol con el 0336 del agente del kernel, y con 0336 + 0337 |
+| `xnu-serie/` | El mismo árbol con 0336, 0337 y 0338 de `xnu/patches/` aplicados en orden |
 | `dtb/` | Los 6 DTB de `vendor_boot_b` y los 47 overlays de `dtbo_b`, con su `.dts`; `merged-khaje24a-sapphire.dts` = base `Khaje SoC` msm-id 0x24a + overlay `Khaje IDP sapphire` (`fdtoverlay`). La base msm-id 0x206 es idéntica en todo lo de GPU; el overlay `sapphiren` solo añade NFC |
 | `vendor_ramdisk/` | El ramdisk de `vendor_boot_b` extraído: 253 módulos del kernel de Android de este teléfono (5.15.94), entre ellos `gpucc-khaje.ko`, `clk-qcom.ko`, `gcc-khaje.ko`, `clk-smd-rpm.ko`, `bwmon.ko`, `memlat.ko`, `qnoc-bengal.ko`, `cx_ipeak.ko` |
 | `ref/downstream/` | Kernel de stock: `MiCode/Xiaomi_Kernel_OpenSource` rama `topaz-t-oss` @ `345999da` (msm-5.15.41, mismo SoC) y `spes-r-oss` @ `88afd325` (4.19, kgsl en el árbol); kgsl 5.x de CodeLinaro `graphics-kernel` @ `f900d903` |
@@ -58,13 +59,27 @@ Todo el material pesado está fuera de git, en `~/sapphire-angel/research/metal/
 | `ref/mesa/` | Mesa 24.3.0: `freedreno_devices.py` y otros |
 | `scripts/` | `extract_dtbs.py` (vendor_boot v4 y dtbo), `kodump.py` (vuelca símbolos de datos de un `.ko`) |
 | `gxfreq/` | Fuente y binario de la herramienta de §3 (la copia versionada es `tools/perf/gxfreq.c`) |
-| `parche/` | `0337-sapphire-gpu-pll-vco.patch`, su generador (`work/splice0337.py`) y el arnés de anfitrión (`work/harness.cpp`) |
+| `parche/` | Copia de `0337-sapphire-gpu-pll-vco.patch` y el borrador `0339-sapphire-gpu-clocks-diag.patch.borrador`, con sus generadores (`work/splice0337.py`, `work/splice0339.py`) y los arneses de anfitrión (`work/harness.cpp`, `work/harness2.cpp`) |
 | `telefono/` | `sysctl` y `dmesg` del arranque auditado |
 
 Del teléfono, en solo lectura: `sysctl` (`kern.sweet_*`, `hw.*`, `machdep.*`) y `dmesg`. El ring del log
 no se pudo leer en esta sesión (`/dev/ufsroot0`: *Resource busy*); las líneas `SapphireGpu` y `SWEET
 CPUFREQ` citadas son de rings guardados de arranques con los mismos boot-args
 (`~/sapphire-angel/backups/ring-E5.txt` y otros siete).
+
+Lo relevante del arranque auditado (kernel de CI 43570770230, 0334; `telefono/sysctl-*.txt`):
+
+| sysctl | Valor | Nota |
+|---|---|---|
+| `kern.bootargs` | `… gpu=3 gpu_mmu=1 gpu_service=1 gpu_div=1 gpu_mhz=1260 … sweetfb_scale=2 sweetfb_w=750 sweetfb_hz=120 sweetmetal=2 sweetsched=15 glenv=FD_MESA_DEBUG=sysmem` | sin `gpu_pool`: buffers del pool write-combined |
+| `kern.sweet_sched` | 15 | §12 |
+| `hw.cpufrequency` | 2 803 200 000 | el máximo del LUT del cluster gold |
+| `hw.memfrequency`, `hw.busfrequency` | 1 866 000 000, 100 000 000 | constantes del ADT, no mediciones |
+| `hw.perflevel0/1` | 4 + 4 núcleos; L2 de 2 MB y 512 KB | del ADT; el DT de Android no da tamaños de caché |
+| `hw.pagesize` | 16384 | páginas de usuario |
+| `machdep.cpu.sysreg_MAIR_EL1` | 0x0c08044f00bb44ff | índice 1 = 0x44: write-combined es memoria normal sin caché (§10.4) |
+
+No hay ningún `kern.sweet_gpu*` en ese kernel.
 
 ## 3. Medición: la frecuencia real del núcleo
 
@@ -247,7 +262,7 @@ Todos los valores de `gpu_mhz` menos 1260 dejan la GPU **más lenta** que `gpu_d
 | Resto de `hw_init` (GBIF QoS, UCHE, ROQ, pool, prim fifo…) | §11 | igual | Sí |
 | Registros "mágicos" del a610 (`RB_CCU_CNTL`, `RB_DBG_ECO_CNTL`…) | Mesa `freedreno_devices.py:438-466` | iguales en el blitter del kernel (G1459-1481) | Sí |
 | Gestión de frecuencia y temperatura | `msm-adreno-tz`, límites térmicos, 320 MHz en reposo | frecuencia fija, GPU siempre encendida | **No** |
-| CPU | gold hasta 2803,2 MHz, silver hasta 1900,8, con `schedutil` | las dos fijas al máximo | Sí (al máximo) |
+| CPU | gold hasta 2803,2 MHz, silver hasta 1900,8, con escalado dinámico | las dos fijas al máximo | Sí (al máximo) |
 
 ## 7. Diferencias por impacto probable
 
@@ -257,21 +272,20 @@ Todos los valores de `gpu_mhz` menos 1260 dejan la GPU **más lenta** que `gpu_d
 | 2 | VDD_CX a 416 donde Android pone 464 para 1260 MHz | `.ko` del teléfono (§4.3) | 0337: `rwcx` 0 = 464 antes del reloj | Estabilidad a 1260 MHz reales con 464 frente a `gpu_cx=416` |
 | 3 | Sin voto de VDD_MX para el PLL | `.ko` (§4.3) | 0337: `rwmx` 0 = 416 | Que el PLL bloquee a 2520 MHz (línea `gpu_cc_pll0 locked`) |
 | 4 | Sin votos de corriente de pico desde 900 MHz | DT y kgsl (§4.5) | 0337: clientes 1 y 10 de `cx_ipeak` | Líneas `cx_ipeak: vote … taken` en el log; estabilidad con el módem transmitiendo |
-| 5 | Frecuencia del DDR desconocida, sin votos y sin escalado del RPM | §10 | Medir primero (§10.2). Si no está al máximo: el traspaso de `clk-smd-rpm` (voto máximo en todos los relojes del RPM y después activar el escalado) | Periodo del reloj del DDR; `membw` en 4 hilos |
+| 5 | Frecuencia del DDR desconocida, sin votos y sin escalado del RPM | §10 | Medir primero (§10.2, `kern.sweet_gpu_clocks` del borrador 0339). Si no está al máximo: el traspaso de `clk-smd-rpm` (voto máximo en todos los relojes del RPM y después activar el escalado) | Periodo del reloj del DDR; `membw` en 4 hilos |
 | 6 | Sin gestión de temperatura ni escalado a 1260 MHz reales | §4.5, §5 | Fuera de 0337. Un gobernador mínimo (≤ 820 MHz en reposo) | Temperatura y estabilidad en la escalera |
-| 7 | Acceso mínimo de 32 bytes en vez de 64 | §11 | Poner el bit de 64 bytes en los cuatro registros, tras boot-arg | Tiempo de una pasada limitada por memoria (sysmem a pantalla completa), con y sin |
-| 8 | Clock gating por hardware apagado | §11 | Tabla `a612_hwcg`, tras boot-arg | Temperatura; con gating los contadores always-count dejan de valer en reposo |
-| 9 | Contadores de rendimiento apagados | §11 | `RBBM_PERFCTR_CNTL = 1`, `CP_PERFCTR_CP_SEL_0 = 0` en `hw_init_regs` | — (instrumentación) |
+| 7 | Acceso mínimo de 32 bytes en vez de 64 | §11 | Borrador 0339, `gpu_mal=1`: el bit de 64 bytes en los cuatro registros | Tiempo de una pasada limitada por memoria (sysmem a pantalla completa), con y sin |
+| 8 | Clock gating por hardware apagado | §11 | Borrador 0339, `gpu_hwcg=1`: la tabla `a612_hwcg` | Temperatura; con gating los contadores always-count dejan de valer en reposo |
+| 9 | Contadores de rendimiento apagados | §11 | Borrador 0339: `RBBM_PERFCTR_CNTL = 1`, `CP_PERFCTR_CP_SEL_0 = 0` en `hw_init_regs` | — (instrumentación) |
 | 10 | Memoria de la GPU mapeada write-combined en los programas | §10.4 | Del driver (09, 10) | — |
 
 ## 8. Parche 0337
 
-`xnu/patches/0337-sapphire-gpu-pll-vco.patch` (sha256 `39873905…`,
-un archivo, +369 −4). `git apply --check` pasa sobre el árbol a 0335 + 0336 (`xnu-0336/`) y sobre 0335
-solo (`xnu/`); ninguno de sus hunks toca los de 0336. Lo nuevo se ha compilado y ejecutado en el anfitrión
-contra registros simulados (`parche/work/harness.cpp`: L y alpha de los diez OPP, lectura de vuelta, tope
-por bin, voto rechazado, PLL sin bloqueo, corriente de pico con y sin *danger*). No está compilado dentro
-de xnu: eso lo hace el CI.
+`xnu/patches/0337-sapphire-gpu-pll-vco.patch` (sha256 `39873905…`, un archivo, +369 −4). Se aplica con
+`git apply` en orden tras 0336 (`xnu-serie/`) y también sobre 0335 solo; ninguno de sus hunks toca los de
+0336. Lo nuevo se ha compilado y ejecutado en el anfitrión contra registros simulados
+(`parche/work/harness.cpp`: L y alpha de los diez OPP, lectura de vuelta, tope por bin, voto rechazado,
+PLL sin bloqueo, corriente de pico con y sin *danger*). Dentro de xnu lo compila el CI.
 
 **Elección de interfaz.** `gpu_vco2=1` hace que `gpu_mhz` sea la frecuencia del núcleo. Por defecto vale
 0 y no cambia nada: una imagen con la cmdline actual sigue a 630 MHz al actualizar el kernel, y el
@@ -349,6 +363,27 @@ de bajar a partir de un paso, lo que limita desde ahí no es el reloj.
 - La lectura del fusible y los registros de `cx_ipeak` son MMIO que iOS no ha tocado antes; Android los
   lee y escribe desde EL1. `gpu_bin=0` y `gpu_ipeak=0` evitan cada uno.
 
+### 8.1 Borrador 0339: relojes medidos y resto de `hw_init`
+
+`~/sapphire-angel/research/metal/relojes/parche/0339-sapphire-gpu-clocks-diag.patch.borrador` (sha256
+`7618d852…`, +208). `git apply --check` pasa sobre la serie 0001-0338 (`xnu-serie/`). La aritmética de la
+medición está probada en el anfitrión contra un contador simulado (`parche/work/harness2.cpp`). No está en
+`xnu/patches/`.
+
+- **`sysctl kern.sweet_gpu_clocks`** (solo lectura, unos 0,2 s): mide en el momento de la lectura
+  `gx_gfx3d` y `cx_gmu` por el multiplexor de depuración de GPUCC, `gcc_gpu_memnoc_gfx` y
+  `gcc_bimc_gpu_axi` por el de GCC, los dos clusters de CPU por el de APSS, y el reloj del DDR por su
+  periodo (§10.2). Es el procedimiento de `clk_measure` de stock (`clk-debug.c:91-190`): solo escribe
+  registros de depuración y deja las ramas como estaban. `gpu_clkdiag=1` pone además la línea en el log
+  de arranque.
+- **`hw_init_regs`**: escribe siempre (`gpu_stockinit=0` lo omite) `CP_MEM_POOL_DBG_ADDR = 47`,
+  `RBBM_PERFCTR_GPU_BUSY_MASKED`, `RBBM_PERFCTR_CNTL = 1` y `CP_PERFCTR_CP_SEL_0 = ALWAYS_COUNT`; con
+  `gpu_mal=1`, el bit de acceso mínimo de 64 bytes en los cuatro registros de §11; con `gpu_hwcg=1`, el
+  clock gating de stock. Los dos últimos valen 0 por defecto.
+
+Los registros de GCC, de APSS y de `mccc` que usa la medición son MMIO que iOS no ha tocado antes; Android
+los usa desde EL1 solo bajo demanda (debugfs).
+
 ## 9. La pasada principal del compositor: cuánto debería tardar
 
 **O (03 M2).** Destino 750×1624, 108-132 draws (quads texturizados con alfa), GMEM en 102 tiles: 18-24 ms
@@ -386,6 +421,10 @@ Lo que distingue las lecturas sin tocar el driver: el tiempo de la misma pasada 
 600 MHz (`gpu_div=1`) y 630 MHz (`gpu_mhz=1260`) con el kernel actual, y en los pasos de la escalera de
 §8. Proporcional a 1/f: reloj. Plano: memoria.
 
+Límite de esta estimación: no cita una cifra pública de fill rate del A610 (las bases de datos de
+benchmarks consultadas no sirvieron los datos); la única cifra de relleno es la heredada de este teléfono,
+tomada con el reloj a 630 MHz, y la del DDR sale de las tablas del DT.
+
 ## 10. Bus, DDR y memoria
 
 ### 10.1 Qué hace Android
@@ -395,9 +434,12 @@ Lo que distingue las lecturas sin tocar el driver: el tiempo de la misma pasada 
   arranque vota el BIMC a `INT_MAX` (`:1397-1401`) y **activa el escalado de relojes del RPM**
   (`clk_smd_rpm_enable_scaling`, clave `Enab`, `:1418`). Linux v6.12 hace el mismo traspaso
   (`clk-smd-rpm.c:189-210`, `:402-428`, `:1278-1306`) y comenta que los relojes de bus dejarían de estar
-  sostenidos entre activar el escalado y el arranque del driver de interconexión (`:177-181`): hasta que
-  el sistema operativo activa el escalado, el RPM no baja esos relojes.
-- **Plan del DDR** (DT:7648-7649): 200, 547, 768, 1017, 1555, 1804 y **2092 MHz**.
+  sostenidos entre activar el escalado y el arranque del driver de interconexión (`:177-181`). De ahí se
+  sigue (H) que, mientras el sistema operativo no activa el escalado, el RPM no baja esos relojes.
+- **Plan del DDR** (DT:7648-7649): 200, 547, 768, 1017, 1555, 1804 y **2092 MHz**. El XBL con el que
+  arranca iOS trae el mismo plan: en `xbl_a.img` (+0xc810, filas de 20 bytes) están activadas 200 000,
+  547 200, 768 000, 1 017 600, 1 555 200, 1 804 800 y 2 092 800 kHz. En qué fila deja el DDR al entregar
+  el control no sale de la tabla (lo imprime por UART: "DDR Frequency, %d MHz").
 - **Quién mueve el DDR**: `bwmon` (monitor de tráfico CPU → DDR en 0x1b8e200, DT:7676-7686), `memlat`
   (fallos de caché por cluster; con el gold a 2803,2 MHz pide 2092 MHz, DT:7688-7727), kgsl (§4.5) y la
   pantalla (mínimo 1,6 GB/s, DT:15246).
@@ -416,11 +458,11 @@ Lo que distingue las lecturas sin tocar el driver: el tiempo de la misma pasada 
 
 **Cómo medirlo.** El periodo del reloj del DDR está en un registro: bloque `mccc` 0x447d200, desplazamiento
 0x20, en picosegundos (`debugcc-khaje.c:440-448` y `mccc_debug` DT:6311-6315; `clk-debug.c:466-475`:
-`f = 10¹² / periodo`). Es una lectura de MMIO sin efecto, que hoy no tiene ruta desde el espacio de
-usuario; cabe en un parche de diagnóstico de una línea de log. Los demás relojes (el de la rama
-`gcc_bimc_gpu_axi`, selector 0x97 del multiplexor de depuración de GCC; `gcc_gpu_memnoc_gfx`, 0xee; los
-de CPU, 0xb6) se miden con el contador de `clk_measure` (`clk-debug.c:91-190`, `debugcc-khaje.c:22-26,
-360-455`).
+`f = 10¹² / periodo`). Es una lectura de MMIO sin efecto, que con los kernels hasta 0338 no tiene ruta
+desde el espacio de usuario. Los demás relojes (el de la rama `gcc_bimc_gpu_axi`, selector 0x97 del
+multiplexor de depuración de GCC; `gcc_gpu_memnoc_gfx`, 0xee; los de CPU, 0xb6) se miden con el contador
+de `clk_measure` (`clk-debug.c:91-190`, `debugcc-khaje.c:22-26, 360-455`). El borrador 0339 (§8.1) hace
+las dos cosas en `kern.sweet_gpu_clocks`.
 
 Sin parche, una cota inferior: `userland/tests/membw` en 4 procesos a la vez con QoS de interfaz. Si la
 suma de copias es S, el tráfico es al menos 2 S, y el DDR está al menos en el nivel cuyo 8 B × f lo cubre
@@ -447,6 +489,17 @@ en el programa (G3255-3285, G3722; `MAIR_EL1` del teléfono: índice 1 = 0x44, m
 Para la GPU es lo mismo que en Linux (`MSM_BO_WC`). Para la CPU, cada lectura de esos buffers va al DDR
 sin caché: copiar **desde** un buffer de la GPU o leer-modificar-escribir sobre él es órdenes de magnitud
 más lento que en memoria normal. Qué rutas del driver leen de esos buffers es de 09 y 10.
+
+### 10.5 Panel y MDSS en el DT
+
+- Panel por defecto (DT:749, 15452-15522): "n7 38 0c 0a video mode fhdp dsi panel", 1080×2400, DSI en modo
+  vídeo, 24 bpp, 120 Hz con cambio dinámico a 90 y 60 (`dfps_immediate_porch_mode_vfp`). Total 1300 × 2432:
+  379 MHz de reloj de píxel a 120 Hz.
+- Tráfico de escaneo a 120 Hz con un plano RGBA a resolución completa: 1080 × 2400 × 4 B × 120 = 1,24 GB/s,
+  permanente.
+- Votos de bus de la pantalla (DT:15246-15250, 15268-15269): mínimo 1,6 GB/s sobre el DDR, 2,4 GB/s en el
+  núcleo, tope de 4,3 GB/s (3,2 por pipe). Bajo iOS la pantalla tampoco vota: comparte con la GPU el DDR
+  al nivel que dejó el arranque.
 
 ## 11. `hw_init` registro a registro
 
@@ -499,7 +552,9 @@ calcula.
   libre roba trabajo del cluster E. Con 15, todo hilo de QoS por defecto empieza en un A53 a 1,9 GHz
   salvo que un A73 libre lo robe. Qué hilos del camino de render tienen ese QoS es del plan 07.
 - La frecuencia efectiva se mide con `userland/tests/cpufreq ui` y `cpufreq bg` (cadena de sumas
-  dependientes).
+  dependientes), o con `kern.sweet_gpu_clocks` del borrador 0339, que la mide con el contador de GCC.
+- Cachés y prefetch: los registros de control de los Cortex-A73/A53 (`CPUECTLR`, `CPUACTLR`) los deja el
+  firmware de EL3 al encender cada núcleo por PSCI; xnu no los toca. Sin verificar en el teléfono.
 
 ## 13. Experimentos
 
@@ -508,10 +563,10 @@ calcula.
 | X1 | `gxfreq` con `gpu_mhz=1260` | 630 MHz | **Hecho: 630,00 MHz, 15/15** (03 M3) |
 | X2 | Escalera de 0337 (§8): `gxfreq`, `kern.sweet_gpu_pll`, tiempo de la pasada principal | `gxfreq` = N; tiempo ∝ 1/N si manda el reloj | Pendiente |
 | X3 | Misma pasada con el kernel actual a 300, 600 y 630 MHz (`gpu_div=2`, `gpu_div=1`, `gpu_mhz=1260`) | ∝ 1/f | Pendiente |
-| X4 | Periodo del reloj del DDR (0x447d220) | 478 ps si está a 2092 MHz | Pendiente (necesita parche de diagnóstico) |
+| X4 | Periodo del reloj del DDR (0x447d220), con `kern.sweet_gpu_clocks` de 0339 | 478 ps si está a 2092 MHz | Pendiente (necesita 0339) |
 | X5 | `membw` × 4 con QoS de interfaz | S ≥ 4 GB/s si el DDR está en los niveles altos | Pendiente |
 | X6 | En Android (slot b, root): `gpu_available_frequencies` y `clock_mhz` de `/sys/class/kgsl/kgsl-3d0/`, y `clk_measure` de `gpu_cc_gx_gfx3d_clk` en debugfs con la GPU forzada al nivel 0 | tabla hasta 1260 MHz (bin 0); `clk_measure` ≈ 1 260 000 000 | Pendiente, opcional |
-| X7 | A/B del bit de acceso mínimo de 64 bytes | diferencia solo en pasadas limitadas por memoria | Pendiente |
+| X7 | A/B del bit de acceso mínimo de 64 bytes (`gpu_mal=1` de 0339) | diferencia solo en pasadas limitadas por memoria | Pendiente |
 
 ## 14. Afirmaciones heredadas
 

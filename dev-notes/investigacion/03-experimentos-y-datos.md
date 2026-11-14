@@ -327,3 +327,30 @@ de núcleo (`PERF_CP_ALWAYS_COUNT`, `PERF_RBBM_ALWAYS_COUNT`) y el contador del 
 
 **Interpretación.** `gpu_mhz=1260` deja el VCO de `gpu_cc_pll0` a 1260 MHz y el núcleo de la GPU a la mitad.
 La comparación con los niveles de Android está en [11](11-gpu-relojes-bus-vs-android.md).
+
+## M4 — Kernel 0338 con el PLL de la GPU como Android (2026-11-14, tarde)
+
+Kernel de CI, run 43612053690 (0336, 0337 y 0338 aplicados; 336 parches). Imagen
+`boot_a-0338-vco2-1260.img`: boot-args de expG con `sweet_reboot=2 gpu_vco2=1 gpu_mhz=1260` (575 caracteres).
+Ruta R, un arranque (n=1), sin pasar por los escalones intermedios de la escalera de 11 §8. Driver cargado:
+`rebuild/out/propio-args` (upstream de HackiOS `63fc2b4` + parches A610 propios + `metal.args`).
+
+**Observado.** El teléfono arranca y responde a los 21 s. `sysctl kern.sweet_gpu_pll`: `gx_gfx3d 1260000 kHz
+from gpu_cc_pll0 OUT_MAIN; … l 131 alpha 4000 user_ctl 0100010f …: VCO 2520000 kHz`. `gxfreq 200 3`: **1260,00
+MHz** en las 3 muestras, con los dos contadores.
+
+**Sin medir en este arranque:** el tiempo de GPU de la pasada principal, los contadores `kern.sweet_fb_diag` y
+`kern.sweet_gpu_diag` de 0336, la temperatura bajo carga y la estabilidad a lo largo del tiempo.
+
+## M5 — Bundle propio y pruebas con los demonios de radio (2026-11-14, tarde)
+
+- **Bundle propio (`propio-args`) con el kernel 0334 a 630 MHz:** carga, pinta el home con colores correctos
+  (captura `medicion/shots/propio1-0.png`) y da cifras del orden de las del binario de Angel en el primer
+  ensayo, con la caché de stages vacía (cada especialización tarda ~0,8 s la primera vez). Los ensayos 2-4 con
+  la caché caliente están en `medicion/ab/ab-propio-args-{2,3,4}.txt`, sin resumir.
+- **Demonios de radio y localización:** en reposo (40 s) todo el sistema consume el 18 % de un núcleo; CommCenter,
+  wifid y locationd, 0,4 % cada uno. Congelarlos con SIGSTOP durante la prueba no da una comparación válida:
+  cambia lo que se dibuja (111 draws por buffer en vez de 151) y SpringBoard deja de trabajar. Las imágenes
+  `boot_a-0334-noradio.img` (`modem=0 wifi=0 ipa=0`) y `boot_a-43603985878-radio.img` (control) están
+  construidas y sin probar. `CalendarWidgetExtension` consume ~57 % de un núcleo durante la prueba en todas las
+  condiciones.
