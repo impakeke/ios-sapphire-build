@@ -721,3 +721,20 @@ La caché de stages en disco ya contenía los shaders de esa vista. Con `bocache
 **Interpretación.** El tirón de la primera apertura es un frame que tarda 0,2-0,5 s en prepararse en CPU, el primero
 en que aparecen las tarjetas; la segunda apertura no lo tiene. Reutilizar buffers en el kernel no lo quita. Queda
 por separar cuánto es preparar por primera vez los pipelines en el proceso y cuánto subir las imágenes de las tarjetas.
+
+## M20 — `merge-6`: la caché de stages se consulta sin esperar al compilador (2026-11-14)
+
+Mismo protocolo que M19 (kernel 0353 a 820 MHz, scanout directo, parciales activas, `kern.sweet_gpu_bocache=0`), con
+`merge-6` (6594789) y `metal_trace=frame`; después, abrir el Centro de Control. Trazas en
+`research/metal/ios-graficos/trace/capturas-merge6/`. n=1.
+
+| Vista | Codificación máxima de un frame | GPU media por frame |
+|---|---|---|
+| selector de apps, primera apertura | 51,9 ms (M19: 228 y 470 ms) | 19,3 ms |
+| selector de apps, segunda apertura | 46,8 ms | 14,4 ms |
+| Centro de Control | 69,8 ms (M18: 1 318 y 540 ms) | 17,1 ms |
+
+**Interpretación.** El tirón de la primera vez era una espera: al crear un pipeline, el driver tomaba el cerrojo del
+compilador antes de mirar su caché, y un pipeline ya compilado esperaba 170-430 ms a que un hilo de fondo terminara
+de especializar otro shader (13 §; análisis de las trazas de M18 y M19). Con la caché consultada sin cerrojo
+desaparece. Lo que queda en estas animaciones es el tiempo de GPU por frame (14-19 ms de media).
