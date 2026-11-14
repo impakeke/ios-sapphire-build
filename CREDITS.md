@@ -17,8 +17,8 @@ now here, with our changes for the Redmi Note 12 4G (topaz, SM6225 / Adreno 610)
 
 *(This repository has no `09xx` patches; the numbers are probably those of the topaz tree this text came
 from, unverified. Here the patches that name HackiOS as the origin of their code are 0149, 0150, 0155, 0156,
-0200, 0301, 0319 and 0323; 0324 follows a HackiOS input filter with code of its own; 0321 and 0338-0350
-mention HackiOS's design or its Metal driver only as a reference or as the client they serve. Which patches carry
+0200, 0301, 0319 and 0323; 0324 follows a HackiOS input filter with code of its own; 0321, 0338, 0339, 0342 and
+0350 mention HackiOS's design or its Metal driver only as a reference or as the client they serve. Which patches carry
 `kern.exec_inject` and the minisandbox container path is not verified.)*
 `RedwoodGPU.cpp` (msm-style GPU client), the `MiniIOMobileFramebuffer` presentation ideas
 (SwapEnd handed to a presenter thread, vsync notification layout), `redwood_apple80211` /
