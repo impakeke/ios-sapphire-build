@@ -1,0 +1,38 @@
+From: giovannipodesta
+Subject: [PATCH] xnu: usb 0333 — choose the dp=2 default in gadget_start, not as the initial value
+
+0332 made `static int ud_dp = 2`, so the v2 branches (ud_if_output, ud_event, sysctl, log thread)
+could run before gadget_start initialised the v2 state. With 0332 a normal boot enumerated, then
+the link and the phone hung (E5, 2026-11-14). E4 (dp=2 by boot-arg, read in gadget_start) passed
+20 x 30 MB. Now the default is applied at that same point.
+---
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index f019530..2e6cc65 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -291,7 +291,7 @@ static struct {
+  * Evidence (dev-notes/investigacion/03, E4 / carga-1): 20 x 30 MB both ways intact, 0 refused
+  * Start Transfer, against the old path dying after 192 KiB (130538 refusals).
+  */
+-static int ud_dp = 2;
++static int ud_dp;      /* 0 until gadget_start has initialised everything; default chosen there (0333) */
+ #define DP_TRB_RX       0x1400          /* one data TRB per 64-byte line, away from ep0's (0x1000-0x107f) */
+ #define DP_TRB_TX       0x1440
+ #define DP_TRB_INT      0x1480
+@@ -2099,9 +2099,13 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
+-	PE_parse_boot_argn("sweetusb_dp", &ud_dp, sizeof(ud_dp));
+-	if (ud_dp != 2) {
+-		ud_dp = 0;
++	{
++		/* 0333: default 2 chosen here, at the same point 0330 read the boot-arg, never as the
++		 * variable's initial value: 0332's `static int ud_dp = 2` let the v2 paths run before
++		 * gadget_start had set them up (hang on a normal boot, 2026-11-14 E5). */
++		int want = 2;
++		PE_parse_boot_argn("sweetusb_dp", &want, sizeof(want));
++		ud_dp = (want == 2) ? 2 : 0;
+ 	}
+ 	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {

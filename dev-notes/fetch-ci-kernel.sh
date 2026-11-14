@@ -4,14 +4,14 @@
 #   dev-notes/fetch-ci-kernel.sh <run-id|latest> [dir-salida]
 #
 # 1. espera a que la ejecución termine (gh run watch) y exige conclusion=success;
-# 2. guarda el log y exige "Applying patch: …0332-sapphire-usb-defaults-utmipipe-dp2.patch".
+# 2. guarda el log y exige "Applying patch: …0333-sapphire-usb-dp-default-at-start.patch".
 #    darwin-xnu-build se salta EN SILENCIO (solo un [warning]) los parches que no
 #    aplican, así que un "Skipping patch …0329…" o la ausencia de la línea es un fallo;
 #    los demás "Skipping patch" se listan como aviso (STRICT=1 los convierte en fallo);
 # 3. gh run download del artefacto xnu-kernel-4k en un directorio nuevo y vacío;
 # 4. shasum -a 256 -c SHA256SUMS, e imprime el LC_UUID del kernel.
 #
-# Variables: REPO (por defecto giovannipodesta/ios-sapphire), PATCH (0332-sapphire-usb-defaults-utmipipe-dp2.patch),
+# Variables: REPO (por defecto giovannipodesta/ios-sapphire), PATCH (0333-sapphire-usb-dp-default-at-start.patch),
 #            STRICT=1, INTERVAL (segundos entre sondeos, 30).
 # Salida por defecto: ~/sapphire-angel/ci-kernels/<run-id>/{artifact/,run.log}
 # Después: dev-notes/repack-boot.py --base <buena> --kernel <dir>/artifact/kernel.development.sweet -o …
@@ -21,7 +21,7 @@ REPO=${REPO:-giovannipodesta/ios-sapphire}
 WORKFLOW=xnu-4k
 ARTIFACT=xnu-kernel-4k
 KERNEL=kernel.development.sweet
-PATCH=${PATCH:-0332-sapphire-usb-defaults-utmipipe-dp2.patch}
+PATCH=${PATCH:-0333-sapphire-usb-dp-default-at-start.patch}
 INTERVAL=${INTERVAL:-30}
 
 fail() { printf '\n\033[1;31m*** FALLO: %s ***\033[0m\n' "$*" >&2; exit 1; }
