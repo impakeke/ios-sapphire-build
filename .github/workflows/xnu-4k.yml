@@ -1,0 +1,38 @@
+name: xnu-4k
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Xcode 16.0
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.0.app
+          xcodebuild -version
+
+      - name: Build Setup & Compile
+        run: |
+          set -e
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 https://github.com/blacktop/darwin-xnu-build 663906528d1cd5ea8fde7de6f16de73db9511549
+          git -C dxb checkout -q FETCH_HEAD
+          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/ || true
+          cd dxb
+          export MACOS_VERSION="13.5"
+          bash build.sh
+
+      - name: Collect Artifacts
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ || true
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xnu-kernel-4k
+          path: out/
