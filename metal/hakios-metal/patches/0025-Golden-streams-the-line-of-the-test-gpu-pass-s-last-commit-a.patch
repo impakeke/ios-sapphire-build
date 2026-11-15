@@ -1,0 +1,33 @@
+Subject: Golden streams: the line of the test gpu-pass's last commit added draws to
+
+a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone submits more since fa8d36c (its profile's reasons are
+asked of more passes); the other lines are what they were, both chips, three ways.
+
+
+---
+diff --git a/hakios-metal/tests/golden/tests-a610.txt b/hakios-metal/tests/golden/tests-a610.txt
+index f890ee4..63095f4 100644
+--- a/hakios-metal/tests/golden/tests-a610.txt
++++ b/hakios-metal/tests/golden/tests-a610.txt
+@@ -268,7 +268,7 @@ a_fetch_in_a_corner_reads_bins_of_the_width_its_descriptor_has submits 1 words 1
+ the_queue_picks_gmem_or_sysmem_by_what_each_cost_a_target submits 3 words 1963 draws 3 loads 6 stream fc65fa1453cf2d4a state 6daed77ff6dca4f4 names 14 5bb689de53ed2224
+ gmem_for_a_pass_of_enough_draws_decided_at_its_end submits 6 words 4235 draws 11 loads 28 stream 756707daf27964a3 state 1b86c0f68d511005 names 25 fa19332ad5a24ef7
+ tiles_or_sysmem_by_what_a_pass_holds submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+-a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone submits 18 words 15394 draws 148 loads 384 stream 69cbd68d6f55cc54 state 978593b28a758ce5 names 72 6a5f1b835ef9b6fe
++a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone submits 18 words 15538 draws 148 loads 384 stream f8ba37fe9809c324 state 54785826781f23a5 names 90 37f5855db810e49c
+ a_pass_whose_like_was_light_is_recorded_for_sysmem_alone submits 5 words 3736 draws 32 loads 64 stream 741acb79b011181f state 179f28010791cba5 names 20 8e8d1b2d6669327e
+ a_dontcare_attachment_is_loaded_only_when_the_granules_pass_its_last_row submits 2 words 1353 draws 2 loads 4 stream 1e58b9a3b387a29f state b2db15d81d80c4dd names 8 05d20adef5c3adcc
+ a_clear_in_gmem_comes_out_as_the_fill_does submits 8 words 5302 draws 8 loads 16 stream 2cf84b6de3102d2e state 29f464ce110bdd85 names 32 17482b7bd70eb730
+diff --git a/hakios-metal/tests/golden/tests-a635.txt b/hakios-metal/tests/golden/tests-a635.txt
+index 9fd956c..b2dd161 100644
+--- a/hakios-metal/tests/golden/tests-a635.txt
++++ b/hakios-metal/tests/golden/tests-a635.txt
+@@ -268,7 +268,7 @@ a_fetch_in_a_corner_reads_bins_of_the_width_its_descriptor_has submits 1 words 1
+ the_queue_picks_gmem_or_sysmem_by_what_each_cost_a_target submits 3 words 1963 draws 3 loads 6 stream 2a2200ea517c691b state 6daed77ff6dca4f4 names 14 5bb689de53ed2224
+ gmem_for_a_pass_of_enough_draws_decided_at_its_end submits 6 words 4235 draws 11 loads 28 stream 4eae8fc58ce2a337 state 44e549e09cea1985 names 25 fa19332ad5a24ef7
+ tiles_or_sysmem_by_what_a_pass_holds submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+-a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone submits 18 words 15394 draws 148 loads 384 stream db6a4cdfd43b0630 state e20bf0462bc0e585 names 72 6a5f1b835ef9b6fe
++a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone submits 18 words 15538 draws 148 loads 384 stream d88fabd47d1bfee4 state 287734657552d1c5 names 90 37f5855db810e49c
+ a_pass_whose_like_was_light_is_recorded_for_sysmem_alone submits 5 words 3736 draws 32 loads 64 stream 4aba82bef7c44036 state 179f28010791cba5 names 20 8e8d1b2d6669327e
+ a_dontcare_attachment_is_loaded_only_when_the_granules_pass_its_last_row submits 2 words 1353 draws 2 loads 4 stream 41847c8a56cf0cf3 state b2db15d81d80c4dd names 8 05d20adef5c3adcc
+ a_clear_in_gmem_comes_out_as_the_fill_does submits 8 words 5302 draws 8 loads 16 stream 636ff9ea866da3b2 state 29f464ce110bdd85 names 32 17482b7bd70eb730

@@ -1,0 +1,36 @@
+Subject: C interface: hakios_metal_cb_wait_scheduled (optional: what Angel's plug-in calls)
+
+Only for linking this core with userland/src/HakiosMetalCA.m of Angelpro09xd/hakios-xnu-kernel (bd4c247), which calls
+it from -commit and -waitUntilScheduled; upstream's plug-in does not.
+
+---
+diff --git a/hakios-metal/include/hakios-metal/hakios_metal.h b/hakios-metal/include/hakios-metal/hakios_metal.h
+index 7170611..e756a1a 100644
+--- a/hakios-metal/include/hakios-metal/hakios_metal.h
++++ b/hakios-metal/include/hakios-metal/hakios_metal.h
+@@ -541,6 +541,9 @@ void hakios_metal_cb_fail(hakios_metal_cb *cb, const char *why);
+ /* CALLBACK(CB, CONTEXT) runs once, after completion or error, on the queue's thread; may be NULL */
+ void hakios_metal_cb_commit(hakios_metal_cb *cb, void (*callback)(hakios_metal_cb *cb, void *context), void *context);
+ void hakios_metal_cb_wait(hakios_metal_cb *cb);
++/* until a committed CB has been handed to the GPU (Metal's "scheduled"): at once unless the queue records deferred
++ * (hakios_metal_queue_set_deferred), where hakios_metal_cb_commit returns before the submission */
++void hakios_metal_cb_wait_scheduled(hakios_metal_cb *cb);
+ enum hakios_metal_status hakios_metal_cb_status(hakios_metal_cb *cb);
+ /* why it ended in HAKIOS_METAL_ERROR, or "" */
+ const char *hakios_metal_cb_error(hakios_metal_cb *cb);
+diff --git a/hakios-metal/src/c_api.cpp b/hakios-metal/src/c_api.cpp
+index 1536a60..5872e6b 100644
+--- a/hakios-metal/src/c_api.cpp
++++ b/hakios-metal/src/c_api.cpp
+@@ -1623,6 +1623,11 @@ void hakios_metal_cb_commit(hakios_metal_cb* cb, void (*callback)(hakios_metal_c
+     cb->cb->commit();
+ }
+ 
++// (the commit is one of the jobs posted for this buffer: once they are done, it has been submitted)
++void hakios_metal_cb_wait_scheduled(hakios_metal_cb* cb) {
++    syncOne(cb);
++}
++
+ void hakios_metal_cb_wait(hakios_metal_cb* cb) {
+     syncOne(cb);
+     cb->cb->waitUntilCompleted();

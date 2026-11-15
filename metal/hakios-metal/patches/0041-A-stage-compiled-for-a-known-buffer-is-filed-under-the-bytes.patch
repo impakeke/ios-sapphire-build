@@ -1,0 +1,473 @@
+Subject: A stage compiled for a known buffer is filed under the bytes its compilation read
+
+The plug-in compiles CoreAnimation's generic uber shader again for the 52 bytes
+of its FragmentShaderConfig (compileStage's KnownBuffer), and the stage was
+cached under all 52. The structure's last field ends at byte 49; the three
+after it, and the padding inside it, are whatever the buffer held before.
+The same configuration came with other garbage, was another key, and was
+compiled again: 0.45 to 1.1 s in the background each time, the compiler taken
+meanwhile. The phone's cache held 1313 stages, 377 of them one stage of 3124
+bytes; a frame trace holds 25 contents for 19 configurations.
+
+The folding of the known buffer's reads (foldKnownLoad) now records which
+bytes it read. A stage depends on those and on no others: a buffer that holds
+the same values there compiles to the same stage, because what is read next is
+decided by what was read before. Beside its stages each function keeps an index
+(<hash>.known: the mask of bytes read, their values, the stage's file), and a
+known buffer that matches a record is that stage, read from the cache.
+CompiledStage::knownReads carries the mask (hakios_metal_program_known_reads);
+a stage filed under all its bytes by an earlier build stands for exactly them.
+
+CompileTimes also says how long the front end and the folding took.
+
+tools/stagecc compiles one function of a .metallib as the driver does, on a
+host with the compiler (a native build of Mesa's archives with the AIR front
+end): what it comes to, the bytes of a known buffer it read, and the time of
+each part. With CoreAnimation's generic variant from the phone's pipeline
+library (outside this tree): 32064 instruction words unspecialised, as the
+phone says; for one configuration 96 words in 170 to 210 ms on this host --
+about 60 the front end over the whole shader, 5 to 14 the folding, 105 to 120
+the lowering and ir3 -- and the same configuration with other bytes after its
+last field comes from the cache in 0.4 ms.
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/compiler.hpp b/hakios-metal/include/hakios-metal/compiler.hpp
+index deaab04..750a65b 100644
+--- a/hakios-metal/include/hakios-metal/compiler.hpp
++++ b/hakios-metal/include/hakios-metal/compiler.hpp
+@@ -91,6 +91,11 @@ struct CompiledStage {
+     bool writesMemory = true;                // the NIR stores to or does atomics on a device buffer (or global memory); false only when it was looked at and does not
+     std::string name;
+     std::string listing;
++    // A stage compiled for a KnownBuffer: the bytes of it the compilation read, 0xff each, and 0 for those that decided
++    // nothing -- any buffer that holds the same bytes where this is 0xff compiles to this very stage. As long as the
++    // KnownBuffer's bytes; empty for a stage compiled for none, and all 0xff for one whose reads are not known (a file
++    // of the cache from before they were kept: it stands for exactly the bytes it was compiled for).
++    std::vector<uint8_t> knownReads;
+ };
+ 
+ // a VS and an FS linked for one colour format (render.hpp's Program), owning both stages
+@@ -130,6 +135,11 @@ using FunctionConstants = std::vector<FunctionConstant>;
+ // buffer at constant offsets inside BYTES compiled as those values, so that the branches they decide are decided once,
+ // here, rather than in every fragment. CoreAnimation's uber shader (fixed_frag_lph_cpf) picks its path through 15 000
+ // instructions by the 52 bytes of its FragmentShaderConfig: compiled for one configuration it is 16 to 48 instructions.
++// The stage depends on the bytes the compilation read and on no others (CompiledStage::knownReads): a structure's
++// padding, which whoever fills the buffer leaves as it was, decides nothing. The cache files a stage compiled for a
++// KnownBuffer under what it read: a buffer that differs in the rest alone is found there, not compiled again (the
++// phone's cache held one stage of CoreAnimation's 377 times over, each compiled for its own three bytes of garbage
++// after the last field).
+ struct KnownBuffer {
+     uint32_t binding = 0;
+     std::vector<uint8_t> bytes;
+@@ -143,6 +153,9 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
+ struct CompileTimes {
+     uint32_t stages = 0, cached = 0, compiled = 0;
+     double waitedUs = 0, loadedUs = 0, compiledUs = 0;
++    // ...and of the compiling: the front end (AIR to NIR) and the folding of a known buffer's reads; the rest is the
++    // lowering and ir3
++    double frontEndUs = 0, foldedUs = 0;
+ };
+ CompileTimes takeCompileTimes();
+ // compileStage's choice for a stage that spilled with ir3's preamble (WITH) and was compiled again without it (WITHOUT):
+diff --git a/hakios-metal/include/hakios-metal/hakios_metal.h b/hakios-metal/include/hakios-metal/hakios_metal.h
+index ef4b80c..06e84fe 100644
+--- a/hakios-metal/include/hakios-metal/hakios_metal.h
++++ b/hakios-metal/include/hakios-metal/hakios_metal.h
+@@ -291,6 +291,11 @@ hakios_metal_program *hakios_metal_program_new_bitcode_constants(const void *vs_
+  * descriptor and sample count come with it. NULL with the reason. */
+ hakios_metal_program *hakios_metal_program_specialize(hakios_metal_program *base, const void *fs_bitcode, size_t fs_size,
+     const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned binding, const void *bytes, size_t length);
++/* Which of the bytes a specialised PROGRAM was compiled for decided anything: MASK[i] 0xff for a byte its compilation
++ * read, 0 for one it did not (a structure's padding, a field no branch taken looks at). A buffer that holds the same
++ * bytes where the mask is set is drawn by this very program. Writes at most LENGTH bytes and returns how many the
++ * program has; 0 for a program that was not specialised, or NULL. */
++unsigned hakios_metal_program_known_reads(hakios_metal_program *program, unsigned char *mask, unsigned length);
+ /* What making programs cost the calling thread since it last asked (the counts start again): the stages asked for,
+  * those read from the stage cache and those compiled, and the microseconds spent waiting for the compiler while
+  * another thread compiled, reading cached stages, and compiling. Any pointer may be NULL. */
+diff --git a/hakios-metal/src/c_api.cpp b/hakios-metal/src/c_api.cpp
+index 0ce284b..c14e38e 100644
+--- a/hakios-metal/src/c_api.cpp
++++ b/hakios-metal/src/c_api.cpp
+@@ -1268,6 +1268,13 @@ hakios_metal_program* hakios_metal_program_from_stages(const Stage& vs, const St
+ 
+ extern "C" {
+ 
++unsigned hakios_metal_program_known_reads(hakios_metal_program* p, unsigned char* mask, unsigned length) {
++    if (p == nullptr || p->program == nullptr || p->program->fs == nullptr) return 0;
++    const std::vector<uint8_t>& reads = p->program->fs->knownReads;
++    if (mask != nullptr) memcpy(mask, reads.data(), std::min<size_t>(length, reads.size()));
++    return unsigned(reads.size());
++}
++
+ void hakios_metal_compile_times(unsigned* stages, unsigned* cached, unsigned* compiled, double* waitedUs, double* loadedUs, double* compiledUs) {
+     const CompileTimes t = takeCompileTimes();
+     if (stages != nullptr) *stages = t.stages;
+diff --git a/hakios-metal/src/compiler.cpp b/hakios-metal/src/compiler.cpp
+index e5c16cf..c9973b8 100644
+--- a/hakios-metal/src/compiler.cpp
++++ b/hakios-metal/src/compiler.cpp
+@@ -249,8 +249,21 @@ struct Translation {
+ // AIR to NIR: the front end, with the module's function constants as the pipeline supplied them (the rest not
+ // supplied: the front end tells the module so, and reads them as zero)
+ // a load of the known buffer at a constant offset inside its bytes: those bytes, as the load's components
++// (what compileStage did for this thread: takeCompileTimes)
++thread_local CompileTimes tCompileTimes;
++double microsecondsSince(std::chrono::steady_clock::time_point t) {
++    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t).count();
++}
++void noteFrontEnd(std::chrono::steady_clock::time_point began) { tCompileTimes.frontEndUs += microsecondsSince(began); }
++void noteFolded(std::chrono::steady_clock::time_point began) { tCompileTimes.foldedUs += microsecondsSince(began); }
++
++struct KnownFold {
++    const KnownBuffer* known;
++    std::vector<uint8_t>* reads;   // (as long as the known bytes) 0xff where a load was folded, when asked for
++};
+ bool foldKnownLoad(nir_builder* b, nir_intrinsic_instr* intr, void* data) {
+-    const KnownBuffer* known = static_cast<const KnownBuffer*>(data);
++    const KnownFold* fold = static_cast<const KnownFold*>(data);
++    const KnownBuffer* known = fold->known;
+     if (intr->intrinsic != nir_intrinsic_load_ubo || !nir_src_is_const(intr->src[0]) || !nir_src_is_const(intr->src[1])) return false;
+     if (nir_src_as_uint(intr->src[0]) != known->binding) return false;
+     const unsigned bits = intr->def.bit_size, comps = intr->def.num_components;
+@@ -262,12 +275,16 @@ bool foldKnownLoad(nir_builder* b, nir_intrinsic_instr* intr, void* data) {
+         memcpy(&v, known->bytes.data() + at + c * (bits / 8), bits / 8);   // (little-endian, as the GPU reads it)
+         values[c] = nir_const_value_for_raw_uint(v, bits);
+     }
++    if (fold->reads != nullptr && fold->reads->size() == known->bytes.size()) {
++        for (uint64_t i = at; i < at + uint64_t(comps) * (bits / 8); i++) (*fold->reads)[size_t(i)] = 0xff;
++    }
+     b->cursor = nir_before_instr(&intr->instr);
+     nir_def_replace(&intr->def, nir_build_imm(b, comps, bits, values));
+     return true;
+ }
+ 
+-bool translate(const void* bitcode, size_t size, Translation& t, std::string* why, const FunctionConstants& supplied, const KnownBuffer* known = nullptr) {
++bool translate(const void* bitcode, size_t size, Translation& t, std::string* why, const FunctionConstants& supplied, const KnownBuffer* known = nullptr,
++               std::vector<uint8_t>* reads = nullptr) {
+     t.mem = ralloc_context(nullptr);
+     air_constant_value* constants = nullptr;
+     unsigned numConstants = air_module_function_constants(t.mem, bitcode, size, &constants);
+@@ -283,18 +300,23 @@ bool translate(const void* bitcode, size_t size, Translation& t, std::string* wh
+     options.constants = constants;
+     options.num_constants = numConstants;
+     const char* error = nullptr;
++    const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+     t.nir = air_to_nir(t.mem, bitcode, size, nullptr, &options, ir3_get_compiler_options(theCompiler()), &t.info, &error);
++    noteFrontEnd(began);
+     if (t.nir == nullptr) return refuse(why, std::string("the front end refused it: ") + (error ? error : "no reason given"));
+     // the known buffer's reads folded, its offsets folded first (a field's offset is the front end's arithmetic on the
+     // pointer), until nothing more folds: a value read may decide the offset of another read
+     // (called directly, not under NIR_PASS: a debug build validates the whole shader after each, and an uber shader
+     // takes rounds of this. nir_copy_prop's own answer does not count: on CoreAnimation's uber shader it says it made
+     // progress every time, 21 000 rounds and on)
++    KnownFold fold{known, reads};
++    const std::chrono::steady_clock::time_point folding = std::chrono::steady_clock::now();
+     for (bool progress = known != nullptr; progress;) {
+         nir_copy_prop(t.nir);
+         progress = nir_opt_constant_folding(t.nir);
+-        progress = nir_shader_intrinsics_pass(t.nir, foldKnownLoad, nir_metadata_control_flow, const_cast<KnownBuffer*>(known)) || progress;
++        progress = nir_shader_intrinsics_pass(t.nir, foldKnownLoad, nir_metadata_control_flow, &fold) || progress;
+     }
++    if (known != nullptr) noteFolded(folding);
+     return true;
+ }
+ 
+@@ -1100,7 +1122,7 @@ std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std
+ 
+ namespace {
+ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
+-                                                const KnownBuffer* known);
++                                                const KnownBuffer* known, std::vector<uint8_t>* reads);
+ }  // namespace
+ 
+ // A stage compiled as turnip compiles it, unless that spills: ir3's preamble pass hoists what is uniform into a
+@@ -1279,10 +1301,6 @@ std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
+ }  // namespace
+ 
+ namespace {
+-thread_local CompileTimes tCompileTimes;
+-double microsecondsSince(std::chrono::steady_clock::time_point t) {
+-    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t).count();
+-}
+ // a stage of that name in the writable cache or in a seed, or nullptr
+ std::unique_ptr<CompiledStage> stageCacheFind(const std::string& name, const std::string& cached) {
+     if (!cached.empty()) {
+@@ -1302,6 +1320,81 @@ std::unique_ptr<CompiledStage> stageCacheFind(const std::string& name, const std
+ }
+ }  // namespace
+ 
++namespace {
++// The known buffers a function was compiled for, kept beside its stages: one file a function (its bitcode, constants,
++// IBO base, the buffer's binding and length), a record a compilation -- the bytes the compilation read (a mask), their
++// values, and the name of the stage's file. A buffer that holds those values where the mask is set is that stage.
++std::string knownIndexName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer& known) {
++    KnownBuffer shape;
++    shape.binding = known.binding;
++    const uint32_t length = uint32_t(known.bytes.size());
++    shape.bytes.assign(reinterpret_cast<const uint8_t*>(&length), reinterpret_cast<const uint8_t*>(&length) + 4);
++    std::string name = stageCacheName(bitcode, size, constants, iboBase, &shape);
++    if (name.size() > 6) name.replace(name.size() - 6, 6, ".known");   // (".stage")
++    return name;
++}
++constexpr size_t kStageNameBytes = 40;   // "/" + 32 hex digits + ".stage", and the rest zeros
++
++std::unique_ptr<CompiledStage> knownIndexFind(const std::string& dir, const std::string& index, const KnownBuffer& known) {
++    if (dir.empty() || index.empty()) return nullptr;
++    FILE* f = fopen((dir + index).c_str(), "rb");
++    if (f == nullptr) return nullptr;
++    std::string data;
++    char chunk[16384];
++    for (size_t n; (n = fread(chunk, 1, sizeof(chunk), f)) > 0;) data.append(chunk, n);
++    fclose(f);
++    const size_t length = known.bytes.size(), record = 2 * length + kStageNameBytes;
++    for (size_t at = 0; length != 0 && at + record <= data.size(); at += record) {
++        const uint8_t* mask = reinterpret_cast<const uint8_t*>(data.data()) + at;
++        const uint8_t* values = mask + length;
++        bool same = true;
++        for (size_t i = 0; same && i < length; i++) same = ((known.bytes[i] ^ values[i]) & mask[i]) == 0;
++        if (!same) continue;
++        char name[kStageNameBytes + 1] = {};
++        memcpy(name, values + length, kStageNameBytes);
++        if (name[0] != '/' || strchr(name + 1, '/') != nullptr) continue;   // (a file of this directory, nothing else)
++        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name)) {
++            s->knownReads.assign(mask, mask + length);
++            return s;
++        }
++    }
++    return nullptr;
++}
++
++// in the writable cache, then in each seed
++std::unique_ptr<CompiledStage> knownIndexFindAnywhere(const std::string& index, const KnownBuffer& known) {
++    const char* dir = getenv("HAKIOS_METAL_CACHE");
++    if (dir != nullptr && dir[0] != 0) {
++        if (std::unique_ptr<CompiledStage> s = knownIndexFind(dir, index, known)) return s;
++    }
++    const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
++    for (const char* p = seed; p != nullptr && *p != 0;) {
++        const char* colon = strchr(p, ':');
++        const std::string d(p, colon != nullptr ? size_t(colon - p) : strlen(p));
++        p = colon != nullptr ? colon + 1 : nullptr;
++        if (std::unique_ptr<CompiledStage> s = knownIndexFind(d, index, known)) return s;
++    }
++    return nullptr;
++}
++
++// one record more, in the writable cache: written whole in one append, so that two processes' records do not mix
++void knownIndexNote(const std::string& index, const KnownBuffer& known, const std::vector<uint8_t>& reads, const std::string& stageName) {
++    const char* dir = getenv("HAKIOS_METAL_CACHE");
++    if (dir == nullptr || dir[0] == 0 || index.empty() || stageName.empty() || stageName.size() > kStageNameBytes ||
++        reads.size() != known.bytes.size()) {
++        return;
++    }
++    std::string record(reinterpret_cast<const char*>(reads.data()), reads.size());
++    for (size_t i = 0; i < known.bytes.size(); i++) record.push_back(char(known.bytes[i] & reads[i]));
++    record.append(stageName);
++    record.append(kStageNameBytes - stageName.size(), char(0));
++    FILE* f = fopen((std::string(dir) + index).c_str(), "ab");
++    if (f == nullptr) return;
++    fwrite(record.data(), 1, record.size(), f);
++    fclose(f);
++}
++}  // namespace
++
+ CompileTimes takeCompileTimes() {
+     const CompileTimes t = tCompileTimes;
+     tCompileTimes = CompileTimes{};
+@@ -1319,7 +1412,17 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
+     const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+     const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
+     const std::string cached = stageCacheWritable(name);
+-    if (std::unique_ptr<CompiledStage> s = stageCacheFind(name, cached)) {
++    // (for a known buffer: the stages compiled for buffers that hold what this one holds where it matters)
++    const std::string index = known != nullptr && !name.empty() ? knownIndexName(bitcode, size, constants, iboBase, *known) : std::string();
++    auto found = [&]() -> std::unique_ptr<CompiledStage> {
++        if (std::unique_ptr<CompiledStage> s = stageCacheFind(name, cached)) {
++            // (filed under the very bytes, by a build that kept no reads: it stands for these bytes and no others)
++            if (known != nullptr) s->knownReads.assign(known->bytes.size(), 0xff);
++            return s;
++        }
++        return known != nullptr ? knownIndexFindAnywhere(index, *known) : nullptr;
++    };
++    if (std::unique_ptr<CompiledStage> s = found()) {
+         tCompileTimes.cached++;
+         tCompileTimes.loadedUs += microsecondsSince(began);
+         return s;
+@@ -1329,29 +1432,35 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
+     std::lock_guard<std::mutex> g(gCompilerLock);
+     tCompileTimes.waitedUs += microsecondsSince(asked);
+     // (while this thread waited another may have compiled the very stage: its file is there now)
+-    if (!cached.empty()) {
+-        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached)) {
+-            tCompileTimes.cached++;
+-            return s;
+-        }
++    if (std::unique_ptr<CompiledStage> s = found()) {
++        tCompileTimes.cached++;
++        return s;
+     }
+     const std::chrono::steady_clock::time_point compiling = std::chrono::steady_clock::now();
+     if (theCompiler() == nullptr) {
+         refuse(why, "ir3 has no compiler for chip 0x06030500");
+         return nullptr;
+     }
+-    std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known);
++    std::vector<uint8_t> reads(known != nullptr ? known->bytes.size() : 0, 0), readsWithout = reads;
++    std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known, known != nullptr ? &reads : nullptr);
+     std::unique_ptr<CompiledStage> chosen;
+     if (with == nullptr || with->stage.k.pvtmemSize == 0 || !theCompiler()->has_preamble) {
+         chosen = std::move(with);
+     } else {
+         theCompiler()->has_preamble = false;
+         std::string whyNot;
+-        std::unique_ptr<CompiledStage> without = compileStageOnce(bitcode, size, &whyNot, constants, iboBase, known);
++        std::unique_ptr<CompiledStage> without =
++            compileStageOnce(bitcode, size, &whyNot, constants, iboBase, known, known != nullptr ? &readsWithout : nullptr);
+         theCompiler()->has_preamble = true;
++        // (the folding comes before the preamble pass: both compilations read the same bytes; their union, to be sure)
++        for (size_t i = 0; i < reads.size(); i++) reads[i] |= readsWithout[i];
+         chosen = without != nullptr && preferWithoutPreamble(with->stage.k, without->stage.k) ? std::move(without) : std::move(with);
+     }
+     if (chosen != nullptr && !cached.empty()) stageCacheSave(cached, *chosen);
++    if (chosen != nullptr && known != nullptr) {
++        chosen->knownReads = reads;
++        if (!cached.empty()) knownIndexNote(index, *known, reads, name);
++    }
+     tCompileTimes.compiled++;
+     tCompileTimes.compiledUs += microsecondsSince(compiling);
+     return chosen;
+@@ -1361,9 +1470,9 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
+ 
+ namespace {
+ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
+-                                                const KnownBuffer* known) {
++                                                const KnownBuffer* known, std::vector<uint8_t>* reads) {
+     Translation t;
+-    if (!translate(bitcode, size, t, why, constants, known)) return nullptr;
++    if (!translate(bitcode, size, t, why, constants, known, reads)) return nullptr;
+     // the stage is the module's named metadata (air.vertex / air.fragment / air.kernel: air_to_nir.c module_stage)
+     const std::string name = t.info.entry_point ? t.info.entry_point : "the function";
+     switch (t.nir->info.stage) {
+diff --git a/hakios-metal/tools/stagecc.cpp b/hakios-metal/tools/stagecc.cpp
+new file mode 100644
+index 0000000..36d0b0c
+--- /dev/null
++++ b/hakios-metal/tools/stagecc.cpp
+@@ -0,0 +1,115 @@
++// stagecc: one function of a .metallib compiled to a stage as the driver compiles it (compileStage), on the host --
++// what it comes to and how long it takes. For a build with the compiler (MESA=1: tools/compiler.mk).
++//
++//   stagecc LIBRARY.metallib FUNCTION [--zeros] [--constants "4=1 6=2 30=54"] [--known BINDING HEX] [--runs N] [--list]
++//
++// --zeros:     every constant (0 to 63) supplied as 0, as a caller that sets them all does; --constants after it.
++// --constants: the function's constants as the plug-in's lines print them (index=value; the rest are not supplied).
++// --known:     the stage compiled for these bytes of its constant buffer at [[buffer(BINDING)]] (compileStage's
++//              KnownBuffer), as the plug-in specialises CoreAnimation's generic shader; the bytes read are printed.
++// --runs N:    compiled N times, each timed (with HAKIOS_METAL_CACHE unset nothing is read from a cache).
++// --list:      the library's functions.
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <string>
++#include <vector>
++
++#include "hakios-metal/compiler.hpp"
++#include "hakios-metal/metallib.hpp"
++
++using namespace hakios::metal;
++
++int main(int argc, char** argv) {
++    if (argc < 3) {
++        std::printf("stagecc LIBRARY.metallib FUNCTION [--constants \"I=V ...\"] [--known BINDING HEX] [--runs N] [--list]\n");
++        return 2;
++    }
++    std::ifstream in(argv[1], std::ios::binary);
++    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++    MetalLibrary lib;
++    if (bytes.empty() || !lib.parse(bytes.data(), bytes.size())) {
++        std::printf("stagecc: %s: %s\n", argv[1], bytes.empty() ? "cannot be read" : lib.why().c_str());
++        return 1;
++    }
++    FunctionConstants constants;
++    KnownBuffer known;
++    bool hasKnown = false, list = false;
++    int runs = 1;
++    for (int i = 3; i < argc; i++) {
++        const std::string a = argv[i];
++        if (a == "--list") list = true;
++        else if (a == "--zeros") {
++            // (every constant supplied, as CoreAnimation supplies its functions': 0 unless --constants, after this, says otherwise)
++            for (uint32_t k = 0; k < 64; k++) {
++                FunctionConstant c{};
++                c.index = k;
++                constants.push_back(c);
++            }
++        }
++        else if (a == "--runs" && i + 1 < argc) runs = std::max(1, atoi(argv[++i]));
++        else if (a == "--constants" && i + 1 < argc) {
++            for (const char* p = argv[++i]; *p != 0;) {
++                char* end = nullptr;
++                const unsigned long index = strtoul(p, &end, 10);
++                if (end == p || *end != '=') break;
++                const unsigned long long value = strtoull(end + 1, &end, 10);
++                bool had = false;
++                for (FunctionConstant& c : constants) {
++                    if (c.index == uint32_t(index)) c.bits = value, had = true;
++                }
++                if (!had) {
++                    FunctionConstant c{};
++                    c.index = uint32_t(index);
++                    c.bits = value;
++                    constants.push_back(c);
++                }
++                p = end;
++                while (*p == ' ') p++;
++            }
++        } else if (a == "--known" && i + 2 < argc) {
++            hasKnown = true;
++            known.binding = uint32_t(atoi(argv[++i]));
++            const char* hex = argv[++i];
++            for (size_t k = 0; hex[k] != 0 && hex[k + 1] != 0; k += 2) {
++                const char two[3] = {hex[k], hex[k + 1], 0};
++                known.bytes.push_back(uint8_t(strtoul(two, nullptr, 16)));
++            }
++        }
++    }
++    if (list || std::string(argv[2]) == "--list") {
++        for (const MetalFunction& f : lib.functions()) std::printf("%s\n", f.name.c_str());
++        return 0;
++    }
++    const MetalFunction* f = lib.find(argv[2]);
++    const uint8_t* bitcode = nullptr;
++    uint64_t length = 0;
++    if (f == nullptr || !lib.bitcode(*f, &bitcode, &length)) {
++        std::printf("stagecc: no function %s in %s\n", argv[2], argv[1]);
++        return 1;
++    }
++    for (int run = 0; run < runs; run++) {
++        std::string why;
++        const auto t0 = std::chrono::steady_clock::now();
++        std::unique_ptr<CompiledStage> s = compileStage(bitcode, size_t(length), &why, constants, 0, hasKnown ? &known : nullptr);
++        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        const CompileTimes t = takeCompileTimes();
++        if (s == nullptr) {
++            std::printf("%s: refused in %.1f ms: %s\n", argv[2], ms, why.c_str());
++            return 1;
++        }
++        std::printf("%s: %llu bytes of bitcode, %zu constants supplied -> %u instruction words, constlen %u, %zu resources, in %.1f ms (%s%.1f ms compiling: "
++                    "%.1f the front end, %.1f folding the known bytes, %.1f the rest; %.1f ms reading the cache)",
++                    argv[2], (unsigned long long)length, constants.size(), s->stage.k.numWords, s->stage.k.constlen, s->resources.size(), ms,
++                    t.cached ? "from the cache; " : "", t.compiledUs / 1e3, t.frontEndUs / 1e3, t.foldedUs / 1e3,
++                    (t.compiledUs - t.frontEndUs - t.foldedUs) / 1e3, t.loadedUs / 1e3);
++        if (hasKnown) {
++            std::printf("; of the %zu known bytes it read", known.bytes.size());
++            for (size_t i = 0; i < s->knownReads.size(); i++) if (s->knownReads[i]) std::printf(" %zu", i);
++        }
++        std::printf("\n");
++    }
++    return 0;
++}

@@ -1,0 +1,2346 @@
+Subject: Plug-in: metal_trace=frame, a whole frame as the driver received it and the GPU ran it
+
+The frame trace written for the study of how iOS draws
+(dev-notes/investigacion/19-como-dibuja-ios.md, section 5.3), as its two patches
+apply to this branch: touching /var/tmp/metal.trace has the next K command
+buffers written whole to /var/tmp/metal-trace-<pid>-<n>.txt -- each command
+buffer with its times, each encoder with its attachments and their actions,
+each texture with where its memory is, each pipeline with where each stage's
+code came from, its constants and its blending, each draw with its area, the
+box of its transformed vertices, its bindings and whether it was drawn, and
+each of the core's passes with its mode, tiles and GPU time. With the mode off
+it costs one boolean a command buffer. Its reader is trace-frame.py, kept with
+the study outside this tree.
+
+The core gains hakios_metal_program_fs_traits (which colour attachments a
+fragment stage reads by framebuffer fetch, and whether it can discard), which
+the trace looks up by name.
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/hakios_metal.h b/hakios-metal/include/hakios-metal/hakios_metal.h
+index 216a41c..a03c36f 100644
+--- a/hakios-metal/include/hakios-metal/hakios_metal.h
++++ b/hakios-metal/include/hakios-metal/hakios_metal.h
+@@ -288,6 +288,10 @@ hakios_metal_program *hakios_metal_program_specialize(hakios_metal_program *base
+     const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned binding, const void *bytes, size_t length);
+ /* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to */
+ unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
++/* what PROGRAM's fragment stage does that a frame trace reports (the plug-in's metal_trace=frame looks for it by name):
++ * bit n (n < 8) where it reads colour attachment n through framebuffer fetch ([[color(n)]] as an argument, the slots
++ * lowerFbRead gives them), bit 8 where it can discard a fragment. 0 for NULL. */
++unsigned hakios_metal_program_fs_traits(hakios_metal_program *program);
+ void hakios_metal_program_free(hakios_metal_program *program);
+ /* the buffers made from the kernel and those taken again from a queue's pool since the last call, and the bytes made */
+ void hakios_metal_buffer_counts(unsigned *made, unsigned *reused, unsigned long long *bytes);
+diff --git a/hakios-metal/src/c_api.cpp b/hakios-metal/src/c_api.cpp
+index 15e2e94..17ad152 100644
+--- a/hakios-metal/src/c_api.cpp
++++ b/hakios-metal/src/c_api.cpp
+@@ -1258,6 +1258,18 @@ unsigned hakios_metal_program_stage_words(hakios_metal_program* p, unsigned stag
+     return (stage == 0 ? p->program->program.vs : p->program->program.fs).k.numWords;
+ }
+ 
++unsigned hakios_metal_program_fs_traits(hakios_metal_program* p) {
++    if (p == nullptr) return 0;
++    const Stage& fs = p->program->program.fs;
++    unsigned bits = 0;
++    for (uint32_t i = 0; i < kMaxTextureSlots && i < fs.k.numTextureSlots; i++) {
++        const uint8_t target = fs.k.textures[i].fbTarget;   // n + 1 where the slot reads [[color(n)]]
++        if (target != 0 && target <= kMaxColorOutputs) bits |= 1u << (target - 1u);
++    }
++    if (fs.hasKill) bits |= 1u << 8;
++    return bits;
++}
++
+ // FUNCTION of LIBRARY as WANT (a vertex or a fragment function): its bitcode, or nullptr with the reason left
+ static bool functionBitcode(hakios_metal_library* l, const char* function, MetalFunction::Type want, const uint8_t** bytes, uint64_t* length) {
+     const MetalFunction* f = l->lib.find(function != nullptr ? function : "");
+diff --git a/userland/src/HakiosMetalCA.m b/userland/src/HakiosMetalCA.m
+index 0d9220c..653e87c 100644
+--- a/userland/src/HakiosMetalCA.m
++++ b/userland/src/HakiosMetalCA.m
+@@ -106,8 +106,17 @@
+ #include <string.h>
+ #include <unistd.h>
+ 
++#include <errno.h>
++#include <math.h>
++#include <time.h>
++
+ #include "hakios-metal/hakios_metal.h"
+ 
++/* the frame trace (metal_trace=frame, "The frame trace" below): what a command buffer being recorded carries, and what
++ * a render pipeline is described by in one; NULL in every other one */
++struct hm_ft_rec;
++struct hm_ft_pipe;
++
+ /* --- printing ----------------------------------------------------------------------------------------------- */
+ 
+ /*
+@@ -602,6 +611,8 @@ - (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format;
+ - (void)hakiosRefreshShadow;
+ - (void)hakiosSetDeallocator:(void (^)(void *, NSUInteger))deallocator bytes:(void *)bytes length:(NSUInteger)length;
+ - (unsigned)hakiosStorageKind;   /* metal_fps=timeline: 0 a surface's, else 1 + its storage mode */
++- (uint64_t)hakiosFtName:(struct hm_ft_rec *)ft;   /* metal_trace=frame: its id, its tex line written the first time */
++- (unsigned)hakiosTurn;          /* a turned framebuffer's a6xx_rotation */
+ @end
+ 
+ /* A sampler state: hakios-metal's four TEX_SAMP words, computed once from the descriptor, under Metal's own base class
+@@ -1220,10 +1231,12 @@ - (const struct hakios_metal_stencil_face *)hakiosStencilBack;
+ @interface HakiosMetalSamplerState : _MTLSamplerState {
+ 	hakios_metal_sampler *_hakiosSampler;
+ 	uint64_t _hakiosUniqueIdentifier;   /* -[_MTLSamplerState uniqueIdentifier] is a nil-stub, and gpuResourceID is built on it */
++	struct hakios_metal_sampler_desc _hakiosDesc;   /* the descriptor's fields, for metal_trace=frame's samp lines */
+ }
+ - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device sampler:(hakios_metal_sampler *)sampler
+ 			  descriptor:(MTLSamplerDescriptor *)descriptor;
+ - (hakios_metal_sampler *)hakiosSampler;
++- (uint64_t)hakiosFtName:(struct hm_ft_rec *)ft;   /* metal_trace=frame: its id, its samp line written the first time */
+ @end
+ 
+ #define HM_SPEC_MOST 64   /* the contents of its deciding buffer an uber shader's pipeline is specialised for */
+@@ -1258,12 +1271,19 @@ @interface HakiosMetalRenderPipelineState : _MTLRenderPipelineState {
+ 	uint64_t _specHashes[HM_SPEC_MOST];
+ 	hakios_metal_program *_specPrograms[HM_SPEC_MOST];
+ 	uint8_t *_specKeys;                 /* HM_SPEC_MOST x _specLength bytes */
++	struct hm_ft_pipe *_ftPipe;         /* metal_trace=frame: how a trace describes it (made with it while the switch is on) */
+ }
+ - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device program:(hakios_metal_program *)program
+ 			  descriptor:(MTLRenderPipelineDescriptor *)descriptor;
+ - (hakios_metal_program *)hakiosProgram;
+ - (void)hakiosKeepFragment:(NSData *)air constants:(const hakios_metal_constant *)constants count:(unsigned)count;
+ - (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count;
++- (int)hakiosSpecBinding;              /* the uber shader's deciding [[buffer(n)]], -1 when it is not specialised */
++- (unsigned)hakiosSpecLength;          /* ...and the bytes of it that decide */
++- (void)hakiosSetFtPipe:(struct hm_ft_pipe *)pipe;
++- (const struct hm_ft_pipe *)hakiosFtPipe;
++- (uint64_t)hakiosUniqueIdentifier;
++- (uint64_t)hakiosFtName:(struct hm_ft_rec *)ft;   /* metal_trace=frame: its id, its pipe lines written the first time */
+ @end
+ 
+ @interface HakiosMetalCommandQueue : _MTLCommandQueue {
+@@ -1294,11 +1314,16 @@ @interface HakiosMetalCommandBuffer : _MTLCommandBuffer {
+ 	NSMutableArray *_signals, *_waits;       /* { HakiosMetalEvent, value }: applied at completion / met before the GPU sees it */
+ 	dispatch_semaphore_t _sent;              /* a held commit: signalled once it has reached the GPU */
+ 	NSMutableArray *_turned;                 /* HakiosMetalTexture: turned framebuffers drawn here, copied into their surfaces at commit */
++	struct hm_ft_rec *_ftrace;               /* metal_trace=frame: this buffer being recorded, else NULL */
+ }
+ - (instancetype)initWithHakiosQueue:(HakiosMetalCommandQueue *)queue;
+ - (void)hakiosTurnAtCommit:(id)texture;
+ - (hakios_metal_cb *)hakiosCommandBuffer;
+ - (double)hakiosCreatedAt;
++- (struct hm_ft_rec *)hakiosFrameTrace;
++- (void)hakiosFtDebug:(const char *)what string:(NSString *)string;
++- (void)hakiosFtFinish;
++- (void)hakiosFtPhase:(struct hm_ft_rec *)ft scheduled:(BOOL)scheduled;
+ @end
+ 
+ /* A parallel render encoder: one pass whose draws come from several sub-encoders, filled on any thread in any order and
+@@ -1312,15 +1337,21 @@ @interface HakiosMetalParallelRenderCommandEncoder : _MTLCommandEncoder {
+ 	MTLRenderPassDescriptor *_descriptor;       /* copied: its resolves are read at -endEncoding */
+ 	NSMutableArray *_subs;                      /* NSValue (pointer) of each sub-encoder's hakios_metal_cb, in creation order */
+ 	NSLock *_lock;
++	struct hm_ft_rec *_ftrace;                  /* metal_trace=frame: the command buffer's recorder, else NULL */
++	unsigned _ftEnc;                            /* ...and this encoder's number in it */
+ }
+ - (instancetype)initWithHakiosCommandBuffer:(HakiosMetalCommandBuffer *)commandBuffer pass:(const struct hakios_metal_render_pass *)pass
+ 			       colorTexture:(HakiosMetalTexture *)texture descriptor:(MTLRenderPassDescriptor *)descriptor;
++- (unsigned)hakiosFtIndex;
+ @end
+ 
+ @interface HakiosMetalBlitCommandEncoder : _MTLCommandEncoder {
+ 	HakiosMetalCommandBuffer *_commandBuffer;   /* not retained: the base class retains it until -endEncoding */
++	struct hm_ft_rec *_ftrace;                  /* metal_trace=frame: the command buffer's recorder, else NULL */
++	unsigned _ftEnc;                            /* ...and this encoder's number in it */
+ }
+ - (instancetype)initWithHakiosCommandBuffer:(HakiosMetalCommandBuffer *)commandBuffer;
++- (void)hakiosFtDebug:(const char *)what string:(NSString *)string;
+ @end
+ 
+ @interface HakiosMetalComputeCommandEncoder : _MTLCommandEncoder {
+@@ -1336,8 +1367,11 @@ @interface HakiosMetalComputeCommandEncoder : _MTLCommandEncoder {
+ 	NSMutableArray *_scratch;                   /* the buffers -setBytes: made, alive until -endEncoding */
+ 	NSUInteger _threadgroupLength;              /* setThreadgroupMemoryLength: at index 0, given to each dispatch */
+ 	char _refused[160];                         /* a binding this encoder could not take: the dispatch is failed by it */
++	struct hm_ft_rec *_ftrace;                  /* metal_trace=frame: the command buffer's recorder, else NULL */
++	unsigned _ftEnc;                            /* ...and this encoder's number in it */
+ }
+ - (instancetype)initWithHakiosCommandBuffer:(HakiosMetalCommandBuffer *)commandBuffer;
++- (void)hakiosFtDebug:(const char *)what string:(NSString *)string;
+ @end
+ 
+ /*
+@@ -1376,14 +1410,1089 @@ @interface HakiosMetalRenderCommandEncoder : _MTLCommandEncoder {
+ 	MTLWinding _frontFacingWinding;             /* -setFrontFacingWinding:'s, also in _pass.winding for the draws */
+ 	char _refused[160];                         /* a binding or state this encoder could not take: the next draw is failed by it */
+ 	NSMutableIndexSet *_visibilityCounted;      /* the result words (offset / 8) a draw of this encoder has counted into */
++	struct hm_ft_rec *_ftrace;                  /* metal_trace=frame: the command buffer's recorder, else NULL */
++	unsigned _ftEnc;                            /* ...and this encoder's number in it */
++	unsigned _ftDraws;                          /* ...and the draws it has recorded */
+ }
+ - (instancetype)initWithHakiosCommandBuffer:(HakiosMetalCommandBuffer *)commandBuffer pass:(const struct hakios_metal_render_pass *)pass
+ 			       colorTexture:(HakiosMetalTexture *)texture;
+ - (instancetype)initWithHakiosCommandBuffer:(HakiosMetalCommandBuffer *)commandBuffer pass:(const struct hakios_metal_render_pass *)pass
+ 			       colorTexture:(HakiosMetalTexture *)texture sub:(hakios_metal_cb *)sub;
+ - (void)hakiosTakeResolves:(MTLRenderPassDescriptor *)descriptor;
++- (unsigned)hakiosFtIndex;
++- (void)hakiosFtDebug:(const char *)what string:(NSString *)string;
+ @end
+ 
++/* ============================================================================================================
++ * The frame trace: metal_trace=frame
++ * ============================================================================================================ */
++
++/*
++ * metal_trace=1 says each kind of draw once, on the console. metal_trace=frame answers the other question: what ONE
++ * frame of the window server's is made of, all of it, as this driver was given it and as the GPU ran it. While the
++ * switch is on a thread looks at /var/tmp/metal.trace every 100 ms; each time the file appears or is touched again (its
++ * inode or its modification time moves), the next K command buffers this process makes are recorded whole, from their
++ * making to their completion, and written to /var/tmp/metal-trace-PID-N.txt, N the capture's number in the process.
++ * K is metal_trace_cbs=K (8 when not given); a number written in the file wins, and a word proc=NAME in it limits that
++ * capture to the process of that name. With metal_trace_every=S a capture is also armed every S seconds, and
++ * metal_trace_dir=DIR writes the files there instead of /var/tmp (the trigger stays where it is). The console
++ * gets one line when a capture is armed and one when its last command buffer is written; the rest goes to the file, by
++ * a queue of its own, so that no thread that draws waits on the flash.
++ *
++ * The file is lines, one record each: a word saying what the record is, then key=value fields, a value with a space,
++ * a quote or an '=' in it in double quotes with \" and \\. trace-frame.py (the research tree's) reads it. The records:
++ *   trace     the capture: process, pid, its number, K, why it was armed, the switches
++ *   cb        a command buffer, written when it is done with, its own lines after it: label, queue, made, committed,
++ *             scheduled and completed (host seconds, mach_absolute_time's), GPU time, status, what the core counted
++ *   enc       an encoder as it is made (render, parallel, blit, compute); endenc as it ends, with its label
++ *   att       a render encoder's attachment: slot, texture, level, slice, load and store actions as Metal gave them,
++ *             the clear value
++ *   tex       a texture, the first time the command buffer names it: id, the memory it is (s<IOSurface id> or the root
++ *             texture's t<id>, with the level and slice it starts at there), shape, format, usage, asked storage
++ *   samp      a sampler the same way: filters, address modes
++ *   pipe      a render pipeline, the first time the buffer draws with it: label, functions and their labels, the
++ *             constants they were specialised with, where each stage's code came from (CoreAnimation's variant, the
++ *             nearest one standing in, a stand-in function, its own), framebuffer fetch; pblend its blend per attachment
++ *   draw      a draw: pipeline, program, primitive, counts, viewport, scissor, the pixels it can touch and those its
++ *             vertices land on, the uber shader's specialisation, the core's pass it went into, what became of it;
++ *             dtex, dsamp and dbuf what it had bound
++ *   blit      a copy, fill, mipmap, resolve or rotation; dispatch a compute dispatch (with its dtex/dsamp/dbuf)
++ *   clear     a pass that only clears, recorded at its encoder's end
++ *   debug     a debug group pushed or popped, a signpost (where the base classes take them)
++ *   present, event   a drawable presented, an event signalled or waited for
++ *   gpass     a pass of the core's as the GPU ran it, written at completion: kind, size, draws, microseconds, GMEM and
++ *             its tiles, or sysmem and why. A draw's core= is its index here; the core times the first 64 passes
++ *   endcb     the command buffer's end; endtrace the capture's
++ * The cost while the switch is off is its reading, once, and one test of it where a command buffer is made: a buffer
++ * that is not recorded carries a NULL, which is all an encoder, a draw or a copy looks at.
++ */
++
++#define HM_FT_TRIGGER "/var/tmp/metal.trace"
++
++static BOOL hm_ft_enabled;            /* metal_trace=frame is on (hm_ft_mode has read the switches) */
++static unsigned hm_ft_cbs = 8;        /* metal_trace_cbs: the command buffers one capture takes */
++static double hm_ft_every;            /* metal_trace_every: seconds between captures the clock arms, 0 none */
++static char hm_ft_dir[128] = "/var/tmp";   /* metal_trace_dir: where the capture files go */
++static unsigned (*hm_ft_fs_traits)(hakios_metal_program *);   /* the core's hakios_metal_program_fs_traits, when it has it */
++static char hm_ft_asked_key;          /* the name a stand-in function was asked for under (objc_setAssociatedObject) */
++
++/* one capture: its file, its command buffers taken and written (under hm_ft.lock), and closed once no more will be */
++struct hm_ft_capture {
++	unsigned number, taken, written;
++	BOOL closed;
++	size_t bytes;
++	char path[192];
++};
++
++static struct {
++	pthread_mutex_t lock;
++	int armed;                         /* command buffers the current capture still takes */
++	unsigned captures, serial;         /* captures armed, command buffers recorded, in this process */
++	struct hm_ft_capture *capture;     /* the one the next command buffers join */
++} hm_ft = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, NULL };
++
++/* a command buffer being recorded: its lines so far, and what its cb line will say */
++struct hm_ft_rec {
++	pthread_mutex_t lock;              /* a parallel encoder's sub-encoders record from several threads */
++	char *buf;
++	size_t len, cap;
++	struct hm_ft_capture *capture;
++	unsigned seq, serial;              /* its place in the capture (1..K) and among the process's recorded buffers */
++	unsigned encoders, draws, ops;     /* encoders made, draws, and blits and dispatches, each numbered from 0 */
++	unsigned unprofiled;               /* passes a parallel encoder's sub-encoders appended: the core times none of them */
++	double created, committed, scheduled, completed;
++	int phases;                        /* -commit's return and the completion: the second of them writes the record */
++	BOOL held, committedYet;           /* committed to the GPU once the events it waits for had come; -commit seen */
++	NSMutableIndexSet *named;          /* the textures, samplers and pipelines described in it (one counter numbers all) */
++};
++
++/* how a trace describes a render pipeline, made with it */
++struct hm_ft_pipe {
++	char *lines;                       /* its pipe line and a pblend line per colour attachment */
++	unsigned vdFormat, vdOffset, vdBuffer, vdStride;   /* attribute 0 of its vertex descriptor; vdFormat 0: none */
++	BOOL fixedVert, baseColor;         /* CoreAnimation's fixed_vert_*_gen, which reads its vertices itself; its fc_base_color */
++};
++
++static void *hm_ft_watch(void *unused);
++static void hm_ft_debug_methods(void);
++
++/* the switches, once: metal_trace=frame, metal_trace_cbs=K, metal_trace_every=S; the watcher started when it is on */
++static BOOL
++hm_ft_mode(void)
++{
++	static dispatch_once_t once;
++
++	dispatch_once(&once, ^{
++		char args[1024] = "", every[48] = "";
++		size_t size = sizeof(args) - 1;
++		const char *at;
++		pthread_t thread;
++
++		if (hm_bootargs(args, &size) != 0 || strstr(args, "metal_trace=frame") == NULL) {
++			return;
++		}
++		if ((at = strstr(args, "metal_trace_cbs=")) != NULL && atoi(at + strlen("metal_trace_cbs=")) > 0) {
++			hm_ft_cbs = (unsigned)MIN(atoi(at + strlen("metal_trace_cbs=")), 1000);
++		}
++		if ((at = strstr(args, "metal_trace_every=")) != NULL && atof(at + strlen("metal_trace_every=")) > 0) {
++			hm_ft_every = MAX(atof(at + strlen("metal_trace_every=")), 0.5);
++			snprintf(every, sizeof(every), ", and one every %.1f s", hm_ft_every);
++		}
++		if ((at = strstr(args, "metal_trace_dir=")) != NULL && at[strlen("metal_trace_dir=")] == '/') {
++			at += strlen("metal_trace_dir=");
++			snprintf(hm_ft_dir, sizeof(hm_ft_dir), "%.*s", (int)MIN(strcspn(at, " "), sizeof(hm_ft_dir) - 1), at);
++		}
++		/* (a core with the second patch says what a fragment stage reads by framebuffer fetch; without it the trace
++		 * falls back on CoreAnimation's fc_framebuffer_fetch constant) */
++		hm_ft_fs_traits = (unsigned (*)(hakios_metal_program *))dlsym(RTLD_SELF, "hakios_metal_program_fs_traits");
++		hm_ft_enabled = YES;
++		hm_ft_debug_methods();
++		if (pthread_create(&thread, NULL, hm_ft_watch, NULL) == 0) {
++			pthread_detach(thread);
++		}
++		hm_print("frame trace: on, %u command buffers a capture into %s when %s is touched%s; framebuffer fetch %s\n", hm_ft_cbs, hm_ft_dir,
++			 HM_FT_TRIGGER, every, hm_ft_fs_traits != NULL ? "as the core compiled it" : "from fc_framebuffer_fetch (no hakios_metal_program_fs_traits in the core)");
++	});
++	return hm_ft_enabled;
++}
++
++/* S as a field's value into OUT: bare when it is one word of plain characters, else in double quotes with \" and \\
++ * (a line break or a tab a space); "" for NULL or empty. OUT is returned. */
++static const char *
++hm_ft_q(char *out, size_t size, const char *s)
++{
++	size_t o = 0;
++	BOOL bare = s != NULL && s[0] != '\0';
++
++	if (size < 3) {
++		if (size != 0) out[0] = '\0';
++		return out;
++	}
++	if (s == NULL) s = "";
++	for (const char *p = s; bare && *p != '\0'; p++) {
++		bare = (unsigned char)*p > ' ' && (unsigned char)*p < 0x7f && *p != '"' && *p != '\\' && *p != '=';
++	}
++	if (bare) {
++		strlcpy(out, s, size);
++		return out;
++	}
++	out[o++] = '"';
++	for (const char *p = s; *p != '\0' && o + 3 < size; p++) {
++		const char c = *p == '\n' || *p == '\r' || *p == '\t' ? ' ' : *p;
++
++		if (c == '"' || c == '\\') out[o++] = '\\';
++		out[o++] = c;
++	}
++	out[o++] = '"';
++	out[o] = '\0';
++	return out;
++}
++
++static const char *
++hm_ft_qs(char *out, size_t size, NSString *s)
++{
++	return hm_ft_q(out, size, s != nil && [s isKindOfClass:[NSString class]] ? [s UTF8String] : NULL);
++}
++
++/* N bytes from P into OUT (2N + 1 chars) as hex */
++static const char *
++hm_ft_hex(char *out, const uint8_t *p, size_t n)
++{
++	static const char digits[] = "0123456789abcdef";
++
++	for (size_t i = 0; i < n; i++) {
++		out[2 * i] = digits[p[i] >> 4];
++		out[2 * i + 1] = digits[p[i] & 15];
++	}
++	out[2 * n] = '\0';
++	return out;
++}
++
++static uint32_t
++hm_ft_fnv(const void *p, size_t n, uint32_t h)
++{
++	for (size_t i = 0; i < n; i++) h = (h ^ ((const uint8_t *)p)[i]) * 16777619u;
++	return h;
++}
++
++/* FMT appended at *AT of OUT, never past SIZE */
++static void hm_ft_cat(char *out, size_t size, size_t *at, const char *fmt, ...) __attribute__((format(printf, 4, 5)));
++
++static void
++hm_ft_cat(char *out, size_t size, size_t *at, const char *fmt, ...)
++{
++	va_list ap;
++	int n;
++
++	if (*at + 1 >= size) return;
++	va_start(ap, fmt);
++	n = vsnprintf(out + *at, size - *at, fmt, ap);
++	va_end(ap);
++	if (n > 0) *at = MIN(*at + (size_t)n, size - 1);
++}
++
++/* Metal's numbers by name, for the lines */
++static const char *
++hm_ft_format(unsigned f, char *tmp, size_t size)
++{
++	static const struct { unsigned short value; const char *name; } formats[] = {
++		{0, "Invalid"}, {1, "A8Unorm"}, {10, "R8Unorm"}, {11, "R8Unorm_sRGB"}, {12, "R8Snorm"}, {13, "R8Uint"}, {14, "R8Sint"},
++		{20, "R16Unorm"}, {22, "R16Snorm"}, {23, "R16Uint"}, {24, "R16Sint"}, {25, "R16Float"}, {30, "RG8Unorm"}, {31, "RG8Unorm_sRGB"},
++		{32, "RG8Snorm"}, {33, "RG8Uint"}, {34, "RG8Sint"}, {40, "B5G6R5Unorm"}, {41, "A1BGR5Unorm"}, {42, "ABGR4Unorm"}, {43, "BGR5A1Unorm"},
++		{53, "R32Uint"}, {54, "R32Sint"}, {55, "R32Float"}, {60, "RG16Unorm"}, {62, "RG16Snorm"}, {63, "RG16Uint"}, {64, "RG16Sint"},
++		{65, "RG16Float"}, {70, "RGBA8Unorm"}, {71, "RGBA8Unorm_sRGB"}, {72, "RGBA8Snorm"}, {73, "RGBA8Uint"}, {74, "RGBA8Sint"},
++		{80, "BGRA8Unorm"}, {81, "BGRA8Unorm_sRGB"}, {90, "RGB10A2Unorm"}, {91, "RGB10A2Uint"}, {92, "RG11B10Float"}, {93, "RGB9E5Float"},
++		{94, "BGR10A2Unorm"}, {103, "RG32Uint"}, {104, "RG32Sint"}, {105, "RG32Float"}, {110, "RGBA16Unorm"}, {112, "RGBA16Snorm"},
++		{113, "RGBA16Uint"}, {114, "RGBA16Sint"}, {115, "RGBA16Float"}, {123, "RGBA32Uint"}, {124, "RGBA32Sint"}, {125, "RGBA32Float"},
++		{130, "BC1_RGBA"}, {131, "BC1_RGBA_sRGB"}, {132, "BC2_RGBA"}, {133, "BC2_RGBA_sRGB"}, {134, "BC3_RGBA"}, {135, "BC3_RGBA_sRGB"},
++		{140, "BC4_RUnorm"}, {141, "BC4_RSnorm"}, {142, "BC5_RGUnorm"}, {143, "BC5_RGSnorm"}, {150, "BC6H_RGBFloat"}, {151, "BC6H_RGBUfloat"},
++		{152, "BC7_RGBAUnorm"}, {153, "BC7_RGBAUnorm_sRGB"}, {160, "PVRTC_RGB_2BPP"}, {161, "PVRTC_RGB_2BPP_sRGB"}, {162, "PVRTC_RGB_4BPP"},
++		{163, "PVRTC_RGB_4BPP_sRGB"}, {164, "PVRTC_RGBA_2BPP"}, {165, "PVRTC_RGBA_2BPP_sRGB"}, {166, "PVRTC_RGBA_4BPP"},
++		{167, "PVRTC_RGBA_4BPP_sRGB"}, {170, "EAC_R11Unorm"}, {172, "EAC_R11Snorm"}, {174, "EAC_RG11Unorm"}, {176, "EAC_RG11Snorm"},
++		{178, "EAC_RGBA8"}, {179, "EAC_RGBA8_sRGB"}, {180, "ETC2_RGB8"}, {181, "ETC2_RGB8_sRGB"}, {182, "ETC2_RGB8A1"}, {183, "ETC2_RGB8A1_sRGB"},
++		{186, "ASTC_4x4_sRGB"}, {204, "ASTC_4x4_LDR"}, {222, "ASTC_4x4_HDR"}, {240, "GBGR422"}, {241, "BGRG422"}, {250, "Depth16Unorm"},
++		{252, "Depth32Float"}, {253, "Stencil8"}, {255, "Depth24Unorm_Stencil8"}, {260, "Depth32Float_Stencil8"}, {261, "X32_Stencil8"},
++		{262, "X24_Stencil8"}, {500, "YCbCr8_420_2P"}, {540, "RGB8_420_2P"}, {552, "BGRA10_XR"}, {553, "BGRA10_XR_sRGB"}, {554, "BGR10_XR"},
++		{555, "BGR10_XR_sRGB"},
++	};
++
++	for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
++		if (formats[i].value == f) return formats[i].name;
++	}
++	snprintf(tmp, size, "%s%u", f >= 186 && f <= 236 ? "ASTC" : "fmt", f);
++	return tmp;
++}
++
++static const char *
++hm_ft_name(unsigned i, const char *const *names, unsigned count)
++{
++	return i < count ? names[i] : "?";
++}
++#define HM_FT_NAME(i, ...) hm_ft_name((unsigned)(i), (const char *const[]){ __VA_ARGS__ }, \
++				      sizeof((const char *const[]){ __VA_ARGS__ }) / sizeof(const char *))
++#define HM_FT_LOAD(a)    HM_FT_NAME(a, "dontcare", "load", "clear")
++#define HM_FT_STORE(a)   HM_FT_NAME(a, "dontcare", "store", "resolve", "store+resolve", "unknown", "customdepth")
++#define HM_FT_PRIM(p)    HM_FT_NAME(p, "point", "line", "linestrip", "tri", "tristrip")
++#define HM_FT_FACTOR(f)  HM_FT_NAME(f, "zero", "one", "srcColor", "1-srcColor", "srcAlpha", "1-srcAlpha", "dstColor", "1-dstColor", "dstAlpha", \
++				      "1-dstAlpha", "srcAlphaSat", "blendColor", "1-blendColor", "blendAlpha", "1-blendAlpha", "src1Color", \
++				      "1-src1Color", "src1Alpha", "1-src1Alpha")
++#define HM_FT_BLENDOP(o) HM_FT_NAME(o, "add", "sub", "revsub", "min", "max")
++#define HM_FT_COMPARE(c) HM_FT_NAME(c, "never", "less", "equal", "lequal", "greater", "notequal", "gequal", "always")
++#define HM_FT_TTYPE(t)   HM_FT_NAME(t, "1d", "1darray", "2d", "2darray", "2dms", "cube", "cubearray", "3d", "2dmsarray", "buffer")
++#define HM_FT_STORAGE(s) HM_FT_NAME(s, "shared", "managed", "private", "memoryless")
++#define HM_FT_FILTER(f)  HM_FT_NAME(f, "nearest", "linear")
++#define HM_FT_MIP(f)     HM_FT_NAME(f, "none", "nearest", "linear")
++#define HM_FT_ADDRESS(a) HM_FT_NAME(a, "clamp", "mirrorclamp", "repeat", "mirror", "zero", "border")
++#define HM_FT_ORIGIN(o)  HM_FT_NAME(o, "own", "surface", "buffer", "compressed")
++#define HM_FT_STATUS(s)  HM_FT_NAME(s, "notenqueued", "enqueued", "committed", "scheduled", "completed", "error")
++
++/* a colour write mask (MTLColorWriteMask: red 8, green 4, blue 2, alpha 1) as its letters */
++static const char *
++hm_ft_mask(unsigned m, char out[8])
++{
++	size_t o = 0;
++
++	if (m & 8) out[o++] = 'r';
++	if (m & 4) out[o++] = 'g';
++	if (m & 2) out[o++] = 'b';
++	if (m & 1) out[o++] = 'a';
++	if (o == 0) strlcpy(out, "none", 8);
++	else out[o] = '\0';
++	return out;
++}
++
++/* MTLTextureUsage as words */
++static const char *
++hm_ft_usage(unsigned long u, char out[48])
++{
++	out[0] = '\0';
++	if (u & MTLTextureUsageShaderRead) strlcat(out, "|read", 48);
++	if (u & MTLTextureUsageShaderWrite) strlcat(out, "|write", 48);
++	if (u & MTLTextureUsageRenderTarget) strlcat(out, "|rt", 48);
++	if (u & MTLTextureUsagePixelFormatView) strlcat(out, "|pfv", 48);
++	return out[0] != '\0' ? out + 1 : "none";
++}
++
++/* N bytes of record lines appended (LOCK held); a line that finds no memory is dropped */
++static void
++hm_ft_put(struct hm_ft_rec *ft, const char *s, size_t n)
++{
++	if (ft->len + n + 1 > ft->cap) {
++		const size_t cap = MAX(2 * ft->cap, ft->len + n + 1);
++		char *grown = realloc(ft->buf, cap);
++
++		if (grown == NULL) return;
++		ft->buf = grown;
++		ft->cap = cap;
++	}
++	memcpy(ft->buf + ft->len, s, n);
++	ft->len += n;
++}
++
++static void hm_ft_line(struct hm_ft_rec *ft, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
++
++/* one record line, whole, into FT */
++static void
++hm_ft_line(struct hm_ft_rec *ft, const char *fmt, ...)
++{
++	char small[2048], *line = small;
++	va_list ap;
++	int n;
++
++	va_start(ap, fmt);
++	n = vsnprintf(small, sizeof(small), fmt, ap);
++	va_end(ap);
++	if (n < 0) return;
++	if ((size_t)n >= sizeof(small)) {
++		va_start(ap, fmt);
++		n = vasprintf(&line, fmt, ap);
++		va_end(ap);
++		if (n < 0) return;
++	}
++	pthread_mutex_lock(&ft->lock);
++	hm_ft_put(ft, line, (size_t)n);
++	pthread_mutex_unlock(&ft->lock);
++	if (line != small) free(line);
++}
++
++/* YES the first time ID (a texture's, a sampler's or a pipeline's) is named in FT: its describing line is due */
++static BOOL
++hm_ft_first(struct hm_ft_rec *ft, uint64_t id)
++{
++	BOOL first;
++
++	pthread_mutex_lock(&ft->lock);
++	first = ![ft->named containsIndex:(NSUInteger)id];
++	if (first) [ft->named addIndex:(NSUInteger)id];
++	pthread_mutex_unlock(&ft->lock);
++	return first;
++}
++
++/* the next number of a counter of FT's (encoders, draws, ops) */
++static unsigned
++hm_ft_next(struct hm_ft_rec *ft, unsigned *counter)
++{
++	unsigned n;
++
++	pthread_mutex_lock(&ft->lock);
++	n = (*counter)++;
++	pthread_mutex_unlock(&ft->lock);
++	return n;
++}
++
++/* the passes the core has opened in CB so far, each kind (hakios_metal_cb_counts): a draw's, blit's or dispatch's own
++ * pass is the last of them once it is recorded, which is its index among the passes the core times (gpass), less those
++ * of sub-encoders, which it does not */
++static unsigned
++hm_ft_total(hakios_metal_cb *cb)
++{
++	unsigned passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0;
++
++	hakios_metal_cb_counts(cb, &passes, &draws, &dispatches, &copies, &clears);
++	return passes + dispatches + copies + clears;
++}
++
++/* the core's pass index of what was just recorded on CB, which had BEFORE passes before it, and how many it opened */
++static int
++hm_ft_core(struct hm_ft_rec *ft, hakios_metal_cb *cb, unsigned before, unsigned *opened)
++{
++	const unsigned after = hm_ft_total(cb);
++
++	*opened = after > before ? after - before : 0;
++	return after == 0 || after - 1 < ft->unprofiled ? -1 : (int)(after - 1 - ft->unprofiled);
++}
++
++/* --- captures --- */
++
++static dispatch_queue_t
++hm_ft_writer(void)
++{
++	static dispatch_queue_t queue;
++	static dispatch_once_t once;
++
++	dispatch_once(&once, ^{
++		queue = dispatch_queue_create("hakios.metal.frame-trace", DISPATCH_QUEUE_SERIAL);
++	});
++	return queue;
++}
++
++static void
++hm_ft_write_all(int fd, const char *p, size_t n)
++{
++	while (n > 0) {
++		const ssize_t w = write(fd, p, n);
++
++		if (w <= 0) return;
++		p += w;
++		n -= (size_t)w;
++	}
++}
++
++/* a capture whose every command buffer is written: its last line, the console told, and it gone */
++static void
++hm_ft_capture_done(struct hm_ft_capture *c)
++{
++	char line[160];
++	const int n = snprintf(line, sizeof(line), "endtrace capture=%u cbs=%u bytes=%zu\n", c->number, c->written, c->bytes);
++	const int fd = open(c->path, O_WRONLY | O_APPEND);
++
++	if (fd >= 0) {
++		hm_ft_write_all(fd, line, (size_t)n);
++		close(fd);
++	}
++	hm_print("frame trace: capture %u done: %u command buffers, %zu KB in %s\n", c->number, c->written, c->bytes >> 10, c->path);
++	free(c);
++}
++
++/* RECORD (malloc'd, LEN bytes) appended to C's file by the writer's queue, which frees it */
++static void
++hm_ft_write(struct hm_ft_capture *c, char *record, size_t len)
++{
++	dispatch_async(hm_ft_writer(), ^{
++		const int fd = open(c->path, O_WRONLY | O_APPEND);
++		BOOL done;
++
++		if (fd >= 0) {
++			hm_ft_write_all(fd, record, len);
++			close(fd);
++		}
++		free(record);
++		pthread_mutex_lock(&hm_ft.lock);
++		c->written++;
++		c->bytes += len;
++		done = c->closed && c->written == c->taken;
++		if (done && hm_ft.capture == c) hm_ft.capture = NULL;
++		pthread_mutex_unlock(&hm_ft.lock);
++		if (done) hm_ft_capture_done(c);
++	});
++}
++
++/* a capture armed for K command buffers (WHY: file or every): its file begun with the trace line; the one before it,
++ * if it was still taking, takes no more */
++static void
++hm_ft_arm(unsigned k, const char *why)
++{
++	struct hm_ft_capture *c, *finished = NULL;
++	char args[1024] = "", quoted[1100], line[1400];
++	size_t size = sizeof(args) - 1;
++	int fd, n;
++
++	if (strcmp(why, "every") == 0 && __atomic_load_n(&hm_ft.armed, __ATOMIC_ACQUIRE) > 0) {
++		return;   /* (the clock does not cut a capture short) */
++	}
++	if ((c = calloc(1, sizeof(*c))) == NULL) return;
++	(void)hm_bootargs(args, &size);
++	/* (the file begun before the capture is installed: no command buffer waits on the flash for it) */
++	c->number = __atomic_add_fetch(&hm_ft.captures, 1, __ATOMIC_ACQ_REL);
++	snprintf(c->path, sizeof(c->path), "%s/metal-trace-%d-%u.txt", hm_ft_dir, getpid(), c->number);
++	fd = open(c->path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++	if (fd < 0) {
++		hm_print("frame trace: capture %u not taken: %s: %s\n", c->number, c->path, strerror(errno));
++		free(c);
++		return;
++	}
++	n = snprintf(line, sizeof(line), "# hakios-metal frame trace (metal_trace=frame); read by trace-frame.py\n"
++		     "trace fmt=1 proc=%s pid=%d capture=%u cbs=%u why=%s t=%.6f wall=%ld args=%s\n", getprogname(), getpid(), c->number, k,
++		     why, hm_now(), (long)time(NULL), hm_ft_q(quoted, sizeof(quoted), args));
++	hm_ft_write_all(fd, line, (size_t)MIN(n, (int)sizeof(line) - 1));
++	close(fd);
++	pthread_mutex_lock(&hm_ft.lock);
++	if (hm_ft.capture != NULL && !hm_ft.capture->closed) {
++		hm_ft.capture->closed = YES;
++		if (hm_ft.capture->written == hm_ft.capture->taken) finished = hm_ft.capture;
++	}
++	hm_ft.capture = c;
++	hm_ft.armed = (int)k;
++	pthread_mutex_unlock(&hm_ft.lock);
++	if (finished != NULL) {
++		/* (nothing of it left in flight: its last line goes after the writer's queue has written what it holds) */
++		dispatch_async(hm_ft_writer(), ^{
++			hm_ft_capture_done(finished);
++		});
++	}
++	hm_print("frame trace: capture %u (%s): the next %u command buffers, into %s\n", c->number, why, k, c->path);
++}
++
++/* the watcher: the trigger file every 100 ms, the clock's captures; it runs for the process's life */
++static void *
++hm_ft_watch(void *unused)
++{
++	struct stat st;
++	ino_t ino = 0;
++	struct timespec seen = { 0, 0 };
++	double last = hm_now();
++
++	(void)unused;
++	pthread_setname_np("hakios.metal.frame-trace");
++	/* (a trigger left from before this process does not fire: only one touched while it runs) */
++	if (stat(HM_FT_TRIGGER, &st) == 0) {
++		ino = st.st_ino;
++		seen = st.st_mtimespec;
++	}
++	for (;;) {
++		usleep(100000);
++		if (stat(HM_FT_TRIGGER, &st) == 0 &&
++		    (st.st_ino != ino || st.st_mtimespec.tv_sec != seen.tv_sec || st.st_mtimespec.tv_nsec != seen.tv_nsec)) {
++			char words[256] = "";
++			unsigned k = hm_ft_cbs;
++			BOOL mine = YES;
++			const int fd = open(HM_FT_TRIGGER, O_RDONLY);
++
++			ino = st.st_ino;
++			seen = st.st_mtimespec;
++			if (fd >= 0) {
++				const ssize_t got = read(fd, words, sizeof(words) - 1);
++
++				words[got > 0 ? got : 0] = '\0';
++				close(fd);
++			}
++			char *rest = NULL;
++
++			for (char *w = strtok_r(words, " \t\r\n", &rest); w != NULL; w = strtok_r(NULL, " \t\r\n", &rest)) {
++				if (strspn(w, "0123456789") == strlen(w) && atoi(w) > 0) k = (unsigned)MIN(atoi(w), 1000);
++				else if (strncmp(w, "proc=", 5) == 0) mine = strcmp(w + 5, getprogname()) == 0;
++			}
++			if (mine) hm_ft_arm(k, "file");
++		}
++		if (hm_ft_every > 0 && hm_now() - last >= hm_ft_every) {
++			last = hm_now();
++			hm_ft_arm(hm_ft_cbs, "every");
++		}
++	}
++	return NULL;
++}
++
++/* At a command buffer's making (CREATED): a recorder when a capture wants it, else NULL -- one atomic load when none does */
++static struct hm_ft_rec *
++hm_ft_take(double created)
++{
++	struct hm_ft_rec *ft;
++	struct hm_ft_capture *c = NULL;
++
++	if (__atomic_load_n(&hm_ft.armed, __ATOMIC_ACQUIRE) <= 0 || (ft = calloc(1, sizeof(*ft))) == NULL) {
++		return NULL;
++	}
++	pthread_mutex_lock(&hm_ft.lock);
++	if (hm_ft.armed > 0 && hm_ft.capture != NULL) {
++		c = hm_ft.capture;
++		hm_ft.armed--;
++		ft->seq = ++c->taken;
++		ft->serial = ++hm_ft.serial;
++		if (hm_ft.armed == 0) c->closed = YES;
++	}
++	pthread_mutex_unlock(&hm_ft.lock);
++	if (c == NULL) {
++		free(ft);
++		return NULL;
++	}
++	pthread_mutex_init(&ft->lock, NULL);
++	ft->capture = c;
++	ft->created = created;
++	ft->cap = 64 * 1024;
++	ft->buf = malloc(ft->cap);
++	if (ft->buf == NULL) ft->cap = 0;
++	ft->named = [[NSMutableIndexSet alloc] init];
++	return ft;
++}
++
++/* the gpass lines of a command buffer the GPU is done with (or never had): the core's passes as it timed them */
++static void
++hm_ft_gpasses(struct hm_ft_rec *ft, hakios_metal_cb *cb)
++{
++	const int n = hakios_metal_cb_pass_time(cb, 0, NULL, NULL, NULL, NULL, NULL);
++
++	for (int i = 0; i < n; i++) {
++		unsigned kind = 0, width = 0, height = 0, draws = 0, attached = 0, touched = 0;
++		double us = 0;
++		char why[300];
++		int tiles;
++
++		if (hakios_metal_cb_pass_time(cb, (unsigned)i, &kind, &width, &height, &draws, &us) < 0) break;
++		tiles = hakios_metal_cb_pass_tiles(cb, (unsigned)i);
++		(void)hakios_metal_cb_pass_attachments(cb, (unsigned)i, &attached, &touched);
++		hm_ft_line(ft, "gpass i=%d kind=%s w=%u h=%u draws=%u us=%.1f mode=%s tiles=%d attached=0x%x touched=0x%x why=%s\n", i,
++			   HM_FT_NAME(kind, "draw", "copy", "clear", "dispatch"), width, height, draws, us,
++			   kind != 0 ? "-" : tiles > 0 ? "gmem" : "sysmem", MAX(tiles, 0), attached, touched,
++			   hm_ft_q(why, sizeof(why), hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i)));
++	}
++}
++
++/* --- what a draw's vertices cover --- */
++
++/*
++ * The pixels a draw's vertices land on (BOX: x0 y0 x1 y1, not clipped), from a convention every vertex function of
++ * CoreAnimation's keeps (QuartzCore's default.metallib of 20H392, its AIR read on the host): its mvp_matrix, a
++ * float4x4, at [[buffer(2)]]. Each position times it, divided by w, through the viewport. The positions are attribute
++ * 0 of the pipeline's vertex descriptor -- "position", a float4, in every one of its functions that has one (std_vert*,
++ * fixed_vert_*_spc, the blur passes' downsample/upsample) -- or, for fixed_vert_*_gen, which reads its vertices itself,
++ * the records at [[buffer(1)]] laid out as byte 2 of [[buffer(0)]] says (VertexShaderConfig.layout: 0 a 48-byte
++ * SurfaceVertex, float4 first; 1 a LineVertex, float2 first, 12 bytes with fc_base_color and 16 without; 2 a 16-byte
++ * PointVertex, float2 first). NO when any of it is not there or a w is not positive; at most 4096 vertices are read
++ * (*READ of them), the first six positions into POS.
++ */
++static BOOL
++hm_ft_geometry(const struct hm_ft_pipe *p, hakios_metal_buffer *const *vs, const uint64_t *vsOffsets, unsigned vsCount,
++	       const struct hakios_metal_viewport *vp, unsigned start, unsigned count, hakios_metal_buffer *index, unsigned indexType,
++	       uint64_t indexOffset, long baseVertex, float box[4], float pos[12], unsigned *positions, unsigned *read, const char **source)
++{
++	const uint8_t *vertices, *indices = NULL;
++	uint64_t length, indexLength = 0, base;
++	unsigned stride, offset = 0, components, half = 0;
++	float m[16];
++
++	*positions = *read = 0;
++	if (p == NULL || vsCount <= 2 || vs[2] == NULL) return NO;
++	{
++		const uint8_t *mvp = hakios_metal_buffer_contents(vs[2]);
++		const uint64_t ml = hakios_metal_buffer_length(vs[2]);
++
++		if (mvp == NULL || vsOffsets[2] > ml || ml - vsOffsets[2] < 64) return NO;
++		memcpy(m, mvp + vsOffsets[2], 64);
++	}
++	if (p->vdFormat != 0) {
++		switch (p->vdFormat) {
++		case MTLVertexFormatHalf2: components = 2; half = 1; break;
++		case MTLVertexFormatHalf4: components = 4; half = 1; break;
++		case MTLVertexFormatFloat2: components = 2; break;
++		case MTLVertexFormatFloat3: components = 3; break;
++		case MTLVertexFormatFloat4: components = 4; break;
++		default: return NO;
++		}
++		if (p->vdBuffer >= vsCount || vs[p->vdBuffer] == NULL) return NO;
++		vertices = hakios_metal_buffer_contents(vs[p->vdBuffer]);
++		length = hakios_metal_buffer_length(vs[p->vdBuffer]);
++		base = vsOffsets[p->vdBuffer];
++		stride = p->vdStride;
++		offset = p->vdOffset;
++		*source = "vd";
++	} else if (p->fixedVert) {
++		const uint8_t *config;
++		uint64_t cl;
++
++		if (vsCount <= 1 || vs[0] == NULL || vs[1] == NULL || (config = hakios_metal_buffer_contents(vs[0])) == NULL) return NO;
++		cl = hakios_metal_buffer_length(vs[0]);
++		if (vsOffsets[0] > cl || cl - vsOffsets[0] < 4) return NO;
++		switch (config[vsOffsets[0] + 2]) {
++		case 0: stride = 48; components = 4; break;
++		case 1: stride = p->baseColor ? 12 : 16; components = 2; break;
++		case 2: stride = 16; components = 2; break;
++		default: return NO;
++		}
++		vertices = hakios_metal_buffer_contents(vs[1]);
++		length = hakios_metal_buffer_length(vs[1]);
++		base = vsOffsets[1];
++		*source = "cfg";
++	} else {
++		return NO;
++	}
++	if (vertices == NULL || stride == 0 || stride > 4096) return NO;
++	if (index != NULL && (indices = hakios_metal_buffer_contents(index)) == NULL) return NO;
++	if (index != NULL) indexLength = hakios_metal_buffer_length(index);
++	box[0] = box[1] = INFINITY;
++	box[2] = box[3] = -INFINITY;
++	for (unsigned i = 0; i < count && *read < 4096; i++) {
++		const unsigned bytes = components * (half ? 2u : 4u);
++		float c[4] = { 0, 0, 0, 1 };
++		uint64_t v, at;
++
++		if (indices != NULL) {
++			const unsigned size = indexType == MTLIndexTypeUInt32 ? 4 : 2;
++			uint32_t x = 0;
++
++			at = indexOffset + (uint64_t)i * size;
++			if (at + size > indexLength) return NO;
++			memcpy(&x, indices + at, size);
++			if (x == (size == 4 ? 0xffffffffu : 0xffffu)) continue;   /* primitive restart */
++			if ((long)x + baseVertex < 0) return NO;
++			v = (uint64_t)((long)x + baseVertex);
++		} else {
++			v = (uint64_t)start + i;
++		}
++		at = base + v * stride + offset;
++		if (at < base || at + bytes > length) return NO;
++		for (unsigned k = 0; k < components; k++) {
++			if (half) {
++				__fp16 h;
++
++				memcpy(&h, vertices + at + 2 * k, 2);
++				c[k] = (float)h;
++			} else {
++				memcpy(&c[k], vertices + at + 4 * k, 4);
++			}
++		}
++		{
++			const float cx = m[0] * c[0] + m[4] * c[1] + m[8] * c[2] + m[12] * c[3];
++			const float cy = m[1] * c[0] + m[5] * c[1] + m[9] * c[2] + m[13] * c[3];
++			const float cw = m[3] * c[0] + m[7] * c[1] + m[11] * c[2] + m[15] * c[3];
++			float x, y;
++
++			if (!(cw > 0)) return NO;
++			x = (float)(vp->x + (cx / cw + 1) * 0.5 * vp->width);
++			y = (float)(vp->y + (1 - cy / cw) * 0.5 * vp->height);
++			if (!isfinite(x) || !isfinite(y)) return NO;
++			box[0] = MIN(box[0], x);
++			box[1] = MIN(box[1], y);
++			box[2] = MAX(box[2], x);
++			box[3] = MAX(box[3], y);
++			if (*positions < 6) {
++				pos[2 * *positions] = x;
++				pos[2 * *positions + 1] = y;
++				(*positions)++;
++			}
++			(*read)++;
++		}
++	}
++	return *read > 0;
++}
++
++/* the size of the attachment a pass draws into: colour 0's level, or the first other colour attachment's, or depth's */
++static void
++hm_ft_window(const struct hakios_metal_render_pass *pass, unsigned *w, unsigned *h)
++{
++	hakios_metal_texture *t = pass->color0;
++	unsigned level = pass->color0_level;
++
++	for (unsigned i = 0; t == NULL && i < 7; i++) {
++		t = pass->more[i].texture;
++		level = pass->more[i].level;
++	}
++	if (t == NULL) {
++		t = pass->depth;
++		level = pass->depth_level;
++	}
++	*w = t != NULL ? MAX(hakios_metal_texture_width(t) >> level, 1u) : 0;
++	*h = t != NULL ? MAX(hakios_metal_texture_height(t) >> level, 1u) : 0;
++}
++
++/* --- a render pass's attachments, as the descriptor gives them --- */
++
++static void
++hm_ft_attachment(struct hm_ft_rec *ft, unsigned enc, const char *slot, MTLRenderPassAttachmentDescriptor *a, const char *clear)
++{
++	id t = [a texture];
++	char resolve[48] = "";
++
++	if (t == nil || ![t isKindOfClass:[HakiosMetalTexture class]]) {
++		if (t != nil) hm_ft_line(ft, "att enc=%u slot=%s foreign=%s\n", enc, slot, class_getName(object_getClass(t)));
++		return;
++	}
++	if ([a resolveTexture] != nil && [[a resolveTexture] isKindOfClass:[HakiosMetalTexture class]]) {
++		snprintf(resolve, sizeof(resolve), " resolve=%llu", (unsigned long long)[(HakiosMetalTexture *)[a resolveTexture] hakiosFtName:ft]);
++	}
++	hm_ft_line(ft, "att enc=%u slot=%s tex=%llu lvl=%lu slice=%lu plane=%lu load=%s store=%s %s%s\n", enc, slot,
++		   (unsigned long long)[(HakiosMetalTexture *)t hakiosFtName:ft], (unsigned long)[a level], (unsigned long)[a slice],
++		   (unsigned long)[a depthPlane], HM_FT_LOAD([a loadAction]), HM_FT_STORE([a storeAction]), clear, resolve);
++}
++
++/* the enc line of a render (or parallel) encoder and an att line for each attachment of D */
++static void
++hm_ft_pass(struct hm_ft_rec *ft, unsigned enc, const char *kind, MTLRenderPassDescriptor *d)
++{
++	char clear[96];
++
++	hm_ft_line(ft, "enc i=%u kind=%s t=%.6f rt=%lux%lu\n", enc, kind, hm_now(), (unsigned long)[d renderTargetWidth],
++		   (unsigned long)[d renderTargetHeight]);
++	for (NSUInteger i = 0; i < 8; i++) {
++		MTLRenderPassColorAttachmentDescriptor *c = [[d colorAttachments] objectAtIndexedSubscript:i];
++		MTLClearColor cc = [c clearColor];
++		char slot[8];
++
++		snprintf(slot, sizeof(slot), "c%lu", (unsigned long)i);
++		snprintf(clear, sizeof(clear), "clear=%g,%g,%g,%g", cc.red, cc.green, cc.blue, cc.alpha);
++		if (c != nil) hm_ft_attachment(ft, enc, slot, c, clear);
++	}
++	snprintf(clear, sizeof(clear), "clear=%g", [[d depthAttachment] clearDepth]);
++	hm_ft_attachment(ft, enc, "depth", [d depthAttachment], clear);
++	snprintf(clear, sizeof(clear), "clear=%u", [[d stencilAttachment] clearStencil]);
++	hm_ft_attachment(ft, enc, "stencil", [d stencilAttachment], clear);
++	if ([d visibilityResultBuffer] != nil) hm_ft_line(ft, "att enc=%u slot=visibility\n", enc);
++}
++
++/* the dbuf lines of one stage's buffer table (D the draw or dispatch, KEY "d" or "op"), each with its first 64 bytes */
++static void
++hm_ft_buffers(struct hm_ft_rec *ft, const char *key, unsigned d, const char *stage, HakiosMetalBuffer *const *table, const uint64_t *offsets,
++	      unsigned count, uint32_t used, BOOL known)
++{
++	for (unsigned i = 0; i < count; i++) {
++		hakios_metal_buffer *b = table[i] != nil ? [table[i] hakiosBuffer] : NULL;
++		const uint8_t *bytes = b != NULL ? hakios_metal_buffer_contents(b) : NULL;
++		const uint64_t length = b != NULL ? hakios_metal_buffer_length(b) : 0;
++		char hex[2 * 64 + 1] = "";
++
++		if (b == NULL) continue;
++		if (bytes != NULL && offsets[i] < length) hm_ft_hex(hex, bytes + offsets[i], (size_t)MIN(length - offsets[i], 64));
++		hm_ft_line(ft, "dbuf %s=%u stage=%s slot=%u buf=0x%llx len=%llu off=%llu used=%s hex=%s\n", key, d, stage, i,
++			   (unsigned long long)hakios_metal_buffer_gpu_address(b), (unsigned long long)length, (unsigned long long)offsets[i],
++			   !known ? "?" : (used >> i) & 1 ? "1" : "0", hex[0] != '\0' ? hex : "-");
++	}
++}
++
++/* the resources STAGE of PROGRAM declares, as masks: textures and images by index (two words), samplers, buffers */
++static BOOL
++hm_ft_used(hakios_metal_program *program, unsigned stage, uint64_t textures[2], uint32_t *samplers, uint32_t *buffers)
++{
++	const unsigned n = program != NULL ? hakios_metal_program_resource_count(program, stage) : 0;
++
++	textures[0] = textures[1] = 0;
++	*samplers = *buffers = 0;
++	if (program == NULL) return NO;
++	for (unsigned i = 0; i < n; i++) {
++		unsigned kind = 0, index = 0, size = 0;
++
++		if (hakios_metal_program_resource(program, stage, i, &kind, &index, &size) != 0) continue;
++		if ((kind == HAKIOS_METAL_RESOURCE_TEXTURE || kind == HAKIOS_METAL_RESOURCE_IMAGE) && index < 128) textures[index / 64] |= 1ull << (index % 64);
++		else if (kind == HAKIOS_METAL_RESOURCE_SAMPLER && index < 32) *samplers |= 1u << index;
++		else if ((kind == HAKIOS_METAL_RESOURCE_CONSTANT_BUFFER || kind == HAKIOS_METAL_RESOURCE_DEVICE_BUFFER) && index < 32) *buffers |= 1u << index;
++	}
++	return YES;
++}
++
++/* the dtex and dsamp lines of one stage's tables: a texture with the sampler at its own index, a sampler with no
++ * texture beside it on its own */
++static void
++hm_ft_textures(struct hm_ft_rec *ft, const char *key, unsigned d, const char *stage, HakiosMetalTexture *const *textures, unsigned textureCount,
++	       HakiosMetalSamplerState *const *samplers, unsigned samplerCount, const uint64_t used[2], uint32_t usedSamplers, BOOL known)
++{
++	for (unsigned i = 0; i < textureCount; i++) {
++		char samp[40] = "";
++
++		if (textures[i] == nil) continue;
++		if (i < samplerCount && samplers[i] != nil) snprintf(samp, sizeof(samp), " samp=%llu", (unsigned long long)[samplers[i] hakiosFtName:ft]);
++		hm_ft_line(ft, "dtex %s=%u stage=%s slot=%u tex=%llu used=%s%s\n", key, d, stage, i, (unsigned long long)[textures[i] hakiosFtName:ft],
++			   !known ? "?" : (used[i / 64] >> (i % 64)) & 1 ? "1" : "0", samp);
++	}
++	for (unsigned i = 0; i < samplerCount; i++) {
++		if (samplers[i] == nil || (i < textureCount && textures[i] != nil)) continue;
++		hm_ft_line(ft, "dsamp %s=%u stage=%s slot=%u samp=%llu used=%s\n", key, d, stage, i, (unsigned long long)[samplers[i] hakiosFtName:ft],
++			   !known ? "?" : (usedSamplers >> i) & 1 ? "1" : "0");
++	}
++}
++
++/* --- a render pipeline's description --- */
++
++/* a function's constants: the ones not 0 as "index=value ...", and a key over all of them */
++static uint32_t
++hm_ft_constants(const hakios_metal_constant *c, unsigned count, char *out, size_t size)
++{
++	uint32_t key = 2166136261u;
++	size_t at = 0;
++
++	out[0] = '\0';
++	for (unsigned i = 0; i < count; i++) {
++		key = hm_ft_fnv(&c[i].index, sizeof(c[i].index), key);
++		key = hm_ft_fnv(&c[i].bits, sizeof(c[i].bits), key);
++		if (c[i].bits != 0) hm_ft_cat(out, size, &at, "%s%u=%llu", at != 0 ? " " : "", c[i].index, (unsigned long long)c[i].bits);
++	}
++	return key;
++}
++
++/* the value CONSTANTS give the function constant NAME of FUNCTION, -1 when it declares none of that name or none was given */
++static long long
++hm_ft_constant_named(id function, NSString *name, const hakios_metal_constant *constants, unsigned count)
++{
++	MTLFunctionConstant *c = function != nil && [function respondsToSelector:@selector(functionConstantsDictionary)] ?
++		[[function functionConstantsDictionary] objectForKey:name] : nil;
++
++	for (unsigned i = 0; c != nil && i < count; i++) {
++		if (constants[i].index == (unsigned)[c index]) return (long long)constants[i].bits;
++	}
++	return -1;
++}
++
++/*
++ * The description of a render pipeline that metal_trace=frame writes the first time a recorded command buffer draws
++ * with it, made with the pipeline: its pipe line -- the functions, their labels (CoreAnimation's names for its variants),
++ * the constants each was specialised with and a key over them, where each stage's code came from (VS_FROM, FS_FROM:
++ * hm_bitcode_for's choice), the uber shader's deciding buffer, framebuffer fetch (the core's word when it has
++ * hakios_metal_program_fs_traits, else CoreAnimation's fc_framebuffer_fetch constant), how long the pipeline took to
++ * make -- and a pblend line for each colour attachment.
++ */
++static struct hm_ft_pipe *
++hm_ft_pipe_new(MTLRenderPipelineDescriptor *d, id vs, id fs, hakios_metal_program *program, const char *vsFrom, const char *fsFrom,
++	       const hakios_metal_constant *vsConstants, unsigned vsCount, const hakios_metal_constant *fsConstants, unsigned fsCount,
++	       uint64_t id, int specBinding, unsigned specLength, double began, double ended)
++{
++	struct hm_ft_pipe *p = calloc(1, sizeof(*p));
++	char *lines = NULL, vsfc[600], fsfc[600], q[10][400], fb[48], discard[8], vd[64] = "none", tmp[24], tmp2[24], tmp3[24];
++	MTLVertexAttributeDescriptor *a0 = [[[d vertexDescriptor] attributes] objectAtIndexedSubscript:0];
++	NSString *askedVs = vs != nil ? objc_getAssociatedObject(vs, &hm_ft_asked_key) : nil;
++	NSString *askedFs = fs != nil ? objc_getAssociatedObject(fs, &hm_ft_asked_key) : nil;
++	char vsWhere[300], fsWhere[300];
++	const uint32_t vsKey = hm_ft_constants(vsConstants, vsCount, vsfc, sizeof(vsfc));
++	const uint32_t fsKey = hm_ft_constants(fsConstants, fsCount, fsfc, sizeof(fsfc));
++	size_t at = 0, size = 8192;
++
++	if (p == NULL || (lines = malloc(size)) == NULL) {
++		free(p);
++		return NULL;
++	}
++	if (a0 != nil && [a0 format] != MTLVertexFormatInvalid) {
++		MTLVertexBufferLayoutDescriptor *l = [[[d vertexDescriptor] layouts] objectAtIndexedSubscript:[a0 bufferIndex]];
++
++		p->vdFormat = (unsigned)[a0 format];
++		p->vdOffset = (unsigned)[a0 offset];
++		p->vdBuffer = (unsigned)[a0 bufferIndex];
++		p->vdStride = l != nil ? (unsigned)[l stride] : 0;
++		snprintf(vd, sizeof(vd), "f%u+%u@b%u/%u", p->vdFormat, p->vdOffset, p->vdBuffer, p->vdStride);
++	}
++	p->fixedVert = [[vs name] hasPrefix:@"fixed_vert_"];
++	p->baseColor = hm_ft_constant_named(vs, @"fc_base_color", vsConstants, vsCount) > 0;
++	if (hm_ft_fs_traits != NULL) {
++		const unsigned traits = hm_ft_fs_traits(program);
++
++		snprintf(fb, sizeof(fb), "0x%x", traits & 0xff);
++		snprintf(discard, sizeof(discard), "%u", (traits >> 8) & 1);
++	} else {
++		const long long v = hm_ft_constant_named(fs, @"fc_framebuffer_fetch", fsConstants, fsCount);
++
++		snprintf(fb, sizeof(fb), v < 0 ? "?" : v ? "fc:1" : "fc:0");
++		strlcpy(discard, "?", sizeof(discard));
++	}
++	if (askedVs != nil) snprintf(vsWhere, sizeof(vsWhere), "asked:%s;%s", [askedVs UTF8String], vsFrom);
++	else strlcpy(vsWhere, vsFrom, sizeof(vsWhere));
++	if (askedFs != nil) snprintf(fsWhere, sizeof(fsWhere), "asked:%s;%s", [askedFs UTF8String], fsFrom);
++	else strlcpy(fsWhere, fsFrom, sizeof(fsWhere));
++	hm_ft_cat(lines, size, &at, "pipe id=%llu label=%s vs=%s fs=%s vs_label=%s fs_label=%s vs_from=%s fs_from=%s vs_fc=%s fs_fc=%s vs_key=%08x "
++		  "fs_key=%08x prog=%s vs_words=%u fs_words=%u spec_slot=%d spec_len=%u fbfetch=%s discard=%s samples=%lu depth=%s stencil=%s vd=%s "
++		  "created=%.6f compile_ms=%.3f\n", (unsigned long long)id, hm_ft_qs(q[0], sizeof(q[0]), [d label]),
++		  hm_ft_qs(q[1], sizeof(q[1]), [vs name]), hm_ft_qs(q[2], sizeof(q[2]), fs != nil ? [fs name] : nil),
++		  hm_ft_qs(q[3], sizeof(q[3]), [vs respondsToSelector:@selector(label)] ? [vs label] : nil),
++		  hm_ft_qs(q[4], sizeof(q[4]), [fs respondsToSelector:@selector(label)] ? [fs label] : nil), hm_ft_q(q[5], sizeof(q[5]), vsWhere),
++		  hm_ft_q(q[6], sizeof(q[6]), fsWhere), hm_ft_q(q[7], sizeof(q[7]), vsfc), hm_ft_q(q[8], sizeof(q[8]), fsfc), vsKey, fsKey,
++		  hm_ft_q(q[9], sizeof(q[9]), hakios_metal_program_name(program)), hakios_metal_program_stage_words(program, 0),
++		  hakios_metal_program_stage_words(program, 1), specBinding, specLength, fb, discard, (unsigned long)[d rasterSampleCount],
++		  hm_ft_format((unsigned)[d depthAttachmentPixelFormat], tmp, sizeof(tmp)),
++		  hm_ft_format((unsigned)[d stencilAttachmentPixelFormat], tmp2, sizeof(tmp2)), vd, began, (ended - began) * 1e3);
++	for (NSUInteger i = 0; i < 8; i++) {
++		MTLRenderPipelineColorAttachmentDescriptor *c = [[d colorAttachments] objectAtIndexedSubscript:i];
++		char mask[8];
++
++		if (c == nil || [c pixelFormat] == MTLPixelFormatInvalid) continue;
++		hm_ft_cat(lines, size, &at, "pblend pipe=%llu att=%lu fmt=%s on=%d rgb=%s alpha=%s src=%s dst=%s srca=%s dsta=%s mask=%s\n",
++			  (unsigned long long)id, (unsigned long)i, hm_ft_format((unsigned)[c pixelFormat], tmp3, sizeof(tmp3)), [c isBlendingEnabled] ? 1 : 0,
++			  HM_FT_BLENDOP([c rgbBlendOperation]), HM_FT_BLENDOP([c alphaBlendOperation]), HM_FT_FACTOR([c sourceRGBBlendFactor]),
++			  HM_FT_FACTOR([c destinationRGBBlendFactor]), HM_FT_FACTOR([c sourceAlphaBlendFactor]),
++			  HM_FT_FACTOR([c destinationAlphaBlendFactor]), hm_ft_mask((unsigned)[c writeMask], mask));
++	}
++	p->lines = lines;
++	return p;
++}
++
++static void
++hm_ft_pipe_free(struct hm_ft_pipe *p)
++{
++	if (p != NULL) free(p->lines);
++	free(p);
++}
++
++/* --- debug groups --- */
++
++/*
++ * An encoder's or a command buffer's debug groups and signposts (the names a client gives what it draws, when it gives
++ * any) into the record, then on to the base class's own method, which answers as it always did. Added at run time,
++ * only while the switch is on and only where the base class has the method, so that with the switch off -- or in a
++ * Metal whose base classes have no such method -- nothing about these messages changes.
++ */
++static void
++hm_ft_debug_methods(void)
++{
++	Class classes[4] = { [HakiosMetalRenderCommandEncoder class], [HakiosMetalBlitCommandEncoder class], [HakiosMetalComputeCommandEncoder class],
++			     [HakiosMetalCommandBuffer class] };
++
++	for (int k = 0; k < 4; k++) {
++		const Class c = classes[k], base = class_getSuperclass(c);
++		SEL push = @selector(pushDebugGroup:), pop = @selector(popDebugGroup), sign = @selector(insertDebugSignpost:);
++		Method m;
++
++		if ((m = class_getInstanceMethod(base, push)) != NULL && class_getInstanceMethod(c, push) == m) {
++			void (*original)(id, SEL, NSString *) = (void (*)(id, SEL, NSString *))method_getImplementation(m);
++
++			class_addMethod(c, push, imp_implementationWithBlock(^(id self, NSString *s) {
++				[self hakiosFtDebug:"push" string:s];
++				original(self, push, s);
++			}), method_getTypeEncoding(m));
++		}
++		if ((m = class_getInstanceMethod(base, sign)) != NULL && class_getInstanceMethod(c, sign) == m) {
++			void (*original)(id, SEL, NSString *) = (void (*)(id, SEL, NSString *))method_getImplementation(m);
++
++			class_addMethod(c, sign, imp_implementationWithBlock(^(id self, NSString *s) {
++				[self hakiosFtDebug:"signpost" string:s];
++				original(self, sign, s);
++			}), method_getTypeEncoding(m));
++		}
++		if ((m = class_getInstanceMethod(base, pop)) != NULL && class_getInstanceMethod(c, pop) == m) {
++			void (*original)(id, SEL) = (void (*)(id, SEL))method_getImplementation(m);
++
++			class_addMethod(c, pop, imp_implementationWithBlock(^(id self) {
++				[self hakiosFtDebug:"pop" string:nil];
++				original(self, pop);
++			}), method_getTypeEncoding(m));
++		}
++	}
++}
++
++/* a debug line of encoder ENC (-1: the command buffer's own) */
++static void
++hm_ft_debug(struct hm_ft_rec *ft, int enc, const char *what, NSString *string)
++{
++	char q[400];
++
++	if (ft != NULL) hm_ft_line(ft, "debug enc=%d op=%s text=%s\n", enc, what, hm_ft_qs(q, sizeof(q), string));
++}
++
++/* --- one blit's line, whatever way the method that makes it returns --- */
++
++/*
++ * A blit method declares HM_FT_BLIT(cb) first and, when FTB.FT is set, says in FTB.WHAT what it copies; the line is
++ * written as the method returns, by way it returns, with the core passes the copy made and what became of it (the
++ * buffer's refusal count or error moving: the plug-in's own refusals go the same road as the core's).
++ */
++struct hm_ft_blit {
++	struct hm_ft_rec *ft;
++	hakios_metal_cb *cb;
++	unsigned enc, before, skipped;
++	BOOL failed;
++	char what[700];
++};
++
++static void
++hm_ft_blit_end(struct hm_ft_blit *b)
++{
++	const char *last = NULL;
++	char q[300];
++	unsigned opened;
++	int core;
++
++	if (b->ft == NULL) return;
++	core = hm_ft_core(b->ft, b->cb, b->before, &opened);
++	if (hakios_metal_cb_skipped(b->cb, &last) != b->skipped) {
++		snprintf(q, sizeof(q), "skipped: %s", last != NULL ? last : "");
++	} else if (!b->failed && hakios_metal_cb_error(b->cb)[0] != '\0') {
++		snprintf(q, sizeof(q), "failed: %s", hakios_metal_cb_error(b->cb));
++	} else {
++		strlcpy(q, "ok", sizeof(q));
++	}
++	{
++		char quoted[320];
++
++		hm_ft_line(b->ft, "blit i=%u enc=%u %s core=%d n=%u res=%s\n", hm_ft_next(b->ft, &b->ft->ops), b->enc, b->what,
++			   opened != 0 ? core - (int)opened + 1 : -1, opened, hm_ft_q(quoted, sizeof(quoted), q));
++	}
++}
++
++#define HM_FT_BLIT(cbexpr)								\
++	struct hm_ft_blit ftb __attribute__((cleanup(hm_ft_blit_end)));		\
++	ftb.ft = _ftrace;								\
++	if (ftb.ft != NULL) {								\
++		const char *ftbLast_ = NULL;						\
++		ftb.cb = (cbexpr);							\
++		ftb.enc = _ftEnc;							\
++		ftb.before = hm_ft_total(ftb.cb);					\
++		ftb.skipped = hakios_metal_cb_skipped(ftb.cb, &ftbLast_);		\
++		ftb.failed = hakios_metal_cb_error(ftb.cb)[0] != '\0';			\
++		strlcpy(ftb.what, "op=?", sizeof(ftb.what));				\
++	}
++
+ /* ============================================================================================================
+  * The device
+  * ============================================================================================================ */
+@@ -1652,11 +2761,13 @@ - (void)hakiosTakeResolves:(MTLRenderPassDescriptor *)descriptor;
+ }
+ 
+ /* The module to compile for FUNCTION (of the pipeline labelled PIPELINE, vertex stage or not): its variant when
+- * CoreAnimation's labels name one, else what the function itself has. */
++ * CoreAnimation's labels name one, else what the function itself has. HOW (when not NULL) says which, for
++ * metal_trace=frame: "variant:LABEL", "nearest:LABEL(for WANTED)", "instead:inplace_copy(edr_scale)", "own". */
+ static NSData *
+-hm_bitcode_for(id function, NSString *pipeline, BOOL vertex)
++hm_bitcode_for_how(id function, NSString *pipeline, BOOL vertex, char *how, size_t howSize)
+ {
+ 	static unsigned said;
++	NSString *wanted = nil;
+ 	NSString *name = [function respondsToSelector:@selector(name)] ? [function name] : nil, *label = nil, *chosen = nil;
+ 	NSData *own = ((NSData *(*)(id, SEL))objc_msgSend)(function, sel_getUid("bitcodeData")), *variant = nil;
+ 
+@@ -1691,11 +2802,13 @@ - (void)hakiosTakeResolves:(MTLRenderPassDescriptor *)descriptor;
+ 			hm_print("CoreAnimation's %s: %s (%u times)\n", [name UTF8String], copies[lpf] != nil ?
+ 				 "compiled as inplace_copy, the source as it is" : "no inplace_copy to stand in, its own module", told);
+ 		}
++		if (how != NULL) snprintf(how, howSize, copies[lpf] != nil ? "instead:inplace_copy(edr_scale)" : "own");
+ 		if (copies[lpf] != nil) {
+ 			return copies[lpf];
+ 		}
+ 		return own;
+ 	}
++	if (how != NULL) strlcpy(how, "own", howSize);
+ 	if (name == nil || ![name hasPrefix:@"fixed_"]) {
+ 		return own;
+ 	}
+@@ -1722,11 +2835,17 @@ - (void)hakiosTakeResolves:(MTLRenderPassDescriptor *)descriptor;
+ 			[@"com.apple.coreanimation.frag." stringByAppendingString:[spec substringFromIndex:NSMaxRange(under)]] : nil;
+ 
+ 		if (frag != nil && hm_ca_variants[frag] == nil) {
++			wanted = frag;
+ 			frag = hm_ca_nearest(frag);
+ 		}
+ 		chosen = frag == nil ? nil : (vertex ? hm_ca_frag_vert[frag] : frag);
+ 		variant = chosen != nil ? hm_ca_variants[chosen] : nil;
+ 	}
++	if (how != NULL) {
++		if (variant == nil) strlcpy(how, "own(no variant)", howSize);
++		else if (wanted != nil) snprintf(how, howSize, "nearest:%s(for %s)", [chosen UTF8String], [wanted UTF8String]);
++		else snprintf(how, howSize, "variant:%s", [chosen UTF8String]);
++	}
+ 	if (variant == nil || said++ < 40) {
+ 		hm_print("CoreAnimation's %s (label %s, pipeline %s): %s%s\n", [name UTF8String], label ? [label UTF8String] : "none",
+ 			 pipeline ? [pipeline UTF8String] : "none", variant ? "the variant " : "no variant: its own module",
+@@ -1735,6 +2854,12 @@ - (void)hakiosTakeResolves:(MTLRenderPassDescriptor *)descriptor;
+ 	return variant != nil ? variant : own;
+ }
+ 
++static NSData *
++hm_bitcode_for(id function, NSString *pipeline, BOOL vertex)
++{
++	return hm_bitcode_for_how(function, pipeline, vertex, NULL, 0);
++}
++
+ /* The same choice for UniXNU's Metal on Vulkan (metal_m2v=1), whose functions are its own objects: by the function's name,
+  * its label and the pipeline's (native_bridge_metal_variant_hook, NativeBridgeMetalFrontend.mm: variantFunction()). */
+ static const void *
+@@ -1968,6 +3093,7 @@ + (void)load
+ 	}
+ 	if (other != nil && f != nil) {
+ 		HM_ONCE("the library has no %s: %s stands in for it\n", [name UTF8String], [other UTF8String]);
++		if (hm_ft_mode()) objc_setAssociatedObject(f, &hm_ft_asked_key, name, OBJC_ASSOCIATION_COPY);   /* (metal_trace=frame's pipe line says so) */
+ 	}
+ 	return f;
+ }
+@@ -1985,6 +3111,7 @@ + (void)load
+ 	if (other != nil && f != nil) {
+ 		if (error != NULL) *error = nil;
+ 		HM_ONCE("the library has no %s: %s stands in for it (with constants)\n", [name UTF8String], [other UTF8String]);
++		if (hm_ft_mode()) objc_setAssociatedObject(f, &hm_ft_asked_key, name, OBJC_ASSOCIATION_COPY);
+ 	}
+ 	return f;
+ }
+@@ -3223,6 +4350,8 @@ - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descri
+ 	NSData *vsAir, *fsAir;
+ 	hakios_metal_program *program;
+ 	unsigned format;
++	const double ftBegan = hm_ft_mode() ? hm_now() : 0;   /* metal_trace=frame: how long the pipeline took to make */
++	char vsFrom[300] = "own", fsFrom[300] = "none";       /* ...and where each stage's code came from */
+ 
+ 	hm_describe_function([descriptor fragmentFunction]);
+ 	if (why != nil) {
+@@ -3237,8 +4366,8 @@ - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descri
+ 		return [self hakiosRefuse:error what:"a render pipeline"
+ 				      why:@"a function does not answer bitcodeData, so its AIR cannot be read (not an _MTLFunction of this Metal?)"];
+ 	}
+-	vsAir = hm_bitcode_for(vs, [descriptor label], YES);
+-	fsAir = fs != nil ? hm_bitcode_for(fs, [descriptor label], NO) : nil;   /* nil: the built-in fragment function */
++	vsAir = hm_bitcode_for_how(vs, [descriptor label], YES, ftBegan != 0 ? vsFrom : NULL, sizeof(vsFrom));
++	fsAir = fs != nil ? hm_bitcode_for_how(fs, [descriptor label], NO, ftBegan != 0 ? fsFrom : NULL, sizeof(fsFrom)) : nil;   /* nil: the built-in fragment function */
+ 	if (vsAir == nil || [vsAir length] == 0 || (fs != nil && (fsAir == nil || [fsAir length] == 0))) {
+ 		return [self hakiosRefuse:error what:"a render pipeline"
+ 				      why:[NSString stringWithFormat:@"%@ or %@ has no bitcode", [vs name], [fs name]]];
+@@ -3352,6 +4481,13 @@ - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descri
+ 		unsigned count = fs != nil ? hm_function_constants(fs, fc, 64) : 0;
+ 
+ 		if (state != nil && fsAir != nil) [state hakiosKeepFragment:fsAir constants:fc count:count];
++		if (state != nil && hm_ft_mode()) {
++			hakios_metal_constant vc[64];
++			const unsigned vcount = hm_function_constants(vs, vc, 64);
++
++			[state hakiosSetFtPipe:hm_ft_pipe_new(descriptor, vs, fs, program, vsFrom, fsFrom, vc, vcount, fc, count, [state hakiosUniqueIdentifier],
++							     [state hakiosSpecBinding], [state hakiosSpecLength], ftBegan, hm_now())];
++		}
+ 		return state;
+ 	}
+ }
+@@ -4349,6 +5485,37 @@ - (NSUInteger)iosurfacePlane        { return _iosurfacePlane; }
+  * which is what a sample of a surface another program is still writing could show anyway. */
+ - (BOOL)hakiosIsShadow { return _shadow; }
+ - (BOOL)hakiosIsTurned { return _turnedSurface != NULL; }
++- (unsigned)hakiosTurn { return _turn; }
++
++/* metal_trace=frame: the tex line, the first time a recorded command buffer names this texture. Its memory is what the
++ * analysis follows from pass to pass: an IOSurface's id (s<id>: every texture over that surface is the same pixels),
++ * else the root texture's (t<id>: a view and its parent are one memory), with the level and slice this one starts at */
++- (uint64_t)hakiosFtName:(struct hm_ft_rec *)ft
++{
++	if (hm_ft_first(ft, _uniqueIdentifier)) {
++		HakiosMetalTexture *root = self;
++		unsigned level = 0, slice = 0;
++		char memory[32], label[200], usage[48], format[24], parent[32] = "";
++
++		for (; root->_parent != nil; root = root->_parent) {
++			level += (unsigned)root->_parentLevel;
++			slice += (unsigned)root->_parentSlice;
++		}
++		if (_iosurface != NULL) snprintf(memory, sizeof(memory), "s%u", (unsigned)IOSurfaceGetID(_iosurface));
++		else snprintf(memory, sizeof(memory), "t%llu", (unsigned long long)root->_uniqueIdentifier);
++		if (_parent != nil) snprintf(parent, sizeof(parent), " parent=%llu", (unsigned long long)_parent->_uniqueIdentifier);
++		hm_ft_line(ft, "tex id=%llu mem=%s lvl0=%u slice0=%u w=%u h=%u d=%u type=%s fmt=%s levels=%u samples=%u usage=%s storage=%s origin=%s "
++			   "surface=%u%s%s%s%s%s label=%s\n", (unsigned long long)_uniqueIdentifier, memory, level, slice, hakios_metal_texture_width(_texture),
++			   hakios_metal_texture_height(_texture), hakios_metal_texture_depth(_texture), HM_FT_TTYPE(hakios_metal_texture_type(_texture)),
++			   hm_ft_format((unsigned)[self pixelFormat], format, sizeof(format)), hakios_metal_texture_levels(_texture),
++			   hakios_metal_texture_samples(_texture), hm_ft_usage(_usage, usage),
++			   HM_FT_STORAGE((_askedOptions >> MTLResourceStorageModeShift) & 0xf), HM_FT_ORIGIN(hakios_metal_texture_origin(_texture)),
++			   _iosurface != NULL ? (unsigned)IOSurfaceGetID(_iosurface) : 0u, parent, _shadow ? " shadow=1" : "",
++			   _turnedSurface != NULL ? " turned=1" : "", _ycbcr != 0 ? " ycbcr=1" : "", _swizzled ? " swizzled=1" : "",
++			   hm_ft_qs(label, sizeof(label), [self label]));
++	}
++	return _uniqueIdentifier;
++}
+ 
+ - (void)hakiosSetTurned:(hakios_metal_texture *)surface rotation:(unsigned)rotation
+ {
+@@ -4873,6 +6040,21 @@ - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device sampler:(hakios
+ 	}
+ 	_hakiosSampler = sampler;
+ 	_hakiosUniqueIdentifier = hm_next_resource_id();
++	if (!hm_ft_mode()) {
++		return self;   /* (the fields below are metal_trace=frame's alone) */
++	}
++	_hakiosDesc.min_filter = (unsigned)[descriptor minFilter];
++	_hakiosDesc.mag_filter = (unsigned)[descriptor magFilter];
++	_hakiosDesc.mip_filter = (unsigned)[descriptor mipFilter];
++	_hakiosDesc.s_address = (unsigned)[descriptor sAddressMode];
++	_hakiosDesc.t_address = (unsigned)[descriptor tAddressMode];
++	_hakiosDesc.r_address = (unsigned)[descriptor rAddressMode];
++	_hakiosDesc.normalized_coordinates = [descriptor normalizedCoordinates] ? 1 : 0;
++	_hakiosDesc.lod_min_clamp = [descriptor lodMinClamp];
++	_hakiosDesc.lod_max_clamp = [descriptor lodMaxClamp];
++	_hakiosDesc.max_anisotropy = (unsigned)[descriptor maxAnisotropy];
++	_hakiosDesc.compare_function = (unsigned)[descriptor compareFunction];
++	_hakiosDesc.border_color = (unsigned)[descriptor borderColor];
+ 	return self;
+ }
+ 
+@@ -4886,6 +6068,22 @@ - (void)dealloc
+ 
+ - (hakios_metal_sampler *)hakiosSampler { return _hakiosSampler; }
+ 
++/* metal_trace=frame: the samp line, the first time a recorded command buffer binds this sampler */
++- (uint64_t)hakiosFtName:(struct hm_ft_rec *)ft
++{
++	if (hm_ft_first(ft, _hakiosUniqueIdentifier)) {
++		char label[200];
++
++		hm_ft_line(ft, "samp id=%llu min=%s mag=%s mip=%s s=%s t=%s r=%s norm=%d aniso=%u cmp=%s border=%u lod=%g,%g label=%s\n",
++			   (unsigned long long)_hakiosUniqueIdentifier, HM_FT_FILTER(_hakiosDesc.min_filter), HM_FT_FILTER(_hakiosDesc.mag_filter),
++			   HM_FT_MIP(_hakiosDesc.mip_filter), HM_FT_ADDRESS(_hakiosDesc.s_address), HM_FT_ADDRESS(_hakiosDesc.t_address),
++			   HM_FT_ADDRESS(_hakiosDesc.r_address), _hakiosDesc.normalized_coordinates, _hakiosDesc.max_anisotropy,
++			   HM_FT_COMPARE(_hakiosDesc.compare_function), _hakiosDesc.border_color, (double)_hakiosDesc.lod_min_clamp,
++			   (double)_hakiosDesc.lod_max_clamp, hm_ft_qs(label, sizeof(label), [(id<MTLSamplerState>)self label]));
++	}
++	return _hakiosUniqueIdentifier;
++}
++
+ /* The base's -gpuResourceID is -gpuHandle is -uniqueIdentifier, and the last is a nil-stub: a sampler would have
+  * gpuResourceID 0, which an argument-buffer encoder would write as a handle. uniqueIdentifier is answered from the
+  * textures' counter (never 0, never an address); gpuResourceID is the core's id, what an argument buffer holds for the
+@@ -5206,9 +6404,12 @@ - (instancetype)initWithHakiosQueue:(HakiosMetalCommandQueue *)queue
+ 	_queue = [queue retain];
+ 	_cb = hakios_metal_cb_new([queue hakiosQueue]);
+ 	_createdAt = hm_now();
++	if (hm_ft_mode()) {
++		_ftrace = hm_ft_take(_createdAt);   /* metal_trace=frame: NULL unless a capture wants this buffer */
++	}
+ 	if (_cb != NULL) {
+ 		hakios_metal_cb_skip_refused(_cb, !hm_strict());
+-		hakios_metal_cb_set_profile(_cb, hm_fps_on());
++		hakios_metal_cb_set_profile(_cb, hm_fps_on() || _ftrace != NULL);   /* (a recorded buffer's passes are timed, for its gpass lines) */
+ 		hakios_metal_cb_set_gmem(_cb, hm_gmem_on() || hm_gmem_draws() != 0);
+ 		hakios_metal_cb_set_gmem_min_draws(_cb, hm_gmem_draws());
+ 		hakios_metal_cb_set_gmem_binning(_cb, (hm_gmem_off() & 16) == 0);   /* metal_gmem_off's 16: every draw in every tile */
+@@ -5252,6 +6453,9 @@ - (void)hakiosPaySlot
+ - (void)dealloc
+ {
+ 	[self hakiosPaySlot];
++	if (_ftrace != NULL) {
++		[self hakiosFtFinish];   /* metal_trace=frame: a buffer never committed is written as it was left */
++	}
+ 	if (_cb != NULL) {
+ 		hakios_metal_cb_free(_cb);   /* one in flight is waited for inside; one completed is not */
+ 	}
+@@ -5269,6 +6473,61 @@ - (void)dealloc
+ }
+ 
+ - (hakios_metal_cb *)hakiosCommandBuffer { return _cb; }
++- (struct hm_ft_rec *)hakiosFrameTrace { return _ftrace; }
++- (void)hakiosFtDebug:(const char *)what string:(NSString *)string { hm_ft_debug(_ftrace, -1, what, string); }
++
++/*
++ * metal_trace=frame: this buffer's record, written once the GPU is done with it -- its cb line, the lines its encoders
++ * recorded, the core's passes as the GPU timed them, endcb -- by whichever of -commit's return and the completion comes
++ * second (each is one of FT's two phases), or by -dealloc for a buffer never committed. The recorder goes with it.
++ */
++- (void)hakiosFtFinish
++{
++	struct hm_ft_rec *ft = _ftrace;
++	unsigned passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, skipped = 0;
++	const char *last = "";
++	char label[300], queue[300], error[600], skip[600], refusal[600], *head = NULL, *record;
++	int n;
++
++	_ftrace = NULL;
++	if (_cb != NULL) {
++		hakios_metal_cb_counts(_cb, &passes, &draws, &dispatches, &copies, &clears);
++		hakios_metal_cb_gmem_counts(_cb, &gmemPasses, &tiles);
++		skipped = hakios_metal_cb_skipped(_cb, &last);
++		hm_ft_gpasses(ft, _cb);
++	}
++	hm_ft_line(ft, "endcb seq=%u\n", ft->seq);
++	n = asprintf(&head, "cb seq=%u capture=%u serial=%u label=%s queue=%s qid=%p created=%.6f committed=%.6f scheduled=%.6f completed=%.6f "
++		     "gpu_us=%.1f status=%s error=%s held=%d encoders=%u draws=%u ops=%u core_passes=%u core_draws=%u core_dispatches=%u "
++		     "core_copies=%u core_clears=%u gmem_passes=%u tiles=%u skipped=%u skip_last=%s gmem_refusal=%s\n", ft->seq, ft->capture->number,
++		     ft->serial, hm_ft_qs(label, sizeof(label), [self label]), hm_ft_qs(queue, sizeof(queue), [_queue label]), (void *)_queue,
++		     ft->created, ft->committed, ft->scheduled, ft->completed, _cb != NULL ? (double)hakios_metal_cb_gpu_nanoseconds(_cb) / 1e3 : 0.0,
++		     _cb != NULL ? HM_FT_STATUS(hakios_metal_cb_status(_cb)) : "nocb",
++		     hm_ft_q(error, sizeof(error), _cb != NULL ? hakios_metal_cb_error(_cb) : "no command buffer"), ft->held ? 1 : 0, ft->encoders,
++		     ft->draws, ft->ops, passes, draws, dispatches, copies, clears, gmemPasses, tiles, skipped,
++		     hm_ft_q(skip, sizeof(skip), skipped != 0 ? last : ""), hm_ft_q(refusal, sizeof(refusal), _cb != NULL ? hakios_metal_cb_gmem_refusal(_cb) : ""));
++	record = n > 0 ? malloc((size_t)n + ft->len) : NULL;
++	if (record != NULL) {
++		memcpy(record, head, (size_t)n);
++		if (ft->len != 0) memcpy(record + n, ft->buf, ft->len);
++		hm_ft_write(ft->capture, record, (size_t)n + ft->len);
++	}
++	free(head);
++	free(ft->buf);
++	[ft->named release];
++	pthread_mutex_destroy(&ft->lock);
++	free(ft);
++}
++
++/* one of the two moments a recorded buffer's record waits for: -commit's return (SCHEDULED) or the completion */
++- (void)hakiosFtPhase:(struct hm_ft_rec *)ft scheduled:(BOOL)scheduled
++{
++	if (scheduled) ft->scheduled = hm_now();
++	else ft->completed = hm_now();
++	if (__atomic_add_fetch(&ft->phases, 1, __ATOMIC_ACQ_REL) == 2) {
++		[self hakiosFtFinish];
++	}
++}
+ 
+ - (id)device               { return [_queue device]; }
+ - (id)commandQueue         { return _queue; }
+@@ -5616,12 +6875,19 @@ - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)descriptor
+ 	if (!hm_read_render_pass(descriptor, &pass, &texture, why, sizeof(why))) {
+ 		hm_print("refused: a render pass: %s; the command buffer is failed and no encoder is returned\n", why);
+ 		hakios_metal_cb_refuse(_cb, why);
++		if (_ftrace != NULL) {
++			char q[300];
++
++			hm_ft_line(_ftrace, "enc i=%u kind=render t=%.6f refused=%s\n", hm_ft_next(_ftrace, &_ftrace->encoders), hm_now(), hm_ft_q(q, sizeof(q), why));
++		}
+ 		return nil;
+ 	}
+ 	{
+ 		HakiosMetalRenderCommandEncoder *encoder = [[[HakiosMetalRenderCommandEncoder alloc] initWithHakiosCommandBuffer:self pass:&pass
+ 													     colorTexture:texture] autorelease];
+ 
++		if (_ftrace != NULL) hm_ft_pass(_ftrace, [encoder hakiosFtIndex], "render", descriptor);   /* metal_trace=frame */
++
+ 		hm_shadow_targets(descriptor, (id<MTLCommandBuffer>)self);
+ 
+ 		[encoder hakiosTakeResolves:descriptor];   /* hm_read_render_pass judged them */
+@@ -5642,8 +6908,13 @@ - (id)parallelRenderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)desc
+ 		return nil;
+ 	}
+ 	hm_shadow_targets(descriptor, (id<MTLCommandBuffer>)self);
+-	return [[[HakiosMetalParallelRenderCommandEncoder alloc] initWithHakiosCommandBuffer:self pass:&pass colorTexture:texture
+-											descriptor:descriptor] autorelease];
++	{
++		HakiosMetalParallelRenderCommandEncoder *encoder = [[[HakiosMetalParallelRenderCommandEncoder alloc] initWithHakiosCommandBuffer:self pass:&pass
++														     colorTexture:texture descriptor:descriptor] autorelease];
++
++		if (_ftrace != NULL) hm_ft_pass(_ftrace, [encoder hakiosFtIndex], "parallel", descriptor);   /* metal_trace=frame */
++		return encoder;
++	}
+ }
+ 
+ - (id)resourceStateCommandEncoder
+@@ -6347,6 +7618,16 @@ - (void)enqueue
+ 		}
+ 	}
+ 	hm_fps_note(NO, (double)hakios_metal_cb_gpu_nanoseconds(cb) / 1e9, hm_now() - [self GPUStartTime], cb);
++	if (hm_ft_enabled) {
++		struct hm_ft_rec *ft = [self hakiosFrameTrace];
++
++		/* metal_trace=frame: done on the GPU (a pool of its own: the record names labels on a thread that has none) */
++		if (ft != NULL) {
++			@autoreleasepool {
++				[self hakiosFtPhase:ft scheduled:NO];
++			}
++		}
++	}
+ 	/* hakios-metal's queue thread has no autorelease pool of its own, and the NSError built here and whatever a
+ 	 * handler autoreleases would otherwise leak, silently, once per command buffer */
+ 	@autoreleasepool {
+@@ -6364,6 +7645,7 @@ - (void)hakiosTurnAtCommit:(id)texture
+ - (void)commit
+ {
+ 	BOOL met = YES;
++	struct hm_ft_rec *ft = _ftrace;   /* metal_trace=frame: this buffer recorded (the completion cannot write it before -commit returns) */
+ 
+ 	if (_committed) {
+ 		HM_ONCE("a command buffer was committed twice; Metal asserts on that, this plug-in does nothing the second time\n");
+@@ -6371,9 +7653,24 @@ - (void)commit
+ 	}
+ 	_committed = YES;
+ 	_committedAt = hm_now();
++	if (ft != NULL) {
++		char label[300];
++
++		ft->committed = _committedAt;
++		hm_ft_line(ft, "commit t=%.6f label=%s\n", _committedAt, hm_ft_qs(label, sizeof(label), [self label]));
++	}
+ 	/* each turned framebuffer drawn into, laid into its surface by the 2D engine after everything that drew it */
+ 	for (HakiosMetalTexture *t in _turned) {
++		const unsigned before = ft != NULL ? hm_ft_total(_cb) : 0;
++
+ 		[t hakiosTurnInto:_cb];
++		if (ft != NULL) {
++			unsigned opened = 0;
++			const int core = hm_ft_core(ft, _cb, before, &opened);
++
++			hm_ft_line(ft, "blit i=%u enc=-1 op=rotate src=%llu rotation=%u core=%d n=%u res=ok\n", hm_ft_next(ft, &ft->ops),
++				   (unsigned long long)[t hakiosFtName:ft], [t hakiosTurn], opened != 0 ? core - (int)opened + 1 : -1, opened);
++		}
+ 	}
+ 	[self retain];
+ 	for (NSArray *w in _waits) {
+@@ -6385,6 +7682,7 @@ - (void)commit
+ 		NSArray *waits = [_waits copy];
+ 
+ 		_sent = dispatch_semaphore_create(0);
++		if (ft != NULL) ft->held = YES;
+ 		[self retain];
+ 		[_queue hakiosDefer:^{
+ 			for (NSArray *w in waits) {
+@@ -6392,6 +7690,7 @@ - (void)commit
+ 			}
+ 			[waits release];
+ 			hakios_metal_cb_commit(_cb, hm_completed, self);
++			if (ft != NULL) [self hakiosFtPhase:ft scheduled:YES];
+ 			dispatch_semaphore_signal(_sent);
+ 			[self hakiosDeliverScheduled];
+ 			[self release];
+@@ -6404,6 +7703,7 @@ - (void)commit
+ 		hakios_metal_cb_commit(_cb, hm_completed, self);
+ 		hm_fps_commit(hm_now() - began);
+ 	}
++	if (ft != NULL) [self hakiosFtPhase:ft scheduled:YES];
+ 	[self hakiosDeliverScheduled];
+ }
+ 
+@@ -6545,6 +7845,12 @@ - (void)presentDrawable:(id)drawable
+ 		hm_print("refused: -presentDrawable: of a %s, which does not answer -present; nothing is presented\n", class_getName(object_getClass(drawable)));
+ 		return;
+ 	}
++	if (_ftrace != NULL) {   /* metal_trace=frame */
++		id t = [drawable respondsToSelector:@selector(texture)] ? [drawable texture] : nil;
++
++		hm_ft_line(_ftrace, "present drawable=%s tex=%llu\n", class_getName(object_getClass(drawable)),
++			   [t isKindOfClass:[HakiosMetalTexture class]] ? (unsigned long long)[(HakiosMetalTexture *)t hakiosFtName:_ftrace] : 0ull);
++	}
+ 	[drawable retain];
+ 	[self addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+ 		(void)cb;
+@@ -6578,6 +7884,7 @@ - (void)encodeSignalEvent:(id)event value:(uint64_t)value
+ 	}
+ 	if (_signals == nil) _signals = [[NSMutableArray alloc] init];
+ 	[_signals addObject:@[ event, @(value) ]];
++	if (_ftrace != NULL) hm_ft_line(_ftrace, "event op=signal id=%p value=%llu\n", (void *)event, (unsigned long long)value);
+ }
+ 
+ - (void)encodeWaitForEvent:(id)event value:(uint64_t)value
+@@ -6589,6 +7896,7 @@ - (void)encodeWaitForEvent:(id)event value:(uint64_t)value
+ 	}
+ 	if (_waits == nil) _waits = [[NSMutableArray alloc] init];
+ 	[_waits addObject:@[ event, @(value) ]];
++	if (_ftrace != NULL) hm_ft_line(_ftrace, "event op=wait id=%p value=%llu\n", (void *)event, (unsigned long long)value);
+ }
+ 
+ /* Sent by the window server to every command buffer it makes (78 unrecognized-selector aborts in one boot): declared on
+@@ -6628,10 +7936,15 @@ - (instancetype)initWithHakiosCommandBuffer:(HakiosMetalCommandBuffer *)commandB
+ 		return nil;
+ 	}
+ 	_commandBuffer = commandBuffer;
++	if (hm_ft_enabled && (_ftrace = [commandBuffer hakiosFrameTrace]) != NULL) {   /* metal_trace=frame */
++		_ftEnc = hm_ft_next(_ftrace, &_ftrace->encoders);
++		hm_ft_line(_ftrace, "enc i=%u kind=blit t=%.6f\n", _ftEnc, hm_now());
++	}
+ 	return self;
+ }
+ 
+ - (id)device { return [_commandBuffer device]; }
++- (void)hakiosFtDebug:(const char *)what string:(NSString *)string { hm_ft_debug(_ftrace, (int)_ftEnc, what, string); }
+ 
+ /* a buffer of another device, or an object standing in for one, cannot be bound here; said by name */
+ static hakios_metal_buffer *
+@@ -6654,7 +7967,13 @@ - (void)copyFromBuffer:(id)source sourceOffset:(NSUInteger)sourceOffset toBuffer
+ 	hakios_metal_buffer *from = hm_buffer_of(self, source, "source");
+ 	hakios_metal_buffer *to = hm_buffer_of(self, destination, "destination");
+ 	hakios_metal_cb *cb = [_commandBuffer hakiosCommandBuffer];
++	HM_FT_BLIT(cb)
+ 
++	if (ftb.ft != NULL) {
++		snprintf(ftb.what, sizeof(ftb.what), "op=copy_buf src=0x%llx soff=%lu dst=0x%llx doff=%lu len=%lu",
++			 from != NULL ? (unsigned long long)hakios_metal_buffer_gpu_address(from) : 0ull, (unsigned long)sourceOffset,
++			 to != NULL ? (unsigned long long)hakios_metal_buffer_gpu_address(to) : 0ull, (unsigned long)destinationOffset, (unsigned long)size);
++	}
+ 	if (from == NULL || to == NULL) {
+ 		hakios_metal_cb_refuse(cb, "a buffer copy named a buffer that is not this device's");
+ 		return;
+@@ -6668,7 +7987,13 @@ - (void)fillBuffer:(id)buffer range:(NSRange)range value:(uint8_t)value
+ {
+ 	hakios_metal_buffer *target = hm_buffer_of(self, buffer, "fill");
+ 	hakios_metal_cb *cb = [_commandBuffer hakiosCommandBuffer];
++	HM_FT_BLIT(cb)
+ 
++	if (ftb.ft != NULL) {
++		snprintf(ftb.what, sizeof(ftb.what), "op=fill buf=0x%llx off=%lu len=%lu value=%u",
++			 target != NULL ? (unsigned long long)hakios_metal_buffer_gpu_address(target) : 0ull, (unsigned long)range.location,
++			 (unsigned long)range.length, (unsigned)value);
++	}
+ 	if (target == NULL) {
+ 		hakios_metal_cb_refuse(cb, "a fill named a buffer that is not this device's");
+ 		return;
+@@ -6708,9 +8033,19 @@ - (void)copyFromTexture:(id)sourceTexture sourceSlice:(NSUInteger)sourceSlice so
+       destinationOrigin:(MTLOrigin)destinationOrigin
+ {
+ 	hakios_metal_cb *cb = [_commandBuffer hakiosCommandBuffer];
++	HM_FT_BLIT(cb)
+ 	hakios_metal_texture *from = hm_blit_texture(cb, sourceTexture, "source");
+ 	hakios_metal_texture *to = from != NULL ? hm_blit_texture(cb, destinationTexture, "destination") : NULL;
+ 
++	if (ftb.ft != NULL) {
++		snprintf(ftb.what, sizeof(ftb.what), "op=copy_tex src=%llu sslice=%lu slvl=%lu sx=%lu sy=%lu w=%lu h=%lu d=%lu dst=%llu dslice=%lu dlvl=%lu dx=%lu dy=%lu",
++			 [sourceTexture isKindOfClass:[HakiosMetalTexture class]] ? (unsigned long long)[(HakiosMetalTexture *)sourceTexture hakiosFtName:ftb.ft] : 0ull,
++			 (unsigned long)sourceSlice, (unsigned long)sourceLevel, (unsigned long)sourceOrigin.x, (unsigned long)sourceOrigin.y,
++			 (unsigned long)sourceSize.width, (unsigned long)sourceSize.height, (unsigned long)sourceSize.depth,
++			 [destinationTexture isKindOfClass:[HakiosMetalTexture class]] ?
++				(unsigned long long)[(HakiosMetalTexture *)destinationTexture hakiosFtName:ftb.ft] : 0ull,
++			 (unsigned long)destinationSlice, (unsigned long)destinationLevel, (unsigned long)destinationOrigin.x, (unsigned long)destinationOrigin.y);
++	}
+ 	if (to == NULL) {
+ 		return;
+ 	}
+@@ -6768,8 +8103,13 @@ - (void)copyFromTexture:(id)sourceTexture toTexture:(id)destinationTexture
+ - (void)generateMipmapsForTexture:(id)texture
+ {
+ 	hakios_metal_cb *cb = [_commandBuffer hakiosCommandBuffer];
++	HM_FT_BLIT(cb)
+ 	hakios_metal_texture *t = hm_blit_texture(cb, texture, "texture");
+ 
++	if (ftb.ft != NULL && t != NULL) {
++		snprintf(ftb.what, sizeof(ftb.what), "op=mipmaps tex=%llu levels=%u", (unsigned long long)[(HakiosMetalTexture *)texture hakiosFtName:ftb.ft],
++			 hakios_metal_texture_levels(t));
++	}
+ 	if (t != NULL && hakios_metal_cb_generate_mipmaps(cb, t) != 0) {
+ 		hm_print("refused: generateMipmaps of a %lux%lu texture of %lu levels: %s\n", (unsigned long)[texture width],
+ 			 (unsigned long)[texture height], (unsigned long)[texture mipmapLevelCount], hakios_metal_error());
+@@ -6829,6 +8169,7 @@ - (void)copyFromBuffer:(id)sourceBuffer sourceOffset:(NSUInteger)sourceOffset so
+      destinationOrigin:(MTLOrigin)destinationOrigin
+ {
+ 	hakios_metal_cb *cb = [_commandBuffer hakiosCommandBuffer];
++	HM_FT_BLIT(cb)
+ 	hakios_metal_buffer *from = hm_buffer_of(self, sourceBuffer, "source");
+ 	hakios_metal_texture *to = from != NULL ? hm_blit_texture(cb, destinationTexture, "destination") : NULL;
+ 	hakios_metal_buffer *staging;
+@@ -6836,6 +8177,16 @@ - (void)copyFromBuffer:(id)sourceBuffer sourceOffset:(NSUInteger)sourceOffset so
+ 	uint64_t pitch;
+ 	int failed = 0;
+ 
++	if (ftb.ft != NULL) {
++		snprintf(ftb.what, sizeof(ftb.what), "op=buf_to_tex src=0x%llx soff=%lu bpr=%lu w=%lu h=%lu d=%lu dst=%llu dslice=%lu dlvl=%lu dx=%lu dy=%lu dz=%lu",
++			 from != NULL ? (unsigned long long)hakios_metal_buffer_gpu_address(from) : 0ull, (unsigned long)sourceOffset,
++			 (unsigned long)sourceBytesPerRow, (unsigned long)sourceSize.width, (unsigned long)sourceSize.height, (unsigned long)sourceSize.depth,
++			 [destinationTexture isKindOfClass:[HakiosMetalTexture class]] ?
++				(unsigned long long)[(HakiosMetalTexture *)destinationTexture hakiosFtName:ftb.ft] : 0ull,
++			 (unsigned long)destinationSlice, (unsigned long)destinationLevel, (unsigned long)destinationOrigin.x, (unsigned long)destinationOrigin.y,
++			 (unsigned long)destinationOrigin.z);
++	}
++
+ 	(void)sourceBytesPerImage;   /* one image: depth 1 is all a texture here has */
+ 	if (from == NULL) {
+ 		hakios_metal_cb_refuse(cb, "a buffer-to-texture copy named a buffer that is not this device's");
+@@ -6942,6 +8293,7 @@ - (void)copyFromTexture:(id)sourceTexture sourceSlice:(NSUInteger)sourceSlice so
+     destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
+ {
+ 	hakios_metal_cb *cb = [_commandBuffer hakiosCommandBuffer];
++	HM_FT_BLIT(cb)
+ 	hakios_metal_texture *from = hm_blit_texture(cb, sourceTexture, "source");
+ 	hakios_metal_buffer *to = from != NULL ? hm_buffer_of(self, destinationBuffer, "destination") : NULL;
+ 	hakios_metal_buffer *staging;
+@@ -6949,6 +8301,15 @@ - (void)copyFromTexture:(id)sourceTexture sourceSlice:(NSUInteger)sourceSlice so
+ 	uint64_t pitch;
+ 	int failed;
+ 
++	if (ftb.ft != NULL) {
++		snprintf(ftb.what, sizeof(ftb.what), "op=tex_to_buf src=%llu sslice=%lu slvl=%lu sx=%lu sy=%lu w=%lu h=%lu dst=0x%llx doff=%lu bpr=%lu",
++			 [sourceTexture isKindOfClass:[HakiosMetalTexture class]] ? (unsigned long long)[(HakiosMetalTexture *)sourceTexture hakiosFtName:ftb.ft] : 0ull,
++			 (unsigned long)sourceSlice, (unsigned long)sourceLevel, (unsigned long)sourceOrigin.x, (unsigned long)sourceOrigin.y,
++			 (unsigned long)sourceSize.width, (unsigned long)sourceSize.height,
++			 to != NULL ? (unsigned long long)hakios_metal_buffer_gpu_address(to) : 0ull, (unsigned long)destinationOffset,
++			 (unsigned long)destinationBytesPerRow);
++	}
++
+ 	(void)destinationBytesPerImage;
+ 	if (from == NULL) {
+ 		return;
+@@ -7010,6 +8371,11 @@ - (void)copyFromTexture:(id)sourceTexture sourceSlice:(NSUInteger)sourceSlice so
+  * encoder released without this */
+ - (void)endEncoding
+ {
++	if (_ftrace != NULL) {   /* metal_trace=frame */
++		char label[300];
++
++		hm_ft_line(_ftrace, "endenc i=%u t=%.6f label=%s\n", _ftEnc, hm_now(), hm_ft_qs(label, sizeof(label), [self label]));
++	}
+ 	[super endEncoding];
+ }
+ 
+@@ -7057,9 +8423,67 @@ - (instancetype)initWithHakiosCommandBuffer:(HakiosMetalCommandBuffer *)commandB
+ 		return nil;
+ 	}
+ 	_commandBuffer = commandBuffer;
++	if (hm_ft_enabled && (_ftrace = [commandBuffer hakiosFrameTrace]) != NULL) {   /* metal_trace=frame */
++		_ftEnc = hm_ft_next(_ftrace, &_ftrace->encoders);
++		hm_ft_line(_ftrace, "enc i=%u kind=compute t=%.6f\n", _ftEnc, hm_now());
++	}
+ 	return self;
+ }
+ 
++- (void)hakiosFtDebug:(const char *)what string:(NSString *)string { hm_ft_debug(_ftrace, (int)_ftEnc, what, string); }
++
++/* metal_trace=frame: a dispatch's lines -- the dispatch, then what it had bound, each texture with the access the kernel
++ * declares at its index (r, w, rw) -- with the core's pass it went into (BEFORE: the core's passes before it) */
++- (void)hakiosFtDispatch:(const unsigned *)groups threads:(const unsigned *)threads indirect:(id)args offset:(NSUInteger)offset
++		  before:(unsigned)before result:(const char *)result
++{
++	struct hm_ft_rec *ft = _ftrace;
++	hakios_metal_kernel *kernel = _pipeline != nil ? [_pipeline hakiosKernel] : NULL;
++	const unsigned op = hm_ft_next(ft, &ft->ops);
++	const unsigned n = kernel != NULL ? hakios_metal_kernel_resource_count(kernel) : 0;
++	char q[3][300], indirect[64] = "";
++	uint32_t usedBuffers = 0, usedSamplers = 0;
++	uint8_t access[HM_MAX_TEXTURES] = { 0 };
++	unsigned opened = 0;
++	const int core = strcmp(result, "ok") == 0 ? hm_ft_core(ft, [_commandBuffer hakiosCommandBuffer], before, &opened) : -1;
++
++	for (unsigned i = 0; i < n; i++) {
++		unsigned kind = 0, index = 0, size = 0, type = 0, element = 0, how = 0;
++
++		if (hakios_metal_kernel_resource(kernel, i, &kind, &index, &size) != 0) continue;
++		if ((kind == HAKIOS_METAL_RESOURCE_TEXTURE || kind == HAKIOS_METAL_RESOURCE_IMAGE) && index < HM_MAX_TEXTURES) {
++			access[index] = hakios_metal_kernel_resource_texture(kernel, i, &type, &element, &how) == 0 ? (uint8_t)(how != 0 ? how : 1) : 1;
++		} else if (kind == HAKIOS_METAL_RESOURCE_SAMPLER && index < 32) {
++			usedSamplers |= 1u << index;
++		} else if ((kind == HAKIOS_METAL_RESOURCE_CONSTANT_BUFFER || kind == HAKIOS_METAL_RESOURCE_DEVICE_BUFFER) && index < 32) {
++			usedBuffers |= 1u << index;
++		}
++	}
++	if (args != nil && [args isKindOfClass:[HakiosMetalBuffer class]]) {
++		snprintf(indirect, sizeof(indirect), " indirect=0x%llx+%lu", (unsigned long long)hakios_metal_buffer_gpu_address([(HakiosMetalBuffer *)args hakiosBuffer]),
++			 (unsigned long)offset);
++	}
++	hm_ft_line(ft, "dispatch i=%u enc=%u fn=%s label=%s groups=%u,%u,%u threads=%u,%u,%u tg=%lu%s core=%d n=%u res=%s\n", op, _ftEnc,
++		   hm_ft_q(q[0], sizeof(q[0]), kernel != NULL ? hakios_metal_kernel_name(kernel) : NULL),
++		   hm_ft_qs(q[1], sizeof(q[1]), _pipeline != nil ? [(id<MTLComputePipelineState>)_pipeline label] : nil), groups[0], groups[1], groups[2],
++		   threads[0], threads[1], threads[2], (unsigned long)_threadgroupLength, indirect, opened != 0 ? core - (int)opened + 1 : -1, opened,
++		   hm_ft_q(q[2], sizeof(q[2]), result));
++	for (unsigned i = 0; i < _highestTexture; i++) {
++		char samp[40] = "";
++
++		if (_textures[i] == nil) continue;
++		if (i < _highestSampler && _samplers[i] != nil) snprintf(samp, sizeof(samp), " samp=%llu", (unsigned long long)[_samplers[i] hakiosFtName:ft]);
++		hm_ft_line(ft, "dtex op=%u stage=cs slot=%u tex=%llu used=%s access=%s%s\n", op, i, (unsigned long long)[_textures[i] hakiosFtName:ft],
++			   kernel == NULL ? "?" : access[i] != 0 ? "1" : "0", HM_FT_NAME(access[i], "-", "r", "w", "rw"), samp);
++	}
++	for (unsigned i = 0; i < _highestSampler; i++) {
++		if (_samplers[i] == nil || (i < _highestTexture && _textures[i] != nil)) continue;
++		hm_ft_line(ft, "dsamp op=%u stage=cs slot=%u samp=%llu used=%s\n", op, i, (unsigned long long)[_samplers[i] hakiosFtName:ft],
++			   kernel == NULL ? "?" : (usedSamplers >> i) & 1 ? "1" : "0");
++	}
++	hm_ft_buffers(ft, "op", op, "cs", _buffers, _offsets, _highest, usedBuffers, kernel != NULL);
++}
++
+ - (void)dealloc
+ {
+ 	[_pipeline release];
+@@ -7279,15 +8703,23 @@ - (void)hakiosDispatch:(MTLSize)groups indirect:(id)args offset:(NSUInteger)offs
+ 	hakios_metal_sampler *samplers[HM_MAX_SAMPLERS];
+ 	const unsigned g[3] = { (unsigned)groups.width, (unsigned)groups.height, (unsigned)groups.depth };
+ 	const unsigned t[3] = { (unsigned)threads.width, (unsigned)threads.height, (unsigned)threads.depth };
++	const unsigned ftBefore = _ftrace != NULL ? hm_ft_total(cb) : 0;   /* metal_trace=frame */
+ 
+ 	if (_pipeline == nil) {
+ 		hm_print("refused: a dispatch with no pipeline state; the command buffer is failed\n");
+ 		hakios_metal_cb_refuse(cb, "a dispatch with no pipeline state");
++		if (_ftrace != NULL) [self hakiosFtDispatch:g threads:t indirect:args offset:offset before:ftBefore result:"refused: no pipeline state"];
+ 		return;
+ 	}
+ 	if (_refused[0] != '\0') {
+ 		hm_print("refused: this dispatch, because %s; the command buffer is failed\n", _refused);
+ 		hakios_metal_cb_refuse(cb, _refused);
++		if (_ftrace != NULL) {
++			char why[200];
++
++			snprintf(why, sizeof(why), "refused: %s", _refused);
++			[self hakiosFtDispatch:g threads:t indirect:args offset:offset before:ftBefore result:why];
++		}
+ 		return;
+ 	}
+ 	for (unsigned i = 0; i < _highest; i++) {
+@@ -7309,17 +8741,24 @@ - (void)hakiosDispatch:(MTLSize)groups indirect:(id)args offset:(NSUInteger)offs
+ 	if (args != nil && ![args respondsToSelector:@selector(hakiosBuffer)]) {
+ 		hm_print("refused: an indirect dispatch whose argument buffer is not this device's; the command buffer is failed\n");
+ 		hakios_metal_cb_refuse(cb, "an indirect dispatch's argument buffer from another device");
++		if (_ftrace != NULL) [self hakiosFtDispatch:g threads:t indirect:nil offset:offset before:ftBefore result:"refused: a foreign argument buffer"];
+ 		return;
+ 	}
+ 	if (args != nil ? hakios_metal_cb_dispatch_indirect(cb, [_pipeline hakiosKernel], [(HakiosMetalBuffer *)args hakiosBuffer], (uint64_t)offset, t,
+ 							    buffers, offsets, _highest, textures, _highestTexture, samplers, _highestSampler) != 0
+ 			: hakios_metal_cb_dispatch2(cb, [_pipeline hakiosKernel], g, t, buffers, offsets, _highest, textures, _highestTexture,
+ 						    samplers, _highestSampler) != 0) {
++		char why[300];
++
++		snprintf(why, sizeof(why), "refused: %s", hakios_metal_error());
+ 		hm_print("refused: a dispatch of %s over %ux%ux%u groups of %ux%ux%u with %u buffer, %u texture and %u sampler slots: %s\n",
+ 			 hakios_metal_kernel_name([_pipeline hakiosKernel]), g[0], g[1], g[2], t[0], t[1], t[2], _highest, _highestTexture,
+ 			 _highestSampler, hakios_metal_error());
+ 		hakios_metal_cb_refuse(cb, hakios_metal_error());
++		if (_ftrace != NULL) [self hakiosFtDispatch:g threads:t indirect:args offset:offset before:ftBefore result:why];
++		return;
+ 	}
++	if (_ftrace != NULL) [self hakiosFtDispatch:g threads:t indirect:args offset:offset before:ftBefore result:"ok"];
+ }
+ 
+ /* Metal counts threads here and threadgroups above; a grid that does not divide evenly is refused rather than rounded,
+@@ -7386,6 +8825,11 @@ - (void)endEncoding
+ 	/* the bindings were handed to hakios-metal at each dispatch, which holds them until the GPU is done */
+ 	[_scratch release];
+ 	_scratch = nil;
++	if (_ftrace != NULL) {   /* metal_trace=frame */
++		char label[300];
++
++		hm_ft_line(_ftrace, "endenc i=%u t=%.6f label=%s\n", _ftEnc, hm_now(), hm_ft_qs(label, sizeof(label), [self label]));
++	}
+ 	[super endEncoding];   /* MUST: the base class retains the command buffer and this is what releases it */
+ }
+ 
+@@ -7452,6 +8896,7 @@ - (void)dealloc
+ 	}
+ 	free(_specKeys);
+ 	[_fsAir release];
++	hm_ft_pipe_free(_ftPipe);
+ 	if (_program != NULL) {
+ 		hakios_metal_program_free(_program);   /* a draw in flight keeps its own reference */
+ 	}
+@@ -7460,6 +8905,26 @@ - (void)dealloc
+ }
+ 
+ - (hakios_metal_program *)hakiosProgram { return _program; }
++- (int)hakiosSpecBinding { return _fsAir != nil ? _specBinding : -1; }   /* (_fsAir is kept only for an uber shader) */
++- (unsigned)hakiosSpecLength { return _specLength; }
++- (void)hakiosSetFtPipe:(struct hm_ft_pipe *)pipe { hm_ft_pipe_free(_ftPipe); _ftPipe = pipe; }
++- (uint64_t)hakiosUniqueIdentifier { return _hakiosUniqueIdentifier; }
++- (const struct hm_ft_pipe *)hakiosFtPipe { return _ftPipe; }
++
++/* metal_trace=frame: the pipe and pblend lines, the first time a recorded command buffer draws with this pipeline */
++- (uint64_t)hakiosFtName:(struct hm_ft_rec *)ft
++{
++	if (hm_ft_first(ft, _hakiosUniqueIdentifier)) {
++		char q[200];
++
++		if (_ftPipe != NULL && _ftPipe->lines != NULL) {
++			hm_ft_line(ft, "%s", _ftPipe->lines);
++		} else {
++			hm_ft_line(ft, "pipe id=%llu prog=%s\n", (unsigned long long)_hakiosUniqueIdentifier, hm_ft_q(q, sizeof(q), hakios_metal_program_name(_program)));
++		}
++	}
++	return _hakiosUniqueIdentifier;
++}
+ 
+ /* boot-arg metal_nospec: every draw with the pipeline's own program, no uber shader specialised */
+ static BOOL
+@@ -7677,9 +9142,15 @@ - (instancetype)initWithHakiosCommandBuffer:(HakiosMetalCommandBuffer *)commandB
+ 	_colorTexture = [texture retain];
+ 	_pass = *pass;
+ 	_frontFacingWinding = MTLWindingClockwise;   /* Metal's default */
++	if (hm_ft_enabled && (_ftrace = [commandBuffer hakiosFrameTrace]) != NULL) {   /* metal_trace=frame: its enc line is its maker's */
++		_ftEnc = hm_ft_next(_ftrace, &_ftrace->encoders);
++	}
+ 	return self;
+ }
+ 
++- (unsigned)hakiosFtIndex { return _ftEnc; }
++- (void)hakiosFtDebug:(const char *)what string:(NSString *)string { hm_ft_debug(_ftrace, (int)_ftEnc, what, string); }
++
+ - (void)hakiosTakeResolves:(MTLRenderPassDescriptor *)descriptor
+ {
+ 	for (NSUInteger i = 0; i < 8; i++) {
+@@ -8387,6 +9858,142 @@ - (void)hakiosDraw:(MTLPrimitiveType)primitive vertexStart:(NSUInteger)start ver
+ 	if (began != 0) hm_fps.lastTpidr = tpidr;
+ }
+ 
++/*
++ * metal_trace=frame: a draw's lines -- its pipeline described the first time, the draw (RESULT what became of it; for one
++ * the core took, the pass it went into, BEFORE the core's passes before it), then the textures, samplers and buffers it
++ * had bound, each marked used when PROGRAM's stage declares that index. AREA is what the core takes the draw to touch
++ * (viewport and scissor in the target, render::drawArea's rule); GEOM where its vertices land (hm_ft_geometry).
++ */
++- (void)hakiosFtDraw:(unsigned)primitive start:(NSUInteger)start count:(NSUInteger)count instances:(NSUInteger)instances
++	 indexBuffer:(id)indexBuffer indexType:(MTLIndexType)indexType indexOffset:(NSUInteger)indexOffset baseVertex:(NSInteger)baseVertex
++	baseInstance:(NSUInteger)baseInstance indirect:(id)indirect indirectOffset:(NSUInteger)indirectOffset
++	     program:(hakios_metal_program *)program before:(unsigned)before result:(const char *)result
++{
++	struct hm_ft_rec *ft = _ftrace;
++	const struct hm_ft_pipe *pipe = _pipeline != nil ? [_pipeline hakiosFtPipe] : NULL;
++	const unsigned long long pipeId = _pipeline != nil ? (unsigned long long)[_pipeline hakiosFtName:ft] : 0ull;
++	const unsigned d = hm_ft_next(ft, &ft->draws);
++	const BOOL ok = strcmp(result, "ok") == 0;
++	uint64_t fsUsed[2] = { 0, 0 }, vsUsed[2] = { 0, 0 };
++	uint32_t fsSamplers = 0, vsSamplers = 0, fsBuffers = 0, vsBuffers = 0;
++	const BOOL known = hm_ft_used(program, 1, fsUsed, &fsSamplers, &fsBuffers) && hm_ft_used(program, 0, vsUsed, &vsSamplers, &vsBuffers);
++	unsigned w = 0, h = 0, opened = 0;
++	const int core = ok && _sub == NULL ? hm_ft_core(ft, [self hakiosCb], before, &opened) : -1;
++	struct hakios_metal_viewport vp;
++	char line[4096], q[2][400];
++	size_t at = 0;
++
++	hm_ft_window(&_pass, &w, &h);
++	vp = _hasViewport ? _viewport : (struct hakios_metal_viewport){ 0, 0, (double)w, (double)h, 0, 1 };
++	hm_ft_cat(line, sizeof(line), &at, "draw i=%u enc=%u pipe=%llu prog=%s prim=%s", d, _ftEnc, pipeId,
++		  hm_ft_q(q[0], sizeof(q[0]), program != NULL ? hakios_metal_program_name(program) : NULL), HM_FT_PRIM(primitive));
++	if (indexBuffer != nil) {
++		hm_ft_cat(line, sizeof(line), &at, " idx=%s icount=%lu ioff=%lu bv=%ld", indexType == MTLIndexTypeUInt32 ? "u32" : "u16", (unsigned long)count,
++			  (unsigned long)indexOffset, (long)baseVertex);
++	} else {
++		hm_ft_cat(line, sizeof(line), &at, " vstart=%lu vcount=%lu", (unsigned long)start, (unsigned long)count);
++	}
++	hm_ft_cat(line, sizeof(line), &at, " inst=%lu binst=%lu", (unsigned long)instances, (unsigned long)baseInstance);
++	if (indirect != nil && [indirect isKindOfClass:[HakiosMetalBuffer class]]) {
++		hm_ft_cat(line, sizeof(line), &at, " indirect=0x%llx+%lu",
++			  (unsigned long long)hakios_metal_buffer_gpu_address([(HakiosMetalBuffer *)indirect hakiosBuffer]), (unsigned long)indirectOffset);
++	}
++	if (_hasViewport) {
++		hm_ft_cat(line, sizeof(line), &at, " vp=%g,%g,%g,%g,%g,%g", _viewport.x, _viewport.y, _viewport.width, _viewport.height, _viewport.znear,
++			  _viewport.zfar);
++	} else {
++		hm_ft_cat(line, sizeof(line), &at, " vp=-");
++	}
++	if (_hasScissor) hm_ft_cat(line, sizeof(line), &at, " sc=%u,%u,%u,%u", _scissor.x, _scissor.y, _scissor.width, _scissor.height);
++	else hm_ft_cat(line, sizeof(line), &at, " sc=-");
++	hm_ft_cat(line, sizeof(line), &at, " target=%ux%u", w, h);
++	{
++		/* (render::drawArea's rule: the viewport in the target, cut by the scissor; X1 Y1 inclusive) */
++		BOOL area = w != 0 && h != 0 && isfinite(vp.x) && isfinite(vp.y) && vp.width > 0 && vp.height > 0 && vp.x < w && vp.y < h &&
++			    vp.x + vp.width > 0 && vp.y + vp.height > 0;
++		long x0 = 0, y0 = 0, x1 = 0, y1 = 0;
++
++		if (area) {
++			x0 = (long)MAX(0.0, floor(vp.x));
++			y0 = (long)MAX(0.0, floor(vp.y));
++			x1 = (long)MIN((double)w, ceil(vp.x + vp.width)) - 1;
++			y1 = (long)MIN((double)h, ceil(vp.y + vp.height)) - 1;
++			if (_hasScissor && _scissor.width != 0) {
++				x0 = MAX(x0, (long)_scissor.x);
++				y0 = MAX(y0, (long)_scissor.y);
++				x1 = MIN(x1, (long)_scissor.x + (long)_scissor.width - 1);
++				y1 = MIN(y1, (long)_scissor.y + (long)_scissor.height - 1);
++			}
++			area = x0 <= x1 && y0 <= y1;
++		}
++		if (area) hm_ft_cat(line, sizeof(line), &at, " area=%ld,%ld,%ld,%ld", x0, y0, x1, y1);
++		else hm_ft_cat(line, sizeof(line), &at, " area=none");
++	}
++	if (indirect == nil && pipe != NULL) {
++		hakios_metal_buffer *vs[HM_MAX_BUFFERS];
++		float box[4], pos[12];
++		unsigned positions = 0, read = 0;
++		const char *source = "";
++
++		for (unsigned i = 0; i < _vsHighest; i++) vs[i] = _vsBuffers[i] != nil ? [_vsBuffers[i] hakiosBuffer] : NULL;
++		if (hm_ft_geometry(pipe, vs, _vsOffsets, _vsHighest, &vp, (unsigned)start, (unsigned)count,
++				   [indexBuffer isKindOfClass:[HakiosMetalBuffer class]] ? [(HakiosMetalBuffer *)indexBuffer hakiosBuffer] : NULL,
++				   (unsigned)indexType, (uint64_t)indexOffset, (long)baseVertex, box, pos, &positions, &read, &source)) {
++			hm_ft_cat(line, sizeof(line), &at, " geom=%.1f,%.1f,%.1f,%.1f gsrc=%s nv=%u", box[0], box[1], box[2], box[3], source, read);
++			if (read == positions) {
++				for (unsigned i = 0; i < positions; i++) hm_ft_cat(line, sizeof(line), &at, "%s%.1f,%.1f", i ? ";" : " pos=", pos[2 * i], pos[2 * i + 1]);
++			}
++		}
++	}
++	hm_ft_cat(line, sizeof(line), &at, " cull=%s wind=%s", HM_FT_NAME(_pass.cull_mode, "none", "front", "back"), _pass.winding ? "ccw" : "cw");
++	if (_pass.depth_state_set || _pass.stencil_state_set) {
++		hm_ft_cat(line, sizeof(line), &at, " ds=d:%s,w%d%s", _pass.depth_state_set ? HM_FT_COMPARE(_pass.depth_compare) : "always",
++			  _pass.depth_state_set ? _pass.depth_write : 0, _pass.stencil_state_set ? ",s:on" : "");
++	} else {
++		hm_ft_cat(line, sizeof(line), &at, " ds=off");
++	}
++	if (_pass.blend_color[0] != 0 || _pass.blend_color[1] != 0 || _pass.blend_color[2] != 0 || _pass.blend_color[3] != 0) {
++		hm_ft_cat(line, sizeof(line), &at, " bc=%g,%g,%g,%g", _pass.blend_color[0], _pass.blend_color[1], _pass.blend_color[2], _pass.blend_color[3]);
++	}
++	if (_pass.visibility_mode != 0) {
++		hm_ft_cat(line, sizeof(line), &at, " vis=%s@%llu", _pass.visibility_mode == 1 ? "bool" : "count", (unsigned long long)_pass.visibility_offset);
++	}
++	{
++		/* the uber shader's specialisation: the program for these bytes of its deciding buffer (hit), or the uber
++		 * shader itself while that one compiles or past the 64 a pipeline keeps (pending): the draw never waits */
++		const int binding = _pipeline != nil ? [_pipeline hakiosSpecBinding] : -1;
++
++		if (binding < 0) {
++			hm_ft_cat(line, sizeof(line), &at, " spec=none");
++		} else if ((unsigned)binding >= _fsHighest || _fsBuffers[binding] == nil) {
++			hm_ft_cat(line, sizeof(line), &at, " spec=nobuf");
++		} else {
++			hakios_metal_buffer *b = [_fsBuffers[binding] hakiosBuffer];
++			const uint8_t *bytes = hakios_metal_buffer_contents(b);
++			const uint64_t length = hakios_metal_buffer_length(b), offset = _fsOffsets[binding], need = [_pipeline hakiosSpecLength];
++			const uint32_t key = bytes != NULL && offset <= length && length - offset >= need ? hm_ft_fnv(bytes + offset, (size_t)need, 2166136261u) : 0;
++
++			hm_ft_cat(line, sizeof(line), &at, " spec=%s:%08x", program != NULL && program != [_pipeline hakiosProgram] ? "hit" : "pending", key);
++		}
++	}
++	if (program != NULL) {
++		hm_ft_cat(line, sizeof(line), &at, " vs_words=%u fs_words=%u", hakios_metal_program_stage_words(program, 0),
++			  hakios_metal_program_stage_words(program, 1));
++		if (hm_ft_fs_traits != NULL) {
++			const unsigned traits = hm_ft_fs_traits(program);
++
++			hm_ft_cat(line, sizeof(line), &at, " fb=0x%x discard=%u", traits & 0xff, (traits >> 8) & 1);
++		}
++	}
++	hm_ft_cat(line, sizeof(line), &at, " core=%d n=%u res=%s\n", core, opened, hm_ft_q(q[1], sizeof(q[1]), result));
++	hm_ft_line(ft, "%s", line);
++	hm_ft_textures(ft, "d", d, "fs", _fsTextures, _fsHighestTexture, _fsSamplers, _fsHighestSampler, fsUsed, fsSamplers, known);
++	hm_ft_textures(ft, "d", d, "vs", _vsTextures, _vsHighestTexture, _vsSamplers, _vsHighestSampler, vsUsed, vsSamplers, known);
++	hm_ft_buffers(ft, "d", d, "vs", _vsBuffers, _vsOffsets, _vsHighest, vsBuffers, known);
++	hm_ft_buffers(ft, "d", d, "fs", _fsBuffers, _fsOffsets, _fsHighest, fsBuffers, known);
++	_ftDraws++;
++}
++
+ - (void)hakiosDrawOnce:(MTLPrimitiveType)primitive vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count instanceCount:(NSUInteger)instances
+ 	   indexBuffer:(id)indexBuffer indexType:(MTLIndexType)indexType indexOffset:(NSUInteger)indexOffset baseVertex:(NSInteger)baseVertex
+ 	  baseInstance:(NSUInteger)baseInstance
+@@ -8400,15 +10007,33 @@ - (void)hakiosDrawOnce:(MTLPrimitiveType)primitive vertexStart:(NSUInteger)start
+ 	_indirectArgs = nil;
+ 	hakios_metal_texture *fsTex[HM_MAX_TEXTURES], *vsTex[HM_MAX_TEXTURES];
+ 	hakios_metal_sampler *fsSamp[HM_MAX_SAMPLERS], *vsSamp[HM_MAX_SAMPLERS];
++	/* metal_trace=frame: the draw's lines, whichever way it ends (the program it drew with, the core's passes before it) */
++	hakios_metal_program *ftProgram = NULL;
++	unsigned ftBefore = 0;
++#define HM_FT_DRAW(ftResult_)												\
++	do {														\
++		if (_ftrace != NULL) {											\
++			[self hakiosFtDraw:(unsigned)primitive start:start count:count instances:instances indexBuffer:indexBuffer		\
++			       indexType:indexType indexOffset:indexOffset baseVertex:baseVertex baseInstance:baseInstance		\
++				indirect:indirectArgs indirectOffset:indirectOffset program:ftProgram before:ftBefore result:(ftResult_)];	\
++		}													\
++	} while (0)
+ 
+ 	if (_pipeline == nil) {
+ 		hm_print("refused: a draw with no render pipeline state; the command buffer is failed\n");
+ 		hakios_metal_cb_refuse(cb, "a draw with no render pipeline state");
++		HM_FT_DRAW("refused: no render pipeline state");
+ 		return;
+ 	}
+ 	if (_refused[0] != '\0') {
+ 		hm_print("refused: this draw, because %s; the command buffer is failed\n", _refused);
+ 		hakios_metal_cb_refuse(cb, _refused);
++		if (_ftrace != NULL) {
++			char why[200];
++
++			snprintf(why, sizeof(why), "refused: %s", _refused);
++			HM_FT_DRAW(why);
++		}
+ 		return;
+ 	}
+ 	for (unsigned i = 0; i < _vsHighest; i++) {
+@@ -8457,16 +10082,20 @@ - (void)hakiosDrawOnce:(MTLPrimitiveType)primitive vertexStart:(NSUInteger)start
+ 	}
+ 	hakios_metal_program *program = [_pipeline hakiosProgramFor:fs offsets:_fsOffsets count:_fsHighest];
+ 
++	ftProgram = program;
+ 	hm_dump_config(hakios_metal_program_name(program), fs, _fsOffsets, _fsHighest);
+ 	if (hm_trace_draw([_pipeline hakiosProgram], hakios_metal_program_name([_pipeline hakiosProgram]), &_pass, fsTex, _fsHighestTexture, (unsigned)primitive, 0)) {
++		HM_FT_DRAW("skipped: metal_skip");
+ 		return;
+ 	}
+ 	if (hm_luma_boost_left_out(hakios_metal_program_name([_pipeline hakiosProgram]))) {
++		HM_FT_DRAW("left out: luma_boost (metal_luma_boost=1 draws it)");
+ 		return;
+ 	}
+ 	if (indexBuffer != nil && ![indexBuffer isKindOfClass:[HakiosMetalBuffer class]]) {
+ 		hm_print("refused: an indexed draw from a %s, not a buffer of this device; the command buffer is failed\n", class_getName(object_getClass(indexBuffer)));
+ 		hakios_metal_cb_refuse(cb, "an indexed draw from a buffer that is not this device's");
++		HM_FT_DRAW("refused: an index buffer of another device");
+ 		return;
+ 	}
+ 	/* a word this encoder has not counted into yet starts from zero: Metal's result is the pass's count */
+@@ -8479,11 +10108,13 @@ - (void)hakiosDrawOnce:(MTLPrimitiveType)primitive vertexStart:(NSUInteger)start
+ 			hm_print("refused: an indirect draw whose arguments are in a %s, not a buffer of this device; the command buffer is failed\n",
+ 				 class_getName(object_getClass(indirectArgs)));
+ 			hakios_metal_cb_refuse(cb, "an indirect draw's arguments in a buffer that is not this device's");
++			HM_FT_DRAW("refused: indirect arguments in a buffer of another device");
+ 			return;
+ 		}
+ 		hakios_metal_cb_set_indirect(cb, [(HakiosMetalBuffer *)indirectArgs hakiosBuffer], (uint64_t)indirectOffset);
+ 	}
+ 	const double coreBegan = hm_fps_on() ? hm_now() : 0;
++	if (_ftrace != NULL) ftBefore = hm_ft_total(cb);
+ 	if (indexBuffer != nil) {
+ 		drawn = hakios_metal_cb_draw_indexed(cb, program, &_pass, _hasViewport ? &_viewport : NULL, _hasScissor ? &_scissor : NULL,
+ 						     (unsigned)primitive, (unsigned)count, (unsigned)indexType, [(HakiosMetalBuffer *)indexBuffer hakiosBuffer],
+@@ -8499,13 +10130,19 @@ - (void)hakiosDrawOnce:(MTLPrimitiveType)primitive vertexStart:(NSUInteger)start
+ 		[_visibilityCounted addIndex:(NSUInteger)(_pass.visibility_offset / 8)];
+ 	}
+ 	if (drawn != 0) {
++		char ftWhy[400];
++
++		snprintf(ftWhy, sizeof(ftWhy), "refused: %s", hakios_metal_error());
+ 		hm_print("refused: a draw of %s, primitive %lu, %lu vertices from %lu, %lu instance(s), load %u store %u, %u vertex and %u fragment "
+ 			 "buffer slots: %s\n", hakios_metal_program_name([_pipeline hakiosProgram]), (unsigned long)primitive, (unsigned long)count,
+ 			 (unsigned long)start, (unsigned long)instances, _pass.load_action, _pass.store_action, _vsHighest, _fsHighest, hakios_metal_error());
+ 		hakios_metal_cb_refuse(cb, hakios_metal_error());
++		HM_FT_DRAW(ftWhy);
+ 		return;
+ 	}
+ 	hm_spend_clears(&_pass);   /* the fills are recorded: the pass's later draws load what they left */
++	HM_FT_DRAW("ok");
++#undef HM_FT_DRAW
+ }
+ 
+ - (void)drawPrimitives:(MTLPrimitiveType)primitive vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
+@@ -8721,10 +10358,21 @@ - (void)endEncoding
+ {
+ 	/* a Clear no draw spent: the pass still owes it (a pass that only clears is how many clients wipe a drawable) */
+ 	/* (not on a command buffer a refused draw already failed -- it holds an error before commit: its first sentence is the one that matters) */
+-	if (hm_owes_clear(&_pass) && hakios_metal_cb_error([self hakiosCb])[0] == '\0' &&
+-	    hakios_metal_cb_clear([self hakiosCb], &_pass) != 0) {
+-		hm_print("refused: a pass that only clears: %s\n", hakios_metal_error());
+-		hakios_metal_cb_refuse([self hakiosCb], hakios_metal_error());
++	unsigned ftBefore = _ftrace != NULL ? hm_ft_total([self hakiosCb]) : 0;   /* metal_trace=frame */
++
++	if (hm_owes_clear(&_pass) && hakios_metal_cb_error([self hakiosCb])[0] == '\0') {
++		const int failed = hakios_metal_cb_clear([self hakiosCb], &_pass) != 0;
++
++		if (failed) {
++			hm_print("refused: a pass that only clears: %s\n", hakios_metal_error());
++			hakios_metal_cb_refuse([self hakiosCb], hakios_metal_error());
++		}
++		if (_ftrace != NULL) {
++			unsigned opened = 0;
++			const int core = _sub == NULL ? hm_ft_core(_ftrace, [self hakiosCb], ftBefore, &opened) : -1;
++
++			hm_ft_line(_ftrace, "clear enc=%u core=%d res=%s\n", _ftEnc, failed || _sub != NULL ? -1 : core, failed ? "refused" : "ok");
++		}
+ 	}
+ 	hm_spend_clears(&_pass);
+ 	/* the resolves, after the pass: each multisample attachment's samples into its resolveTexture, pixel for pixel (the
+@@ -8733,13 +10381,26 @@ - (void)endEncoding
+ 		if (!_resolving[i] || hakios_metal_cb_error([self hakiosCb])[0] != '\0') {
+ 			continue;
+ 		}
++		if (_ftrace != NULL) ftBefore = hm_ft_total([self hakiosCb]);
+ 		if (hakios_metal_cb_blit([self hakiosCb], [_resolveFrom[i] hakiosTexture], 0, 0, 0, (unsigned)[_resolveFrom[i] width],
+ 					 (unsigned)[_resolveFrom[i] height], [_resolveTo[i] hakiosTexture], _resolveLevel[i], 0, 0,
+ 					 (unsigned)[_resolveFrom[i] width], (unsigned)[_resolveFrom[i] height], 0) != 0) {
+ 			hm_print("refused: the resolve of colour attachment %u: %s\n", i, hakios_metal_error());
+ 			hakios_metal_cb_refuse([self hakiosCb], hakios_metal_error());
++		} else if (_ftrace != NULL) {
++			unsigned opened = 0;
++			const int core = _sub == NULL ? hm_ft_core(_ftrace, [self hakiosCb], ftBefore, &opened) : -1;
++
++			hm_ft_line(_ftrace, "blit i=%u enc=%u op=resolve att=%u src=%llu dst=%llu dlvl=%u core=%d n=%u res=ok\n", hm_ft_next(_ftrace, &_ftrace->ops),
++				   _ftEnc, i, (unsigned long long)[_resolveFrom[i] hakiosFtName:_ftrace], (unsigned long long)[_resolveTo[i] hakiosFtName:_ftrace],
++				   _resolveLevel[i], opened != 0 && core >= 0 ? core - (int)opened + 1 : -1, opened);
+ 		}
+ 	}
++	if (_ftrace != NULL) {
++		char label[300];
++
++		hm_ft_line(_ftrace, "endenc i=%u draws=%u t=%.6f label=%s\n", _ftEnc, _ftDraws, hm_now(), hm_ft_qs(label, sizeof(label), [self label]));
++	}
+ 	/* the bindings were handed to hakios-metal at each draw, which holds them until the GPU is done */
+ 	[_scratch release];
+ 	_scratch = nil;
+@@ -8770,9 +10431,14 @@ - (instancetype)initWithHakiosCommandBuffer:(HakiosMetalCommandBuffer *)commandB
+ 	_descriptor = [descriptor copy];
+ 	_subs = [[NSMutableArray alloc] init];
+ 	_lock = [[NSLock alloc] init];
++	if (hm_ft_enabled && (_ftrace = [commandBuffer hakiosFrameTrace]) != NULL) {   /* metal_trace=frame: its enc line is its maker's */
++		_ftEnc = hm_ft_next(_ftrace, &_ftrace->encoders);
++	}
+ 	return self;
+ }
+ 
++- (unsigned)hakiosFtIndex { return _ftEnc; }
++
+ - (void)dealloc
+ {
+ 	for (NSValue *v in _subs) hakios_metal_cb_free((hakios_metal_cb *)[v pointerValue]);
+@@ -8809,8 +10475,14 @@ - (id)renderCommandEncoder
+ 	pass.depth_store_action = MTLStoreActionStore;
+ 	pass.stencil_store_action = MTLStoreActionStore;
+ 	for (unsigned i = 0; i < 7; i++) pass.more[i].store_action = MTLStoreActionStore;
+-	return [[[HakiosMetalRenderCommandEncoder alloc] initWithHakiosCommandBuffer:_commandBuffer pass:&pass colorTexture:_colorTexture
+-										  sub:sub] autorelease];
++	{
++		HakiosMetalRenderCommandEncoder *encoder = [[[HakiosMetalRenderCommandEncoder alloc] initWithHakiosCommandBuffer:_commandBuffer pass:&pass
++													     colorTexture:_colorTexture sub:sub] autorelease];
++
++		/* metal_trace=frame: a sub-encoder's draws go into a core command buffer of its own, which the core does not time */
++		if (_ftrace != NULL) hm_ft_line(_ftrace, "enc i=%u kind=render parent=%u sub=1 t=%.6f\n", [encoder hakiosFtIndex], _ftEnc, hm_now());
++		return encoder;
++	}
+ }
+ 
+ /* every sub-encoder stores (above); a resolve asked for here is read from the descriptor's store action at the end */
+@@ -8831,10 +10503,19 @@ - (void)endEncoding
+ 	[_lock lock];
+ 	for (NSValue *v in _subs) {
+ 		hakios_metal_cb *sub = (hakios_metal_cb *)[v pointerValue];
++		const unsigned before = _ftrace != NULL ? hm_ft_total(cb) : 0;
+ 
+ 		if (hakios_metal_cb_append(cb, sub) != 0) {
+ 			hm_print("refused: a parallel render pass's sub-encoder: %s\n", hakios_metal_error());
+ 		}
++		if (_ftrace != NULL) {
++			/* (passes counted but not timed: the core's pass index of what follows is past them by as many) */
++			const unsigned after = hm_ft_total(cb);
++
++			pthread_mutex_lock(&_ftrace->lock);
++			_ftrace->unprofiled += after > before ? after - before : 0;
++			pthread_mutex_unlock(&_ftrace->lock);
++		}
+ 		hakios_metal_cb_free(sub);
+ 	}
+ 	const BOOL none = [_subs count] == 0;
+@@ -8861,6 +10542,7 @@ - (void)endEncoding
+ 			hakios_metal_cb_refuse(cb, hakios_metal_error());
+ 		}
+ 	}
++	if (_ftrace != NULL) hm_ft_line(_ftrace, "endenc i=%u t=%.6f\n", _ftEnc, hm_now());
+ 	[super endEncoding];   /* MUST: the base class retains the command buffer and this is what releases it */
+ }
+ 

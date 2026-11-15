@@ -1,0 +1,99 @@
+Subject: A tiled pass's profile says which attachments are written and which are read
+
+The plug-in's `passes:` line gave a tiled pass's attachments touched as one mask, written or read. On the phone the
+main pass is 78 tiles when its draws touch the second attachment and 42 when they do not, and costs twice as much a
+draw there: whether that attachment is written by a fragment stage's output or only read through framebuffer fetch
+is what says what can be done about it. PassTime::wrote and ::read keep the two (closePass has them already),
+hakios_metal_cb_pass_access hands them to the plug-in, and the line prints them -- and, for a pass left in sysmem,
+why.
+
+Nothing of the stream changes (golden); built for iOS.
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/command.hpp b/hakios-metal/include/hakios-metal/command.hpp
+index 17f59c9..514359b 100644
+--- a/hakios-metal/include/hakios-metal/command.hpp
++++ b/hakios-metal/include/hakios-metal/command.hpp
+@@ -168,8 +168,10 @@ public:
+     // for -- kPassReads a draw reads its target, kPassBelowBar tiled with fewer draws than the bar for what it holds
+     // (render::gmemWorth), kPassNoLoad its tiles load nothing: what the plug-in's passes and timeline lines print as
+     // "touched")
++    // (WROTE, READ: of a tiled pass, the attachments a draw's fragment stage has an output for, and those a draw
++    // reads through framebuffer fetch -- what TOUCHED's low byte is the union of)
+     enum : uint16_t { kPassReads = 0x100, kPassBelowBar = 0x200, kPassNoLoad = 0x400 };
+-    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; std::string sysmemWhy; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
++    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; uint8_t wrote = 0, read = 0; std::string sysmemWhy; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
+     static constexpr uint32_t kMaxProfiled = 64;
+     void setProfile(bool on) { profile_ = on; }
+     // ...and each draw of a sysmem pass on its own, the first kMaxProfiledDraws: a wait for idle before it and after it,
+diff --git a/hakios-metal/include/hakios-metal/hakios_metal.h b/hakios-metal/include/hakios-metal/hakios_metal.h
+index 6049d6e..216a41c 100644
+--- a/hakios-metal/include/hakios-metal/hakios_metal.h
++++ b/hakios-metal/include/hakios-metal/hakios_metal.h
+@@ -501,6 +501,9 @@ int hakios_metal_cb_draw_place(hakios_metal_cb *cb, unsigned i, unsigned *pass,
+ void hakios_metal_cb_gmem_counts(hakios_metal_cb *cb, unsigned *passes, unsigned *tiles);
+ /* pass I's colour attachments as a mask, and those its draws wrote or read (a GMEM pass's; 0 for a sysmem one): -1 past the passes */
+ int hakios_metal_cb_pass_attachments(hakios_metal_cb *cb, unsigned i, unsigned *attached, unsigned *touched);
++/* ...and of a tiled pass, apart: the attachments its draws' fragment stages have an output for (WROTE) and those a draw
++ * reads through framebuffer fetch (READ), as masks; -1 past the profiled passes */
++int hakios_metal_cb_pass_access(hakios_metal_cb *cb, unsigned i, unsigned *wrote, unsigned *read);
+ int hakios_metal_cb_pass_tiles(hakios_metal_cb *cb, unsigned i);
+ /* why CB's last pass refused for GMEM was refused ("" when none was); valid while CB lives */
+ const char *hakios_metal_cb_gmem_refusal(hakios_metal_cb *cb);
+diff --git a/hakios-metal/src/c_api.cpp b/hakios-metal/src/c_api.cpp
+index 7f59918..15e2e94 100644
+--- a/hakios-metal/src/c_api.cpp
++++ b/hakios-metal/src/c_api.cpp
+@@ -978,6 +978,15 @@ int hakios_metal_cb_pass_attachments(hakios_metal_cb* cb, unsigned i, unsigned*
+     return 0;
+ }
+ 
++int hakios_metal_cb_pass_access(hakios_metal_cb* cb, unsigned i, unsigned* wrote, unsigned* read) {
++    syncOne(cb);
++    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
++    if (i >= t.size()) return -1;
++    *wrote = t[i].wrote;
++    *read = t[i].read;
++    return 0;
++}
++
+ int hakios_metal_cb_pass_tiles(hakios_metal_cb* cb, unsigned i) {
+     syncOne(cb);
+     const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+diff --git a/hakios-metal/src/render.cpp b/hakios-metal/src/render.cpp
+index 4321643..287a568 100644
+--- a/hakios-metal/src/render.cpp
++++ b/hakios-metal/src/render.cpp
+@@ -5282,6 +5282,8 @@ void CommandBuffer::closePass() {
+             profiled_.back().attached = attached;
+             profiled_.back().touched = uint16_t(((open_->written | open_->read) & 0xffu) | (open_->read != 0 ? kPassReads : 0u) | (belowBar ? kPassBelowBar : 0u) |
+                                                 (load == 0 ? kPassNoLoad : 0u));
++            profiled_.back().wrote = uint8_t(open_->written);
++            profiled_.back().read = uint8_t(open_->read);
+         }
+     }
+     {
+diff --git a/userland/src/HakiosMetalCA.m b/userland/src/HakiosMetalCA.m
+index cccd594..0d9220c 100644
+--- a/userland/src/HakiosMetalCA.m
++++ b/userland/src/HakiosMetalCA.m
+@@ -5864,10 +5864,15 @@ - (void)enqueue
+ 					hm_print("passes: %d passes, %.2f ms on the GPU\n", n, total / 1e3);
+ 					for (int i = 0; i < n; i++) {
+ 						hakios_metal_cb_pass_time(cb, (unsigned)i, &kind, &width, &height, &draws, &us);
+-						unsigned attached = 0, touched = 0;
++						unsigned attached = 0, touched = 0, wrote = 0, read = 0;
+ 						hakios_metal_cb_pass_attachments(cb, (unsigned)i, &attached, &touched);
+-						hm_print("passes:   %2d kind %u %ux%u draws %u tiles %d attached %#x touched %#x %.3f ms\n", i, kind, width, height,
+-							 draws, hakios_metal_cb_pass_tiles(cb, (unsigned)i), attached, touched, us / 1e3);
++						hakios_metal_cb_pass_access(cb, (unsigned)i, &wrote, &read);
++						/* (a tiled pass's attachments: those set, those its draws write or read -- TOUCHED's low byte, with why
++						 * it was tiled above it -- and the two apart: written by a fragment stage's output, read by a fetch) */
++						hm_print("passes:   %2d kind %u %ux%u draws %u tiles %d attached %#x touched %#x wrote %#x read %#x %.3f ms%s%s\n", i, kind,
++							 width, height, draws, hakios_metal_cb_pass_tiles(cb, (unsigned)i), attached, touched, wrote, read, us / 1e3,
++							 hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i)[0] != 0 ? " sysmem: " : "",
++							 hakios_metal_cb_pass_sysmem_why(cb, (unsigned)i));
+ 					}
+ 				}
+ 			}

@@ -1,0 +1,81 @@
+Subject: Merge branch 'gpu-pass' (fa8d36c): a tiled pass's profile says what it was tiled for
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/command.hpp b/hakios-metal/include/hakios-metal/command.hpp
+index a26bbbf..2acd2e1 100644
+--- a/hakios-metal/include/hakios-metal/command.hpp
++++ b/hakios-metal/include/hakios-metal/command.hpp
+@@ -164,7 +164,12 @@ public:
+     // what each costs, beside what it was (a draw pass with its target's size and its draws, a copy, a clear, a
+     // dispatch). Read once the buffer has completed. metal_fps names a frame's slowest passes with it.
+     enum PassKind : uint32_t { kPassDraw = 0, kPassCopy = 1, kPassClear = 2, kPassDispatch = 3 };
+-    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0, touched = 0; std::string sysmemWhy; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
++    // (TOUCHED: the attachments a tiled pass's draws write or read, as a mask, and above them what the pass was tiled
++    // for -- kPassReads a draw reads its target, kPassBelowBar tiled with fewer draws than the bar for what it holds
++    // (render::gmemWorth), kPassNoLoad its tiles load nothing: what the plug-in's passes and timeline lines print as
++    // "touched")
++    enum : uint16_t { kPassReads = 0x100, kPassBelowBar = 0x200, kPassNoLoad = 0x400 };
++    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; std::string sysmemWhy; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
+     static constexpr uint32_t kMaxProfiled = 64;
+     void setProfile(bool on) { profile_ = on; }
+     // ...and each draw of a sysmem pass on its own, the first kMaxProfiledDraws: a wait for idle before it and after it,
+diff --git a/hakios-metal/src/render.cpp b/hakios-metal/src/render.cpp
+index 4e64fef..dde8c22 100644
+--- a/hakios-metal/src/render.cpp
++++ b/hakios-metal/src/render.cpp
+@@ -5071,6 +5071,7 @@ void CommandBuffer::closePass() {
+     // (the tiles over the render area alone unless the bisect or a Clear in the tiles has them over the whole window)
+     const bool overArea = open_->area[0] <= open_->area[2] && open_->area[1] <= open_->area[3] && !(gmemOff_ & kGmemWholeArea) && open_->clears == 0;
+     uint32_t noted = open_->draws;
++    bool belowBar = false;   // (tiled with fewer draws than the bar, for what the pass holds)
+     if (open_->dual) {
+         // Recorded both ways: the tiles or the sysmem words, head and all, by what the pass turned out to hold
+         // (render::gmemWorth) -- or by its draws against the bar alone, the bisect's kGmemByDrawsAlone.
+@@ -5097,6 +5098,7 @@ void CommandBuffer::closePass() {
+             // (a pass tiled for what it holds counts as a heavy one of its kind: draw() records the next like it both
+             // ways again, however few its draws, instead of for sysmem alone)
+             if (tiles) noted = std::max(noted, gmemMinDraws_);
++            belowBar = tiles && open_->draws < gmemMinDraws_;
+         }
+         if (tiles) {
+             appendStream(stream_, open_->headGmem);
+@@ -5233,7 +5235,8 @@ void CommandBuffer::closePass() {
+             uint8_t attached = 0;
+             for (uint32_t i = 0; i < kMaxColorOutputs; i++) attached |= (i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture) != nullptr ? 1u << i : 0u;
+             profiled_.back().attached = attached;
+-            profiled_.back().touched = uint8_t(open_->written | open_->read);
++            profiled_.back().touched = uint16_t(((open_->written | open_->read) & 0xffu) | (open_->read != 0 ? kPassReads : 0u) | (belowBar ? kPassBelowBar : 0u) |
++                                                (load == 0 ? kPassNoLoad : 0u));
+         }
+     }
+     pm4::Stream tail;
+diff --git a/hakios-metal/tests/render_test.cpp b/hakios-metal/tests/render_test.cpp
+index 665a428..a0ec289 100644
+--- a/hakios-metal/tests/render_test.cpp
++++ b/hakios-metal/tests/render_test.cpp
+@@ -5760,6 +5760,7 @@ TEST(a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone) {
+             p.load = load;
+             auto cb = r.queue->commandBuffer();
+             cb->setGmemMinDraws(16);
++            cb->setProfile(true);
+             if (alone) cb->setGmemOff(CommandBuffer::kGmemByDrawsAlone);
+             for (int i = 0; i < draws; i++) CHECK(cb->draw(fetch ? fb : flatProgram(), p, wholeDraw(6), Bindings{}, Bindings{}));
+             cb->commit();
+@@ -5768,6 +5769,16 @@ TEST(a_pass_is_tiled_for_what_it_holds_and_not_for_its_draws_alone) {
+             CHECK_EQ(cb->counts().passes, 1u);
+             CHECK_EQ(r.fake->stats().faults, 0u);
+             if (r.fake->stats().faults) std::printf("       %s\n", r.fake->stats().lastFault.c_str());
++            // what a tiled pass's profile says it was tiled for (PassTime::touched's upper bits)
++            const auto times = cb->passTimes();
++            CHECK_EQ(times.size(), size_t(1));
++            if (times.size() == 1 && cb->counts().gmemPasses == 1) {
++                const uint32_t said = times[0].touched & 0xff00u;
++                const uint32_t want = (fetch ? uint32_t(CommandBuffer::kPassReads) : 0u) | (draws < 16 ? uint32_t(CommandBuffer::kPassBelowBar) : 0u) |
++                                      (load == LoadAction::kDontCare ? uint32_t(CommandBuffer::kPassNoLoad) : 0u);
++                CHECK_EQ(said, want);
++                CHECK_EQ(times[0].touched & 0xffu, 1u);
++            }
+             return cb->counts().gmemPasses;
+         };
+         {

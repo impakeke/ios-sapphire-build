@@ -1,0 +1,29 @@
+Subject: A610: no ASTC HDR formats, which nothing has measured on this chip
+
+The HDR rows of the format table rest on a probe run on the A635. Mesa has no ASTC HDR format for any Adreno, and the
+device this system reports (iPhone X, Apple4) has none in Metal either. Conservative: a refusal, not a guess.
+
+---
+diff --git a/hakios-metal/src/texture.cpp b/hakios-metal/src/texture.cpp
+index 9cb009d..ab5e573 100644
+--- a/hakios-metal/src/texture.cpp
++++ b/hakios-metal/src/texture.cpp
+@@ -140,6 +140,10 @@ constexpr FormatInfo kFormats[] = {
+     {PixelFormat::kPVRTC_RGBA_4BPP_sRGB, FMT6_8_8_8_8_UNORM, 4, WZYX, true, true, kElemFloat, "PVRTC_RGBA_4BPP_sRGB", false, false, false, 1, 1, FMT6_NONE, 4},
+     // HDR: the same storage and the same FMT6 as LDR -- A6xx has one ASTC decoder, and probe 9j2h measures what it makes
+     // of an HDR block
++#if !defined(HAKIOS_CHIP_A610)
++    // (not on the A610: what its texture unit makes of an HDR block is not measured -- probe 9j2h was run on the A635 --
++    // and Mesa lists no ASTC HDR format for any Adreno, fd6_format_table.c:324-352 being LDR and sRGB alone. The iPhone X
++    // this system believes it is has none either: ASTC HDR is MTLGPUFamilyApple6's.)
+     {PixelFormat::kASTC_4x4_HDR, FMT6_ASTC_4x4, 16, WZYX, true, false, kElemFloat, "ASTC_4x4_HDR", false, false, false, 4, 4},
+     {PixelFormat::kASTC_5x4_HDR, FMT6_ASTC_5x4, 16, WZYX, true, false, kElemFloat, "ASTC_5x4_HDR", false, false, false, 5, 4},
+     {PixelFormat::kASTC_5x5_HDR, FMT6_ASTC_5x5, 16, WZYX, true, false, kElemFloat, "ASTC_5x5_HDR", false, false, false, 5, 5},
+@@ -154,6 +158,7 @@ constexpr FormatInfo kFormats[] = {
+     {PixelFormat::kASTC_10x10_HDR, FMT6_ASTC_10x10, 16, WZYX, true, false, kElemFloat, "ASTC_10x10_HDR", false, false, false, 10, 10},
+     {PixelFormat::kASTC_12x10_HDR, FMT6_ASTC_12x10, 16, WZYX, true, false, kElemFloat, "ASTC_12x10_HDR", false, false, false, 12, 10},
+     {PixelFormat::kASTC_12x12_HDR, FMT6_ASTC_12x12, 16, WZYX, true, false, kElemFloat, "ASTC_12x12_HDR", false, false, false, 12, 12},
++#endif
+ };
+ 
+ const char* typeName(TextureType t) {

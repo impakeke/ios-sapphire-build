@@ -1,0 +1,282 @@
+Subject: plug-in: the switches also from /var/tmp/metal.args (optional, for this port's measurements)
+
+Every metal_* switch is read from kern.bootargs, which on this phone means building and flashing a boot image for
+each one tried. hm_bootargs() appends the words of /var/tmp/metal.args to the kernel's. No kernel needs it.
+
+---
+diff --git a/userland/src/HakiosMetalCA.m b/userland/src/HakiosMetalCA.m
+index c6a7ff1..f60715f 100644
+--- a/userland/src/HakiosMetalCA.m
++++ b/userland/src/HakiosMetalCA.m
+@@ -109,6 +109,46 @@
+ 
+ /* --- printing ----------------------------------------------------------------------------------------------- */
+ 
++/*
++ * The switches this plug-in reads (metal_fps, metal_gmem=1, metal_all=1 ...): the kernel's boot-args and, after them, the
++ * words of /var/tmp/metal.args, so that one can be tried without building and flashing a boot image -- the file written,
++ * then the window server restarted (each switch is read once a process). As sysctlbyname("kern.bootargs"): 0 and the
++ * string in ARGS, *SIZE its length with the terminator. Not needed by any kernel; a port's convenience.
++ */
++static int
++hm_bootargs(char *args, size_t *size)
++{
++	const size_t room = *size;
++	size_t used;
++	int fd;
++
++	if (sysctlbyname("kern.bootargs", args, size, NULL, 0) != 0) {
++		return -1;
++	}
++	used = strnlen(args, room);
++	fd = open("/var/tmp/metal.args", O_RDONLY);
++	if (fd < 0) {
++		return 0;
++	}
++	if (used + 2 < room) {
++		ssize_t got;
++
++		args[used++] = ' ';
++		got = read(fd, args + used, room - used - 1);
++		if (got > 0) {
++			used += (size_t)got;
++		}
++		args[used] = '\0';
++		for (size_t i = 0; i < used; i++) {
++			if (args[i] == '\n' || args[i] == '\r' || args[i] == '\t') {
++				args[i] = ' ';
++			}
++		}
++		*size = used + 1;
++	}
++	close(fd);
++	return 0;
++}
+ static void hm_print(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+ static int hm_print_fd = -1;    /* where hm_print writes: stderr, the console, or (metal_m2v=1) a copy of stderr kept aside */
+ 
+@@ -1364,7 +1404,7 @@ - (void)hakiosTakeResolves:(MTLRenderPassDescriptor *)descriptor;
+ 		char args[1024] = {0};
+ 		size_t size = sizeof(args) - 1;
+ 
+-		strict = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_strict") != NULL;
++		strict = hm_bootargs(args, &size) == 0 && strstr(args, "metal_strict") != NULL;
+ 	}
+ 	return strict != 0;
+ }
+@@ -1736,7 +1776,7 @@ - (void)hakiosTakeResolves:(MTLRenderPassDescriptor *)descriptor;
+ 	size_t size = sizeof(args) - 1;
+ 	const char *at;
+ 
+-	if (function == nil || sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (at = strstr(args, key)) == NULL ||
++	if (function == nil || hm_bootargs(args, &size) != 0 || (at = strstr(args, key)) == NULL ||
+ 	    ![function respondsToSelector:sel_getUid("bitcodeData")]) {
+ 		return;
+ 	}
+@@ -2084,7 +2124,7 @@ + (void)load
+ 		const char *at;
+ 		pthread_t sampler;
+ 
+-		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (at = strstr(args, "ca_prof=")) == NULL) return;
++		if (hm_bootargs(args, &size) != 0 || (at = strstr(args, "ca_prof=")) == NULL) return;
+ 		ca_prof_us = (unsigned)atoi(at + 8);
+ 		if (ca_prof_us == 0) return;
+ 		pthread_create(&sampler, NULL, ca_prof_main, NULL);
+@@ -2115,7 +2155,7 @@ extern id native_bridge_metal_open(const char *loader, const char *cache, uint64
+ 	char args[1024] = "";
+ 	size_t size = sizeof(args) - 1;
+ 
+-	return sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, what) != NULL;
++	return hm_bootargs(args, &size) == 0 && strstr(args, what) != NULL;
+ }
+ 
+ - (instancetype)initWithAcceleratorPort:(io_service_t)port
+@@ -2130,7 +2170,7 @@ - (instancetype)initWithAcceleratorPort:(io_service_t)port
+ 		const char *name = getprogname();
+ 
+ 		if (all < 0) {
+-			all = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_all=1") != NULL;
++			all = hm_bootargs(args, &size) == 0 && strstr(args, "metal_all=1") != NULL;
+ 		}
+ 		if (!all && (name == NULL || strcmp(name, "backboardd") != 0)) {
+ 			HM_ONCE("%s is not shown the device: the window server alone is (metal_all=1: every process)\n", name ? name : "?");
+@@ -2146,7 +2186,7 @@ - (instancetype)initWithAcceleratorPort:(io_service_t)port
+ 			size_t size = sizeof(args) - 1;
+ 			const char *at;
+ 
+-			if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "tu_debug=")) != NULL) {
++			if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "tu_debug=")) != NULL) {
+ 				strlcpy(value, at + 9, sizeof(value));
+ 				value[strcspn(value, " ")] = 0;
+ 				setenv("TU_DEBUG", value, 1);
+@@ -3280,7 +3320,7 @@ - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descri
+ 				char args[1024] = {0}, *at;
+ 				size_t size = sizeof(args) - 1;
+ 
+-				if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_dump=")) != NULL &&
++				if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_dump=")) != NULL &&
+ 				    (uint32_t)strtoul(at + 11, NULL, 16) == h) {
+ 					for (NSUInteger o = 0; o < [air length]; o += 64) {
+ 						char line[160];
+@@ -3494,7 +3534,7 @@ - (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)opt
+ 		char args[1024] = {0};
+ 		size_t size = sizeof(args) - 1;
+ 
+-		off = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_noubwc") != NULL;
++		off = hm_bootargs(args, &size) == 0 && strstr(args, "metal_noubwc") != NULL;
+ 	}
+ 	return !off;
+ }
+@@ -4968,7 +5008,7 @@ - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device descriptor:(id)
+ 		char args[1024] = "";
+ 		size_t size = sizeof(args) - 1;
+ 
+-		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_defer=1") != NULL) {
++		if (hm_bootargs(args, &size) == 0 && strstr(args, "metal_defer=1") != NULL) {
+ 			hakios_metal_queue_set_deferred(_queue, 1);
+ 			HM_ONCE("command buffers recorded deferred, by a thread of hakios-metal's (metal_defer=1)\n");
+ 		}
+@@ -5659,7 +5699,7 @@ - (void)enqueue
+ 		char args[1024] = {0};
+ 		size_t size = sizeof(args) - 1;
+ 
+-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_gmem=1") != NULL;
++		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_gmem=1") != NULL;
+ 	}
+ 	return on != 0;
+ }
+@@ -5674,7 +5714,7 @@ - (void)enqueue
+ 		char args[1024] = {0};
+ 		size_t size = sizeof(args) - 1;
+ 
+-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps=draws") != NULL;
++		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_fps=draws") != NULL;
+ 	}
+ 	return on != 0;
+ }
+@@ -5694,7 +5734,7 @@ - (void)enqueue
+ 		const char *at;
+ 
+ 		bits = 0;
+-		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_gmem_off=")) != NULL) {
++		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_gmem_off=")) != NULL) {
+ 			bits = atoi(at + strlen("metal_gmem_off="));
+ 		}
+ 	}
+@@ -5716,7 +5756,7 @@ - (void)enqueue
+ 		const char *at;
+ 
+ 		draws = 56;
+-		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_gmem_draws=")) != NULL) {
++		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_gmem_draws=")) != NULL) {
+ 			draws = atoi(at + strlen("metal_gmem_draws="));
+ 		}
+ 	}
+@@ -5732,7 +5772,7 @@ - (void)enqueue
+ 		char args[1024] = {0};
+ 		size_t size = sizeof(args) - 1;
+ 
+-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps") != NULL;
++		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_fps") != NULL;
+ 	}
+ 	return on != 0;
+ }
+@@ -5783,7 +5823,7 @@ - (void)enqueue
+ 				if (passesOn < 0) {
+ 					char args[1024] = "";
+ 					size_t size = sizeof(args) - 1;
+-					passesOn = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps=passes") != NULL;
++					passesOn = hm_bootargs(args, &size) == 0 && strstr(args, "metal_fps=passes") != NULL;
+ 				}
+ 				int n = passesOn ? hakios_metal_cb_pass_time(cb, 0, NULL, NULL, NULL, NULL, NULL) : 0;
+ 				double total = 0, us;
+@@ -5825,7 +5865,7 @@ - (void)enqueue
+ 				if (mainOn < 0) {
+ 					char args[1024] = "";
+ 					size_t size = sizeof(args) - 1;
+-					mainOn = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps=mainpass") != NULL;
++					mainOn = hm_bootargs(args, &size) == 0 && strstr(args, "metal_fps=mainpass") != NULL;
+ 				}
+ 				const BOOL main = mainOn && slowUs > 4000 && slowDraws >= 40 && mainShown < 6;
+ 				mainShown += main ? 1 : 0;
+@@ -6063,7 +6103,7 @@ - (void)enqueue
+ 		char args[1024] = {0};
+ 		size_t size = sizeof(args) - 1;
+ 
+-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps=sample") != NULL;
++		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_fps=sample") != NULL;
+ 	}
+ 	return on != 0;
+ }
+@@ -6234,7 +6274,7 @@ - (void)enqueue
+ 		char args[1024] = {0};
+ 		size_t size = sizeof(args) - 1;
+ 
+-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps=timeline") != NULL;
++		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_fps=timeline") != NULL;
+ 	}
+ 	return on != 0;
+ }
+@@ -6266,7 +6306,7 @@ - (void)enqueue
+ 			char args[1024] = "";
+ 			size_t size = sizeof(args) - 1;
+ 
+-			lines = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "touch_lat=1") != NULL;
++			lines = hm_bootargs(args, &size) == 0 && strstr(args, "touch_lat=1") != NULL;
+ 		}
+ 		if (lines) {
+ 			fprintf(stderr, "tl: M made %.0f committed %.0f done %.0f gpu %.0f\n", [self hakiosCreatedAt] * 1e6,
+@@ -7341,7 +7381,7 @@ - (oneway void)release
+ 	if (traced < 0) {
+ 		char args[1024] = {0};
+ 		size_t size = sizeof(args) - 1;
+-		traced = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_trace_release") != NULL;
++		traced = hm_bootargs(args, &size) == 0 && strstr(args, "metal_trace_release") != NULL;
+ 	}
+ 	if (traced && [self retainCount] == 1) {
+ 		char what[128];
+@@ -7398,7 +7438,7 @@ - (hakios_metal_program *)hakiosProgram { return _program; }
+ 		char args[1024] = {0};
+ 		size_t size = sizeof(args) - 1;
+ 
+-		off = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_nospec") != NULL;
++		off = hm_bootargs(args, &size) == 0 && strstr(args, "metal_nospec") != NULL;
+ 	}
+ 	return off != 0;
+ }
+@@ -8112,7 +8152,7 @@ - (void)hakiosDraw:(MTLPrimitiveType)primitive vertexStart:(NSUInteger)start ver
+ 		char args[1024] = "";
+ 		size_t size = sizeof(args) - 1;
+ 
+-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_trace=1") != NULL;
++		on = hm_bootargs(args, &size) == 0 && strstr(args, "metal_trace=1") != NULL;
+ 	}
+ 	return on == 1;
+ }
+@@ -8131,7 +8171,7 @@ - (void)hakiosDraw:(MTLPrimitiveType)primitive vertexStart:(NSUInteger)start ver
+ 		const char *at;
+ 
+ 		read = 1;
+-		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_skip=")) != NULL) {
++		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_skip=")) != NULL) {
+ 			at += strlen("metal_skip=");
+ 			for (size_t i = 0; i + 1 < sizeof(word) && at[i] != '\0' && at[i] != ' '; i++) {
+ 				word[i] = at[i] == '_' ? ' ' : at[i];
+@@ -8157,7 +8197,7 @@ - (void)hakiosDraw:(MTLPrimitiveType)primitive vertexStart:(NSUInteger)start ver
+ 		const char *at;
+ 
+ 		state = 0;
+-		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_dump=cfg:")) != NULL) {
++		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_dump=cfg:")) != NULL) {
+ 			at += strlen("metal_dump=cfg:");
+ 			for (size_t i = 0; i + 1 < sizeof(name) && at[i] != '\0' && at[i] != ' '; i++) name[i] = at[i];
+ 			state = name[0] != '\0';
+@@ -8201,7 +8241,7 @@ - (void)hakiosDraw:(MTLPrimitiveType)primitive vertexStart:(NSUInteger)start ver
+ 		char args[1024] = "";
+ 		size_t size = sizeof(args) - 1;
+ 
+-		keep = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_luma_boost=1") != NULL;
++		keep = hm_bootargs(args, &size) == 0 && strstr(args, "metal_luma_boost=1") != NULL;
+ 		HM_ONCE("luma_boost: %s (metal_luma_boost=1 draws it)\n", keep ? "drawn" : "left out, the picture as it is");
+ 	}
+ 	return !keep;

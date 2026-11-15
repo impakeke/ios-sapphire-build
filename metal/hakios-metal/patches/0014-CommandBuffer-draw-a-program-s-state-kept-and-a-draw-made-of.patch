@@ -1,0 +1,3036 @@
+Subject: CommandBuffer::draw: a program's state kept, and a draw made of what changed
+
+A draw was judged and encoded whole every time -- checkTarget, checkStage twice, link, vertexFetch, pushedRanges,
+stageTextures, gfxIbos, some 590 words made -- into a stream of its own that appendDeduped then read back to drop
+the 9 words in 10 the registers already held. What a draw's program and its kind of pass decide between them is
+now worked out at the first draw with that program and kept; the draws after it are judged by what they bind and
+written from what differs. The words that reach the command processor are the same, one for one (the golden
+streams of every test and scene, both chips' constants, recorded three ways: below).
+
+What is kept, and where:
+- ProgramState (render.cpp): for a program in a kind of pass (StateKey: each attachment's format, depth or not,
+  every option) the verdicts of checkStage, link and the blend words (ProgramFacts), what each stage needs bound
+  (StagePlan), the vertex attributes as vertexFetch reads them, and the words of the groups that are the
+  program's alone, as emitDraw wrote them. In the queue (StateCache, by Program::uid) for a program that has a uid,
+  so the next command buffer finds it; in the command buffer, beside a copy of the Program compared byte for byte,
+  for one made by hand.
+- Program::uid: linkProgram gives one, and so does every setter of the C interface that changes a program after
+  that (vertex descriptor, blending, samples): a changed program is another program.
+- PassCache (OpenPass::cache): the window and sample count checkTarget worked out, the pass's own groups (depth
+  and stencil buffer, colour targets, MSAA, RB_RENDER_CNTL, LRZ) by what a program draws into, a fetch's
+  descriptors of the attachments, and for each of the pass's streams a Cursor: the words it last held of each
+  kept group and the numbers the last draw's own groups were made of.
+- DrawCache (CommandBuffer): the states at hand by uid, the facts' scratch.
+
+A draw with a kept state:
+- fastFacts and fastTables are drawFacts' rules for what a draw brings -- bindings, counts, viewport, scissor,
+  depth and stencil state, the index buffer -- and write the texture, sampler and IBO descriptors straight into the
+  draw's table (a texture's sampled descriptor is made once: Texture::sampledWords). Whatever they are not sure of
+  goes the long way, where drawFacts judges it and refuses it by its sentence.
+- emitFast walks the groups in the order a draw has them. A kept group whose words are the ones the stream last
+  held for it is passed over; one that differs goes through the register shadow (DedupSink: appendDeduped's rule
+  applied as the words are made, no stream in between). A group made of the draw's numbers is made when the
+  numbers are not the last draw's. The stages' loads and HLSQ_INVALIDATE_CMD, which no shadow drops, are appended
+  as they are, every draw. That a group passed over is one the shadow would have dropped whole stands on the
+  groups writing registers of their own, which a test holds them to.
+- keep() and use() take a reference and remember what they were just given: a draw names the buffers and textures
+  of the draw before it. The submission names the same buffers (the golden streams' names).
+
+The first draw with a program, a draw with private memory, an indirect draw, one that counts samples and any pass
+without deduplication go the long way as before (drawFacts, emitDraw through DedupSink).
+
+Held to the long way three times over:
+- CommandBuffer::verifyDraws: every draw taken from a kept state is also written whole, through a copy of the
+  shadow as it was, and the words and the table's bytes compared. The tests run with it on; `tests --unchecked` runs
+  them again as a device does.
+- CommandBuffer::keepStates(false) (hakios_metal_draw_states, `tests --long`, `drawbench --long`): no kept state at
+  all. `make -f tools/dev.mk check` compares the golden sums of all three.
+- tests/draw_state_test.cpp: the cases a kept state is wrong in if kept wrongly, and random frames -- half of each
+  draw's kind made anew, half the draw before with one thing changed, a quarter then wrong in one thing --
+  recorded both ways: the same draws taken, the same refusals by the same sentences, the same passes, the same
+  submissions (39 692 draws taken, 26 778 of them from kept states, 6 388 refused, a chip). Sixteen bugs seeded
+  one at a time into the kept path (a check dropped from fastFacts, a field left out of a Cursor's comparison, a
+  buffer not named, a stale slot) each fail it.
+
+append(): what the appended buffer remembers having named and kept is forgotten with its lists.
+
+Host, A610 constants, us a draw / heap allocations a draw (drawbench, the scenes of the C interface with the
+phone's own stages): S 18.97 / 64.7 -> 6.4 / 6.2, T 10.88 / 38.3 -> 3.9 / 5.8 (quick runs; the table is in the
+report).
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/command.hpp b/hakios-metal/include/hakios-metal/command.hpp
+index 6abbfcf..5bc46da 100644
+--- a/hakios-metal/include/hakios-metal/command.hpp
++++ b/hakios-metal/include/hakios-metal/command.hpp
+@@ -34,6 +34,14 @@ namespace hakios::metal {
+ 
+ class CommandQueue;
+ class Texture;
++namespace render {
++// (render.cpp, the draw path: what a queue keeps of the programs drawn with it, what a command buffer has at hand of
++// that, and what an open pass's stream last held)
++struct StateCache;
++struct DrawCache;
++struct PassCache;
++struct ProgramState;
++}  // namespace render
+ 
+ // a buffer a program sees: a GEM object with its length (MTLBuffer's -length may be less than the object's size)
+ class Buffer {
+@@ -111,9 +119,20 @@ public:
+     // a blit the caller could not record (a buffer not in the GPU's memory, say): the buffer ends in the error state
+     void refuse(const std::string& why) { fail(why); }
+     // a buffer it uses, kept alive until it completes (the owner may let go of it before that)
+-    void keep(std::shared_ptr<const Buffer> b) { kept_.push_back(std::move(b)); }
++    // (by reference, and once: a draw names the same few buffers and textures as the draw before it, and a copy of the
++    // pointer for each -- two atomic counts and a slot of a growing vector -- was most of what keeping them cost. One
++    // kept a moment ago is found in RECENT and left alone; one pushed out of it is kept twice, which costs a slot.)
++    void keep(const std::shared_ptr<const Buffer>& b) {
++        if (b != nullptr && !recently(b.get())) kept_.push_back(b);
++    }
++    void keep(const std::shared_ptr<Buffer>& b) {
++        if (b != nullptr && !recently(b.get())) kept_.push_back(b);
++    }
+     // anything else it uses (a compiled kernel's words), the same way
+-    void keepAlive(std::shared_ptr<const void> p) { keptAny_.push_back(std::move(p)); }
++    template <class T>
++    void keepAlive(const std::shared_ptr<T>& p) {
++        if (p != nullptr && !recently(p.get())) keptAny_.push_back(p);
++    }
+     // OTHER's recorded work after this one's, as if it had been recorded here: its packets, what it names and what it
+     // keeps alive -- a parallel render encoder's sub-encoders each record into a command buffer of their own, from any
+     // thread in any order, and are appended in the order they were made. OTHER is left empty and is not committed; an
+@@ -133,7 +152,12 @@ public:
+     // What the buffer holds, counted as it is recorded: passes opened (each a pass start, its flushes and the wait for
+     // idle at its tail, which is a fixed cost whatever is drawn), the draws in them, and dispatches, copies and clears
+     // (each a pass of its own). What a frame's GPU time goes to is read off these beside the time (metal_fps).
+-    struct Counts { uint32_t passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, binnedPasses = 0; };   // (gmemPasses of the passes drawn in tiles, binnedPasses of those binned)
++    struct Counts {
++        uint32_t passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, binnedPasses = 0;   // (gmemPasses of the passes drawn in tiles, binnedPasses of those binned)
++        // ...of the draws, those encoded from what the queue keeps of their program (render.cpp: ProgramState) rather than
++        // judged and written whole: all but the first with each program in each kind of pass, when all is well
++        uint32_t keptDraws = 0;
++    };
+     const Counts& counts() const { return counts_; }
+     // With profiling on, the command processor writes its always-on counter (CP_ALWAYS_ON_COUNTER, 19.2 MHz) at the start
+     // of each pass and after its tail -- whose wait for idle makes the end the end -- for the first kMaxProfiled passes:
+@@ -173,6 +197,13 @@ public:
+     const std::string& gmemRefusal() const { return gmemWhy_; }
+     // the words recorded so far (what the command processor will read)
+     size_t streamWords() const { return stream_.words().size(); }
++    // (for the tests) every draw taken from a program's kept state checked against the same draw encoded in full: a
++    // difference in a word of the stream or a byte of the draw's table ends the buffer in error, saying which
++    static void verifyDraws(bool on);
++    // a program's kept state not used: every draw judged and written whole, as the first with its program is. The
++    // stream is the same either way (the tests record it both ways); a bisect's switch. On by default; what it was is
++    // returned.
++    static bool keepStates(bool on);
+     std::vector<PassTime> passTimes() const;
+     // why profiled pass I of a draw was drawn in sysmem ("" for a GMEM pass, or one not profiled); valid while the buffer lives
+     const char* passSysmemWhy(size_t i) const { return i < profiled_.size() ? profiled_[i].sysmemWhy.c_str() : ""; }
+@@ -213,7 +244,23 @@ private:
+                      const uint32_t* immediates, const compute::Options& options);
+     // the end of it, however it ends: the status, the handlers (which see that status), and only then the waiters
+     void finish(Status s);
+-    void use(const Buffer& b, bool write) { uses_.push_back(BoUse{&b.bo(), write}); }
++    // (once for reading and once for writing: the submission names each buffer once whatever the draws, and the list was
++    // as long as the frame's draws times their bindings, gone through again for every one of them at the commit)
++    void use(const Buffer& b, bool write) {
++        const Bo* bo = &b.bo();
++        const void* key = reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(bo) | (write ? 1u : 0u));
++        if (!recently(key)) uses_.push_back(BoUse{bo, write});
++    }
++    // whether P was asked about a moment ago (and it is, from now on): a small table by address, one entry a slot
++    bool recently(const void* p) {
++        const uintptr_t a = reinterpret_cast<uintptr_t>(p);
++        const void*& slot = recent_[((a >> 4) ^ (a >> 12)) & (kRecent - 1)];
++        if (slot == p) return true;
++        slot = p;
++        return false;
++    }
++    static constexpr size_t kRecent = 256;
++    const void* recent_[kRecent] = {};
+ public:
+     // What each register written in a pass holds, for appendDeduped: a draw writes some 500 of them and almost all
+     // hold their value already, so each is looked up once, in an open-addressed table of its own (std::unordered_map's
+@@ -286,6 +333,8 @@ private:
+         uint64_t kind = 0;          // render::tuneKeyOf the pass and its ordinal in the buffer among passes of that kind
+         uint32_t ordinal = 0, draws = 0;
+         bool lastFetched = false;   // the last draw read its attachments (render::encodeInPass's AFTER_FETCH for the next)
++        // what the pass's streams last held of a draw's groups, and what its attachments come to (render.cpp: PassCache)
++        std::shared_ptr<render::PassCache> cache;
+     };
+     void closePass();
+     void useAttachments(const RenderPass& pass);
+@@ -315,6 +364,9 @@ private:
+     // the GPU address of K's words in this buffer, uploading them when they are not there; 0 with *WHY when out of memory
+     uint64_t programAddress(const Kernel& k, std::string* why);
+     std::unordered_multimap<const uint32_t*, Uploaded> uploaded_;
++    // the programs this buffer has drawn with and its scratch for a draw (render.cpp: DrawCache), made at the first draw
++    std::shared_ptr<render::DrawCache> drawCache_;
++    std::shared_ptr<Texture> null_;   // the queue's null texture, asked for once a buffer rather than once a draw
+ 
+     CommandQueue& queue_;
+     std::atomic<Status> status_{kNotEnqueued};
+@@ -391,6 +443,9 @@ public:
+     // only now and then (CoreAnimation's: light frames between the heavy ones of an animation) counts as heavy
+     uint32_t peakDraws(uint64_t kind, uint32_t ordinal);
+     void noteDraws(uint64_t kind, uint32_t ordinal, uint32_t draws);
++    // what the queue keeps of the programs drawn with it, from one command buffer to the next (render.cpp: StateCache;
++    // under its own lock)
++    render::StateCache& states();
+ 
+ 
+ private:
+@@ -421,6 +476,7 @@ private:
+     std::unordered_map<uint64_t, uint32_t> lastDraws_;   // (under lock_) noteDraws', by kind and ordinal
+     struct Peak { uint32_t draws = 0, below = 0; };
+     std::unordered_map<uint64_t, Peak> peakDraws_;        // (under lock_) noteDraws' too: peakDraws'
++    std::shared_ptr<render::StateCache> states_;   // (made by states() at the first ask, under lock_)
+     std::condition_variable changed_;
+     std::deque<std::shared_ptr<CommandBuffer>> inFlight_;
+     std::vector<std::unique_ptr<Bo>> idle_;
+diff --git a/hakios-metal/include/hakios-metal/hakios_metal.h b/hakios-metal/include/hakios-metal/hakios_metal.h
+index e756a1a..6049d6e 100644
+--- a/hakios-metal/include/hakios-metal/hakios_metal.h
++++ b/hakios-metal/include/hakios-metal/hakios_metal.h
+@@ -486,6 +486,12 @@ void hakios_metal_cb_set_gmem_min_draws(hakios_metal_cb *cb, unsigned draws);
+ void hakios_metal_cb_set_gmem_binning(hakios_metal_cb *cb, int on);
+ /* every fragment texture of CB's draws the null texture (CommandBuffer::setNullFsTextures): for measuring only */
+ void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb *cb, int on);
++/* How the process's command buffers take their draws from now on (CommandBuffer::keepStates, verifyDraws). KEEP 0:
++ * each draw judged and written whole, as the first with its program is -- the stream is the same either way, so this is
++ * a bisect's switch and a measurement's. VERIFY 1: each draw taken from its program's kept state is also written whole
++ * and the two compared; a difference ends the command buffer in error, saying what differs (a draw's cost more than
++ * twice over: for a check on the device, not for use). 1 and 0 when never called. */
++void hakios_metal_draw_states(int keep, int verify);
+ /* each draw of CB's sysmem passes timed alone (CommandBuffer::setProfileDraws, before anything is recorded) and, once it
+  * has completed, draw I's program name (valid while CB lives) and microseconds; the count is returned, -1 past them */
+ void hakios_metal_cb_set_profile_draws(hakios_metal_cb *cb, int on);
+diff --git a/hakios-metal/include/hakios-metal/pm4.hpp b/hakios-metal/include/hakios-metal/pm4.hpp
+index 9b4b399..897fcf5 100644
+--- a/hakios-metal/include/hakios-metal/pm4.hpp
++++ b/hakios-metal/include/hakios-metal/pm4.hpp
+@@ -78,6 +78,8 @@ public:
+     uint32_t* open(uint32_t opcode, uint32_t count);
+     // room for WORDS more, taken at once (a command buffer's stream grows to what the last one's was)
+     void reserve(size_t words) { words_.reserve(words_.size() + words); }
++    // whole packets already encoded (a program's loads, kept from the last draw with it), as they are
++    void append(const uint32_t* words, size_t count) { words_.insert(words_.end(), words, words + count); }
+ 
+     const std::vector<uint32_t>& words() const { return words_; }
+     size_t size() const { return words_.size(); }
+diff --git a/hakios-metal/include/hakios-metal/render.hpp b/hakios-metal/include/hakios-metal/render.hpp
+index 7dc0aa3..2d98297 100644
+--- a/hakios-metal/include/hakios-metal/render.hpp
++++ b/hakios-metal/include/hakios-metal/render.hpp
+@@ -248,7 +248,15 @@ struct Program {
+     // found in the NIR: a stage that only reads them may be replayed tile by tile (gmemDrawOk). A program not made by
+     // linkProgram says all: unknown is taken as writing.
+     uint8_t ssboWrites = 3;
++    // What says, without reading it, that this Program is the one a draw was encoded with before: a number no other
++    // Program has had (newProgramUid), given by whoever makes the Program and owns everything it points at -- linkProgram,
++    // and again by every change made to it afterwards (the C interface's setters). CommandBuffer::draw keeps what a
++    // program with a uid comes to (its validation, its registers) and finds it again by the uid alone. 0, as a Program
++    // made by hand has it: no such promise, and a draw then compares the whole Program with the one it kept.
++    uint64_t uid = 0;
+ };
++// a uid no Program has had (never 0)
++uint64_t newProgramUid();
+ 
+ namespace render {
+ 
+diff --git a/hakios-metal/include/hakios-metal/texture.hpp b/hakios-metal/include/hakios-metal/texture.hpp
+index 995aba6..8ea68f1 100644
+--- a/hakios-metal/include/hakios-metal/texture.hpp
++++ b/hakios-metal/include/hakios-metal/texture.hpp
+@@ -330,6 +330,10 @@ public:
+     // DEPTH 1, ARRAY_PITCH the layer's bytes, the format's swap and swizzle (fd6_view.c:232-250)
+     // (with mip levels: all of them, MIPLVLS levels - 1 and the layer the whole of them, fd6_view.c:232-250)
+     a6xx::TexConst sampledDescriptor() const;
++    // ...its sixteen words, worked out once and kept: they are the texture's for as long as it lives (its memory, its
++    // size, its format and its swizzle are fixed when it is made), and a draw that samples it copies them into its table
++    // -- working them out again for every texture of every draw was a draw's stageTextures
++    const uint32_t* sampledWords() const;
+     // ...of mip level L alone: what a framebuffer fetch reads of an attachment drawn at that level
+     a6xx::TexConst levelDescriptor(uint32_t level) const;
+     // the descriptor a stib/ldib addresses it through, at IBO slot numSsbos + index: the same without PITCHALIGN,
+@@ -364,6 +368,8 @@ private:
+     // GPU before a draw samples the texture after they changed (CommandBuffer::draw, freshen)
+     std::shared_ptr<Texture> staging_;
+     mutable std::atomic<bool> stale_{false};
++    mutable std::atomic<uint8_t> sampledState_{0};   // sampledWords': 0 not worked out, 1 being written, 2 there
++    mutable uint32_t sampledWords_[16];
+ public:
+     const Texture* staging() const { return staging_.get(); }
+     bool takeStale() const { return stale_.exchange(false); }   // true once a draw is to copy the rows in
+diff --git a/hakios-metal/src/c_api.cpp b/hakios-metal/src/c_api.cpp
+index 30a4aca..169c6df 100644
+--- a/hakios-metal/src/c_api.cpp
++++ b/hakios-metal/src/c_api.cpp
+@@ -925,6 +925,11 @@ void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb* cb, int on) {
+     cb->cb->setNullFsTextures(on != 0);
+ }
+ 
++void hakios_metal_draw_states(int keep, int verify) {
++    CommandBuffer::keepStates(keep != 0);
++    CommandBuffer::verifyDraws(verify != 0);
++}
++
+ void hakios_metal_cb_set_profile_draws(hakios_metal_cb* cb, int on) {
+     if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setProfileDraws(on != 0); });
+     cb->cb->setProfileDraws(on != 0);
+@@ -1179,6 +1184,7 @@ hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base
+     p->program.blend = was.blend;
+     for (uint32_t i = 0; i + 1 < kMaxColorOutputs; i++) p->program.moreBlend[i] = was.moreBlend[i];
+     p->program.samples = was.samples;
++    p->program.uid = newProgramUid();   // (changed after the link: another program to a draw)
+     auto* r = new hakios_metal_program;
+     r->program = std::move(p);
+     r->color = base->color;
+@@ -1224,6 +1230,7 @@ hakios_metal_program* hakios_metal_program_from_stages(const Stage& vs, const St
+     out->program.fsIboBase = out->fs->iboBase;
+     out->program.ssboWrites = uint8_t((out->vs->writesMemory ? 1 : 0) | (out->fs->writesMemory ? 2 : 0));
+     out->program.name = out->name.c_str();
++    out->program.uid = newProgramUid();
+     auto* r = new hakios_metal_program;
+     r->program = std::move(out);
+     r->color = colorPixelFormat;
+@@ -1292,6 +1299,7 @@ int hakios_metal_program_set_vertex_attribute(hakios_metal_program* p, unsigned
+         return -1;
+     }
+     p->program->program.vertexDescriptor.attributes[index] = VertexAttribute{VertexFormat(format), offset, bufferIndex};
++    p->program->program.uid = newProgramUid();   // (changed: what a draw kept of it is not this program's)
+     return 0;
+ }
+ 
+@@ -1301,6 +1309,7 @@ int hakios_metal_program_set_vertex_layout(hakios_metal_program* p, unsigned buf
+         return -1;
+     }
+     p->program->program.vertexDescriptor.layouts[bufferIndex] = VertexLayout{stride, VertexStep(stepFunction), stepRate};
++    p->program->program.uid = newProgramUid();
+     return 0;
+ }
+ 
+@@ -1315,6 +1324,7 @@ int hakios_metal_program_set_samples(hakios_metal_program* p, unsigned samples)
+         return -1;
+     }
+     p->program->program.samples = samples;
++    p->program->program.uid = newProgramUid();
+     return 0;
+ }
+ 
+@@ -1326,6 +1336,7 @@ int hakios_metal_program_set_blend_at(hakios_metal_program* p, unsigned index, i
+     }
+     const ColorBlend b{enabled != 0, rgbOp, alphaOp, srcRgb, dstRgb, srcAlpha, dstAlpha, writeMask};
+     (index == 0 ? p->program->program.blend : p->program->program.moreBlend[index - 1]) = b;
++    p->program->program.uid = newProgramUid();
+     return 0;
+ }
+ 
+diff --git a/hakios-metal/src/compiler.cpp b/hakios-metal/src/compiler.cpp
+index 6357502..f933fe4 100644
+--- a/hakios-metal/src/compiler.cpp
++++ b/hakios-metal/src/compiler.cpp
+@@ -1548,6 +1548,9 @@ std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage> vs,
+     out->program.fsIboBase = fs->iboBase;
+     out->program.ssboWrites = uint8_t((vs->writesMemory ? 1 : 0) | (fs->writesMemory ? 2 : 0));
+     out->program.name = out->name.c_str();
++    // (what CommandBuffer::draw knows it by from now on: the stages it points into are this object's, and nothing changes
++    // it but the C interface's setters, each of which gives it another)
++    out->program.uid = newProgramUid();
+     return out;
+ }
+ 
+diff --git a/hakios-metal/src/render.cpp b/hakios-metal/src/render.cpp
+index 10a3a35..e7c0c86 100644
+--- a/hakios-metal/src/render.cpp
++++ b/hakios-metal/src/render.cpp
+@@ -8,10 +8,14 @@
+ #include "hakios-metal/render.hpp"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cmath>
++#include <cstdio>
+ #include <cstring>
+ #include <initializer_list>
++#include <mutex>
+ #include <tuple>
++#include <unordered_map>
+ 
+ #include "hakios-metal/a6xx.hpp"
+ #include "hakios-metal/command.hpp"
+@@ -231,6 +235,7 @@ struct PushedRange {
+     uint32_t copyAt;
+     const Buffer* buffer;
+     uint64_t bufferOffset;
++    const uint32_t* direct;        // ...or NUM_WORDS words kept elsewhere (a program's constant data, worked out once: ProgramState)
+ };
+ // A stage's ranges for one draw: as many as a Kernel holds, in place -- a vector of them, each with a vector of words,
+ // was two allocations a stage a draw. The words of the ranges loaded direct lie one after another in WORDS, which stays
+@@ -259,7 +264,7 @@ bool pushedRanges(const Stage& s, const Bindings& b, PushedRanges* out, std::str
+             if (r.offsetVec4 + r.sizeDwords / 4 > k.constlen) {
+                 return refuse(why, name() + ": its constant data's range at vec4 " + n(r.offsetVec4) + " runs past its constlen of " + n(k.constlen));
+             }
+-            const PushedRange p{r.offsetVec4, r.sizeDwords / 4, 0, uint32_t(out->words.size()), r.sizeDwords, false, 0, nullptr, 0};
++            const PushedRange p{r.offsetVec4, r.sizeDwords / 4, 0, uint32_t(out->words.size()), r.sizeDwords, false, 0, nullptr, 0, nullptr};
+             out->words.resize(out->words.size() + r.sizeDwords, 0u);
+             for (uint32_t d = 0; d < r.sizeDwords; d++) {
+                 const uint64_t at = uint64_t(r.startDword + d) * 4;
+@@ -286,7 +291,7 @@ bool pushedRanges(const Stage& s, const Bindings& b, PushedRanges* out, std::str
+         if (r.offsetVec4 + r.sizeDwords / 4 > k.constlen) {
+             return refuse(why, name() + ": constant buffer " + n(r.block) + "'s range at vec4 " + n(r.offsetVec4) + " runs past its constlen of " + n(k.constlen));
+         }
+-        PushedRange p{r.offsetVec4, r.sizeDwords / 4, x.buffer->gpuAddress() + x.offset + 4ull * r.startDword, 0, 0, false, 0, nullptr, 0};
++        PushedRange p{r.offsetVec4, r.sizeDwords / 4, x.buffer->gpuAddress() + x.offset + 4ull * r.startDword, 0, 0, false, 0, nullptr, 0, nullptr};
+         if (p.from % 16 != 0) {
+             p.copy = true;
+             p.buffer = x.buffer;
+@@ -1334,7 +1339,7 @@ enum : uint32_t {
+ struct ProgramFacts {
+     // the fragment stage's colour registers, kRegidNone where the pass has no attachment for the output
+     uint32_t colorRegid[kMaxColorOutputs];
+-    uint32_t samples, numRt, numOut, blendMask, W, H;
++    uint32_t numRt, numOut, blendMask;
+     bool dual;
+     BlendWords blends[kMaxColorOutputs];
+     Linkage link;
+@@ -1347,6 +1352,7 @@ struct DrawFacts {
+     Ubos vsUbos, fsUbos;
+     VertexFetch fetch;
+     uint32_t vsNumTex, vsNumSamp, fsNumTex, fsNumSamp, iboCount;
++    uint32_t W, H, samples;       // the pass's window and its attachments' sample count
+     bool depthTest;
+     pc_di_primtype prim;
+     uint64_t maxIndices;
+@@ -1469,7 +1475,7 @@ bool drawFacts(const Program& program, const RenderPass& pass, const Draw& draw,
+     // validation names the mismatch, but validation is off in a shipping app, and an Apple GPU then draws -- SiriUICore
+     // builds its orb's pipelines at 1 sample and draws them into a 4-sample target. Nothing a stage was compiled into
+     // depends on the count (the MSAA state is the attachments', below), so the attachments' is the one taken.
+-    pf.samples = firstAttachment(pass)->samples();
++    f.samples = firstAttachment(pass)->samples();
+     const bool dual = pf.dual = fs.dualSrcBlend != 0;
+     const uint32_t numRt = pf.numRt = dual ? 1u : std::max<uint32_t>(fs.numColorOutputs, 1);   // the attachments drawn into
+     pf.numOut = dual ? 2u : numRt;                                                  // the registers the stage hands the RB
+@@ -1627,8 +1633,8 @@ bool drawFacts(const Program& program, const RenderPass& pass, const Draw& draw,
+         return refuse(why, "cull mode " + n(draw.cullMode) + ", winding " + n(draw.winding) + ": MTLCullMode is 0 to 2, MTLWinding 0 or 1");
+     }
+     const auto [W, H] = windowOf(pass);
+-    pf.W = W;
+-    pf.H = H;
++    f.W = W;
++    f.H = H;
+     const Viewport& vp = draw.viewport;
+     if (!finite(vp.x) || !finite(vp.y) || !finite(vp.width) || !finite(vp.height) || !finite(vp.znear) || !finite(vp.zfar)) {
+         return refuse(why, "a viewport with a non-finite value");
+@@ -1695,7 +1701,7 @@ void emitDraw(S& stream, const DrawFacts& f, const Program& program, const Rende
+     const Stage& vs = program.vs;
+     const Stage& fs = program.fs;
+     const uint32_t* const colorRegid = pf.colorRegid;
+-    const uint32_t samples = pf.samples, numRt = pf.numRt, numOut = pf.numOut, blendMask = pf.blendMask, W = pf.W, H = pf.H;
++    const uint32_t samples = f.samples, numRt = pf.numRt, numOut = pf.numOut, blendMask = pf.blendMask, W = f.W, H = f.H;
+     const bool dual = pf.dual;
+     const BlendWords* const blends = pf.blends;
+     const Linkage& link = pf.link;
+@@ -1926,7 +1932,7 @@ void emitDraw(S& stream, const DrawFacts& f, const Program& program, const Rende
+                 stream.waitForMe();
+                 loadIndirect(stream, s, ST6_CONSTANTS, r.offsetVec4, r.units, table + r.copyAt);
+             } else if (r.numWords != 0) {
+-                loadDirect(stream, s, ST6_CONSTANTS, r.offsetVec4, r.units, ranges.words.data() + r.wordsAt, r.numWords);
++                loadDirect(stream, s, ST6_CONSTANTS, r.offsetVec4, r.units, r.direct != nullptr ? r.direct : ranges.words.data() + r.wordsAt, r.numWords);
+             } else {
+                 loadIndirect(stream, s, ST6_CONSTANTS, r.offsetVec4, r.units, r.from);
+             }
+@@ -2305,7 +2311,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
+         return false;
+     }
+     if (whole) {
+-        passStart(stream, pf.W, pf.H, table, o);
++        passStart(stream, f.W, f.H, table, o);
+         // a Clear: the 2D engine fills the target before any draw state is written, as turnip's subpass begin does it;
+         // the depth attachment's Clear after it (tu_clear_sysmem_attachment, each attachment in turn)
+         clearAll(stream, pass, f.clears, table);
+@@ -2894,6 +2900,910 @@ void encodeBytes(pm4::Stream& stream, uint64_t from, uint64_t to, uint64_t lengt
+     passTail(stream, table, o, false);
+ }
+ 
++
++// =====================================================================================================================
++// What is kept between draws
++// =====================================================================================================================
++// A compositor's draw differs from the one before it in a texture, a few constants, sometimes the program. Encoded
++// whole, every draw judged its program and its pass again, made its 350 to 600 words again and had the pass's register
++// shadow throw most of them away. What follows keeps, instead:
++//
++//   ProgramState   what a program comes to in one kind of pass (StateKey: the attachments' formats, depth or none, the
++//                  options): the facts drawFacts found for it and the words of the groups that are the program's alone,
++//                  made by emitDraw itself the first time a draw with it was taken. Kept by the queue from one command
++//                  buffer to the next (StateCache) for a Program with a uid; by the command buffer, against a copy of
++//                  the Program, for one made by hand.
++//   PassCache      what an open pass's attachments come to (the groups that are the pass's alone, a fetch's descriptor)
++//                  and, for each stream the pass is recorded into, a Cursor: which kept words that stream last held for
++//                  each group, and the last draw's viewport, rasterizer, blend and vertex fetch numbers.
++//
++// A draw with a kept state is judged by what it binds alone (fastFacts, fastTables: drawFacts' own rules for the
++// bindings and the draw's numbers) and writes only what differs from what the cursor says the stream holds; whatever
++// fastFacts is not sure of goes the long way, where drawFacts judges it and refuses it by name. The words that reach
++// the stream are the ones the long way would have left there: a group left out is one whose every register the shadow
++// would have dropped, and what is written goes through the same shadow (DedupSink).
++namespace {
++
++// which packets leave the registers as the stream wrote them: the waits, loads, draws, events and markers a draw is made
++// of. Any other (CP_SET_DRAW_STATE, a memory write the command processor may act on) and the shadow forgets what it knew.
++bool leavesRegisters(uint32_t opcode) {
++    switch (opcode) {
++    case pm4::kNop: case CP_WAIT_MEM_GTE: case CP_SKIP_IB2_ENABLE_GLOBAL: case CP_WAIT_FOR_IDLE: case CP_LOAD_STATE6_GEOM:
++    case CP_LOAD_STATE6_FRAG: case CP_LOAD_STATE6: case CP_DRAW_INDX_OFFSET: case CP_DRAW_INDIRECT_MULTI: case CP_WAIT_REG_MEM:
++    case CP_EVENT_WRITE: case CP_SET_MODE: case CP_SET_VISIBILITY_OVERRIDE: case CP_SET_MARKER: case CP_REG_TO_MEM:
++    case pm4::kMemcpy: case pm4::kWaitMemWrites: case pm4::kWaitForMe:
++        return true;
++    default:
++        return false;
++    }
++}
++
++// A pass's stream behind its register shadow: appendDeduped's rule applied as the words are made, with no stream in
++// between to make and read back. A register write that would put the value the register holds is left out, the writes
++// kept going out as the runs they form inside the packet they came in (as pm4::Stream cuts packets: a run does not
++// span two); HLSQ_INVALIDATE_CMD, a command, is written whatever it holds.
++class DedupSink {
++public:
++    DedupSink(pm4::Stream& to, CommandBuffer::RegShadow& regs) : to_(to), regs_(regs) {}
++    void registers(uint32_t reg, const uint32_t* values, uint32_t count) {
++        while (count > 0) {
++            const uint32_t n = count < pm4::kMaxType4Count ? count : pm4::kMaxType4Count;
++            uint32_t runStart = 0, runLen = 0;
++            for (uint32_t k = 0; k < n; k++) {
++                const bool same = regs_.hold(reg + k, values[k]) && reg + k != REG_A6XX_HLSQ_INVALIDATE_CMD;
++                if (!same) {
++                    if (runLen == 0) runStart = k;
++                    runLen++;
++                } else if (runLen != 0) {
++                    to_.registers(reg + runStart, values + runStart, runLen);
++                    runLen = 0;
++                }
++            }
++            if (runLen != 0) to_.registers(reg + runStart, values + runStart, runLen);
++            reg += n;
++            values += n;
++            count -= n;
++        }
++    }
++    void packet(uint32_t opcode, const uint32_t* words, uint32_t count) {
++        note(opcode);
++        to_.packet(opcode, count != 0 ? words : nullptr, count);
++    }
++    uint32_t* open(uint32_t opcode, uint32_t count) {
++        note(opcode);
++        return to_.open(opcode, count);
++    }
++    void waitForIdle() { to_.waitForIdle(); }
++    void waitMemWrites() { to_.waitMemWrites(); }
++    void waitForMe() { to_.waitForMe(); }
++    void memcpy(uint64_t destination, uint64_t source, uint32_t words) { to_.memcpy(destination, source, words); }
++    // whether a packet made the shadow forget what the registers hold
++    bool forgot() const { return forgot_; }
++
++private:
++    void note(uint32_t opcode) {
++        if (!leavesRegisters(opcode)) {
++            regs_.clear();
++            forgot_ = true;
++        }
++    }
++    pm4::Stream& to_;
++    CommandBuffer::RegShadow& regs_;
++    bool forgot_ = false;
++};
++
++// what a pass's shape and a draw's options are to a program: everything of the pass that ProgramFacts and the program's
++// own groups read (which colour outputs have an attachment, what format each is, whether there is depth), and every
++// switch. Compared as bytes: made zeroed, then filled.
++struct StateKey {
++    uint32_t format[kMaxColorOutputs];   // each colour attachment's pixel format + 1; 0: none
++    uint32_t depth;                      // a depth attachment
++    Options options;
++};
++
++void stateKeyOf(const RenderPass& pass, const Options& o, StateKey* k) {
++    memset(k, 0, sizeof *k);
++    for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
++        const Texture* t = attachmentOf(pass, i).texture;
++        k->format[i] = t != nullptr ? uint32_t(t->format()) + 1 : 0;
++    }
++    k->depth = pass.depth != nullptr ? 1 : 0;
++    k->options = o;
++}
++
++// what a stage needs of a draw's bindings, read off the Stage once
++struct StagePlan {
++    enum : uint8_t { kNone = 0, kSampled = 1, kNull = 2, kFetch = 3 };
++    struct Tex {
++        uint8_t kind, dim, isArray, element, fbTarget;
++    };
++    struct Range {
++        bool direct;            // the constant data's: its words are RANGE_WORDS from wordsAt, the program's own
++        uint32_t block, offsetVec4, units, startDword, sizeDwords, wordsAt;
++    };
++    uint32_t numTex = 0, numSamp = 0, samplerMask = 0;
++    Tex tex[kMaxTextureSlots] = {};
++    bool needsNull = false;         // a slot that is the null texture's, whatever is bound
++    std::vector<Range> ranges;
++    std::vector<uint32_t> rangeWords;
++    uint32_t numUbos = 0, constantDataUbo = 0;
++    uint32_t constUbo[2] = {0, 0};  // the constant data's UBO descriptor: where the program's words lie
++    uint32_t numSsbos = 0;
++};
++
++void planStage(const Stage& s, uint64_t program, StagePlan* p) {
++    const Kernel& k = s.k;
++    p->numTex = std::min(k.numTextureSlots, kMaxTextureSlots);
++    p->samplerMask = k.samplerMask;
++    if (p->numTex != 0) {
++        p->numSamp = 1;
++        for (uint32_t m = 0; m < kMaxTextureSlots; m++) {
++            if ((k.samplerMask >> m) & 1) p->numSamp = m + 1;
++        }
++    }
++    for (uint32_t t = 0; t < p->numTex; t++) {
++        const KernelTexture& kt = k.textures[t];
++        StagePlan::Tex& x = p->tex[t];
++        x.kind = kt.kind != kTexSampled ? StagePlan::kNone : kt.fbTarget != 0 ? StagePlan::kFetch : kt.isNull ? StagePlan::kNull : StagePlan::kSampled;
++        x.dim = kt.dim;
++        x.isArray = kt.isArray;
++        x.element = kt.element;
++        x.fbTarget = kt.fbTarget;
++        if (x.kind == StagePlan::kNull) p->needsNull = true;
++    }
++    for (uint32_t i = 0; i < k.numUboRanges && i < kMaxUboRanges; i++) {
++        const KernelUboRange& r = k.uboRanges[i];
++        StagePlan::Range x{false, r.block, r.offsetVec4, r.sizeDwords / 4, r.startDword, r.sizeDwords, 0};
++        if (k.constantDataUbo != 0 && r.block == k.constantDataUbo - 1) {
++            // (pushedRanges: its words from the program's own, zeros past their end)
++            x.direct = true;
++            x.wordsAt = uint32_t(p->rangeWords.size());
++            p->rangeWords.resize(p->rangeWords.size() + r.sizeDwords, 0u);
++            for (uint32_t d = 0; d < r.sizeDwords; d++) {
++                const uint64_t at = uint64_t(r.startDword + d) * 4;
++                if (at + 4 <= k.constantDataSize) p->rangeWords[x.wordsAt + d] = k.words[k.constantDataOffset / 4 + r.startDword + d];
++            }
++        }
++        p->ranges.push_back(x);
++    }
++    p->numUbos = std::min(k.numUbos, kMaxVertexBuffers);
++    p->constantDataUbo = k.constantDataUbo;
++    if (k.constantDataUbo != 0) uboDescriptor(program + k.constantDataOffset, (k.constantDataSize + 15) / 16, p->constUbo);
++    p->numSsbos = k.numSsbos;
++}
++
++}  // namespace
++
++// What a program comes to in one kind of pass. Made once, read by any thread after.
++struct ProgramState {
++    uint64_t uid = 0;
++    uint32_t keyId = 0;
++    // false: every draw of it goes the long way (a stage with private memory, whose registers are the queue's to move)
++    bool fast = false;
++    ProgramFacts pf{};
++    // the two stages' words where the queue keeps them (a program with a uid), and their addresses
++    std::shared_ptr<Buffer> vsBuffer, fsBuffer;
++    uint64_t vsProgram = 0, fsProgram = 0;
++    StagePlan vs, fs;
++    // the vertex stage's attributes as vertexFetch reads them off the descriptor: the buffer each is fetched from, its
++    // stride and step, and the bytes its last element needs from the element's start
++    struct Attr {
++        uint32_t bufferIndex, stride, stepRate;
++        uint64_t need;
++        bool perInstance;
++    };
++    std::vector<Attr> attrs;
++    uint32_t fetchCount = 0;
++    uint32_t fsIboBase = 0;
++    uint32_t tileCode = 0;          // why no draw of it can be replayed tile by tile (tileWhy), 0 when one can
++    bool fbRead = false, hasKill = false, driverParams = false;
++    uint32_t depthRegid = 0;
++    // the words of the groups that are the program's: register packets, but for the two stages' loads
++    std::vector<uint32_t> words;
++    struct Frag {
++        uint32_t at = 0, n = 0;
++    };
++    Frag invalidate, config, vsRegs, vsLoads, fsRegs, fsLoads, vfd, link, blend;
++    const uint32_t* at(const Frag& f) const { return words.data() + f.at; }
++};
++
++// What a queue keeps of the programs drawn with it.
++struct StateCache {
++    static constexpr uint32_t kNoKey = ~0u;
++    std::mutex lock;
++    std::vector<StateKey> keys;
++    std::unordered_map<uint64_t, std::vector<std::shared_ptr<const ProgramState>>> states;   // by uid, one a kind of pass
++    size_t count = 0;
++
++    // the number this kind of pass goes by in the queue (kNoKey: more kinds than are kept, the long way for all of them)
++    uint32_t keyId(const StateKey& k) {
++        std::lock_guard<std::mutex> g(lock);
++        for (size_t i = 0; i < keys.size(); i++) {
++            if (memcmp(&keys[i], &k, sizeof k) == 0) return uint32_t(i);
++        }
++        if (keys.size() >= 1024) return kNoKey;
++        keys.push_back(k);
++        return uint32_t(keys.size() - 1);
++    }
++    std::shared_ptr<const ProgramState> find(uint64_t uid, uint32_t key) {
++        std::lock_guard<std::mutex> g(lock);
++        auto it = states.find(uid);
++        if (it == states.end()) return nullptr;
++        for (const auto& s : it->second) {
++            if (s->keyId == key) return s;
++        }
++        return nullptr;
++    }
++    void put(std::shared_ptr<const ProgramState> s) {
++        std::lock_guard<std::mutex> g(lock);
++        // (a program let go leaves its states behind, a uid never coming back: past this many, all are dropped -- the
++        // ones in use are found again by their next draw, and a command buffer in flight keeps its own)
++        if (count >= 4096) {
++            states.clear();
++            count = 0;
++        }
++        states[s->uid].push_back(std::move(s));
++        count++;
++    }
++};
++
++namespace {
++
++// what a pass's stream last held of a draw's groups: for each group that is kept as words, the words; for each that is
++// made of the draw's numbers, the numbers
++struct Cursor {
++    enum : uint32_t { kPass, kConfig, kVsRegs, kFsRegs, kVfd, kLink, kBlend, kSlots };
++    struct Last {
++        const uint32_t* at = nullptr;
++        uint32_t n = 0;
++    } last[kSlots];
++    bool rastSet = false, viewportSet = false, blendSet = false, vfdSet = false;
++    uint32_t rast = 0;
++    struct ViewportIn {
++        double v[6];
++        uint32_t sc[4], W, H;
++        bool operator==(const ViewportIn& o) const {
++            for (int i = 0; i < 6; i++) {
++                if (v[i] != o.v[i]) return false;
++            }
++            return sc[0] == o.sc[0] && sc[1] == o.sc[1] && sc[2] == o.sc[2] && sc[3] == o.sc[3] && W == o.W && H == o.H;
++        }
++    } viewport;
++    struct BlendIn {
++        uint32_t color[4];          // the blend colour's bits
++        uint32_t depthCompare, depthWrite, hasDepth, hasKill, depthRegid;
++        uint32_t stencilOn, face[2][6], reference[2];
++        bool operator==(const BlendIn& o) const {
++            if (stencilOn != o.stencilOn) return false;
++            // (a stencil state that is off is the same whatever its faces say)
++            if (stencilOn != 0 && (memcmp(face, o.face, sizeof face) != 0 || reference[0] != o.reference[0] || reference[1] != o.reference[1])) return false;
++            return memcmp(color, o.color, sizeof color) == 0 && depthCompare == o.depthCompare && depthWrite == o.depthWrite && hasDepth == o.hasDepth &&
++                   hasKill == o.hasKill && depthRegid == o.depthRegid;
++        }
++    } blend;
++    struct VfdIn {
++        static constexpr uint32_t kMost = 4;
++        uint32_t n;                 // the fetches used; kMost + 1: more than are compared
++        uint32_t bi[kMost], size[kMost], stride[kMost];
++        uint64_t base[kMost];
++        uint32_t indexOffset, baseInstance, restart;
++        bool operator==(const VfdIn& o) const {
++            if (n != o.n || n > kMost || indexOffset != o.indexOffset || baseInstance != o.baseInstance || restart != o.restart) return false;
++            for (uint32_t i = 0; i < n; i++) {
++                if (bi[i] != o.bi[i] || size[i] != o.size[i] || stride[i] != o.stride[i] || base[i] != o.base[i]) return false;
++            }
++            return true;
++        }
++    } vfd;
++    // (a packet that changes registers behind the stream's back, or a draw encoded the long way: nothing is known)
++    void forget() { *this = Cursor{}; }
++};
++
++}  // namespace
++
++// What an open pass's attachments come to, and where its streams are.
++struct PassCache {
++    uint32_t keyId = StateCache::kNoKey;
++    uint32_t W = 0, H = 0, samples = 1;
++    // [0] the pass in sysmem (the command buffer's stream, or the sysmem side of a pass recorded both ways), [1] its
++    // draws gathered for tiles
++    Cursor cur[2];
++    // the groups that are the pass's alone (depth and stencil, the colour targets, MSAA, RB_RENDER_CNTL, LRZ), by how
++    // many targets a program draws into, which of its outputs have one, and sysmem or tiles
++    struct Frag {
++        uint32_t sig;
++        std::vector<uint32_t> words;
++    };
++    std::vector<std::unique_ptr<Frag>> frags;
++    // a framebuffer fetch's descriptor of each attachment: [0] where it lies in memory, [1] its bin in GMEM
++    uint32_t fb[2][kMaxColorOutputs][16];
++    uint8_t fbHave[2] = {0, 0};
++};
++
++// What a command buffer has at hand for a draw.
++struct DrawCache {
++    // the states of the programs with a uid this buffer drew with: found by the uid, one a slot
++    struct Slot {
++        uint64_t uid = 0;
++        uint32_t keyId = StateCache::kNoKey;
++        const ProgramState* state = nullptr;
++    };
++    static constexpr uint32_t kSlots = 64;
++    Slot slots[kSlots];
++    std::vector<std::shared_ptr<const ProgramState>> kept;   // ...alive until the buffer is done
++    // a Program made by hand, as it was when its state was made: a draw with the Program at that address is the same
++    // draw only while every byte of it, its immediates and its two addresses in this buffer are the same
++    struct Hand {
++        const Program* at = nullptr;
++        uint32_t keyId = StateCache::kNoKey;
++        std::vector<uint8_t> bytes;
++        std::vector<uint32_t> vsImm, fsImm;
++        std::shared_ptr<const ProgramState> state;
++    };
++    std::vector<Hand> hands;
++    // a draw's facts, here rather than on the stack so that what they hold of the heap (a direct range's words) is kept
++    ProgramFacts pf, pfSys;
++    DrawFacts facts, factsSys;
++    pm4::Stream scratch;
++    std::vector<uint8_t> staticKey;
++};
++
++namespace {
++
++// --- a kept state from the first draw taken with the program ------------------------------------------------------------------
++std::shared_ptr<ProgramState> buildState(const Program& program, uint32_t keyId, const Options& o, const ProgramFacts& pf, const DrawFacts& f,
++                                         const RenderPass& pass, const Draw& draw, const Bindings& vsb, const Bindings& fsb, uint64_t vsProgram,
++                                         uint64_t fsProgram) {
++    auto s = std::make_shared<ProgramState>();
++    const Stage& vs = program.vs;
++    const Stage& fs = program.fs;
++    s->uid = program.uid;
++    s->keyId = keyId;
++    s->pf = pf;
++    s->vsProgram = vsProgram;
++    s->fsProgram = fsProgram;
++    planStage(vs, vsProgram, &s->vs);
++    planStage(fs, fsProgram, &s->fs);
++    s->fast = vs.k.pvtmemSize == 0 && fs.k.pvtmemSize == 0;
++    s->fetchCount = f.fetch.count;
++    for (uint32_t i = 0; i < vs.numInputs; i++) {
++        const StageInput& in = vs.inputs[i];
++        if (in.sysval || in.regid == kRegidNone) continue;
++        // (vertexFetch took this draw: every attribute is one the descriptor describes, in a format served)
++        const uint32_t loc = in.slot - kVertAttribGeneric0;
++        const VertexAttribute& a = loc < kMaxVertexAttributes ? program.vertexDescriptor.attributes[loc] : program.vertexDescriptor.attributes[0];
++        const VertexFormatInfo* fi = vertexFormatInfo(a.format);
++        if (loc >= kMaxVertexAttributes || fi == nullptr || a.bufferIndex >= kMaxVertexBuffers) {
++            s->fast = false;
++            break;
++        }
++        const VertexLayout& l = program.vertexDescriptor.layouts[a.bufferIndex];
++        const bool perInstance = l.step == VertexStep::kPerInstance;
++        s->attrs.push_back(ProgramState::Attr{a.bufferIndex, l.stride, perInstance && l.stepRate != 0 ? l.stepRate : 1, uint64_t(a.offset) + fi->bytes, perInstance});
++    }
++    s->fsIboBase = program.fsIboBase;
++    // (gmemDrawOk's rules for the program alone)
++    if ((vs.k.numSsbos != 0 && (program.ssboWrites & 1)) || (fs.k.numSsbos != 0 && (program.ssboWrites & 2))) s->tileCode = 1;
++    for (const Stage* st : {&vs, &fs}) {
++        for (uint32_t i = 0; s->tileCode == 0 && i < kMaxTextureSlots && i < st->k.numTextureSlots; i++) {
++            if (st->k.textures[i].kind == kTexImage) s->tileCode = 2;
++        }
++    }
++    s->fbRead = fs.fbRead != 0;
++    s->hasKill = fs.hasKill != 0;
++    s->depthRegid = fs.depthRegid;
++    s->driverParams = vs.k.driverParamsOffsetVec4 >= 0;
++    // the program's groups, each as emitDraw writes it for this draw: nothing in them is the draw's
++    pm4::Stream st;
++    auto frag = [&](uint32_t groups) {
++        st.clear();
++        emitDraw(st, f, program, pass, draw, vsb, fsb, vsProgram, fsProgram, 0, o, nullptr, false, groups);
++        ProgramState::Frag r{uint32_t(s->words.size()), uint32_t(st.words().size())};
++        s->words.insert(s->words.end(), st.words().begin(), st.words().end());
++        return r;
++    };
++    s->invalidate = frag(kGInvalidate);
++    // (with no device buffer in either stage SP_IBO_COUNT is 0 for every draw, and goes with the stages' configuration)
++    s->config = frag(kGConfig | (vs.k.numSsbos == 0 && fs.k.numSsbos == 0 ? uint32_t(kGIbos) : 0u));
++    s->vsRegs = frag(kGVsRegs);
++    s->vsLoads = frag(kGVsLoads);
++    s->fsRegs = frag(kGFsRegs);
++    s->fsLoads = frag(kGFsLoads);
++    s->vfd = frag(kGVfdStatic);
++    s->link = frag(kGVpc | kGFsInputs | kGFsOutputs);
++    s->blend = frag(kGBlendStatic);
++    return s;
++}
++
++// --- a draw's own facts against a kept state: drawFacts' rules for the bindings and the draw's numbers ----------------------
++
++bool fastRanges(const StagePlan& p, const Bindings& b, PushedRanges* out) {
++    out->count = 0;
++    out->words.clear();
++    for (const StagePlan::Range& r : p.ranges) {
++        if (r.direct) {
++            out->r[out->count++] = PushedRange{r.offsetVec4, r.units, 0, 0, r.sizeDwords, false, 0, nullptr, 0, p.rangeWords.data() + r.wordsAt};
++            continue;
++        }
++        if (r.block >= b.buffers.size() || b.buffers[r.block].buffer == nullptr) return false;
++        const Binding& x = b.buffers[r.block];
++        if (x.offset % 4 != 0 || x.offset > x.buffer->length()) return false;
++        const uint64_t mapped = x.buffer->bo().size() - x.offset;
++        if (uint64_t(r.startDword) * 4 + uint64_t(r.sizeDwords) * 4 > mapped) return false;
++        PushedRange q{r.offsetVec4, r.units, x.buffer->gpuAddress() + x.offset + 4ull * r.startDword, 0, 0, false, 0, nullptr, 0, nullptr};
++        if (q.from % 16 != 0) {
++            q.copy = true;
++            q.buffer = x.buffer;
++            q.bufferOffset = x.offset + 4ull * r.startDword;
++        }
++        out->r[out->count++] = q;
++    }
++    return true;
++}
++
++bool fastUbos(const StagePlan& p, const Bindings& b, Ubos* out) {
++    out->count = 0;
++    for (uint32_t u = 0; u < p.numUbos; u++) {
++        if (p.constantDataUbo != 0 && u == p.constantDataUbo - 1) {
++            out->push_back(p.constUbo[0]);
++            out->push_back(p.constUbo[1]);
++            continue;
++        }
++        if (u >= b.buffers.size() || b.buffers[u].buffer == nullptr) {
++            if (u + 1 == p.numUbos) return false;
++            out->push_back(0);
++            out->push_back(0);
++            continue;
++        }
++        const Binding& x = b.buffers[u];
++        if (x.offset % 4 != 0 || x.offset > x.buffer->length()) return false;
++        const uint64_t vec4s = (x.buffer->length() - x.offset + 15) / 16;
++        uint32_t d[2];
++        uboDescriptor(x.buffer->gpuAddress() + x.offset, uint32_t(std::min<uint64_t>(vec4s, kUboMaxVec4)), d);
++        out->push_back(d[0]);
++        out->push_back(d[1]);
++    }
++    return true;
++}
++
++bool fastFacts(const ProgramState& ps, const PassCache& pc, const RenderPass& pass, const Draw& draw, const Bindings& vsb, const Bindings& fsb, DrawFacts* f) {
++    f->p = &ps.pf;
++    f->W = pc.W;
++    f->H = pc.H;
++    f->samples = pc.samples;
++    // the constants: each stage's ranges, the copies' places in the table, the UBO descriptors
++    if (!fastRanges(ps.vs, vsb, &f->vsRanges) || !fastRanges(ps.fs, fsb, &f->fsRanges)) return false;
++    uint32_t copyAt = kConstCopyAt;
++    for (PushedRanges* ranges : {&f->vsRanges, &f->fsRanges}) {
++        for (PushedRange& r : *ranges) {
++            if (!r.copy) continue;
++            if (copyAt + r.units * 16 > kConstCopyEnd) return false;   // (no room in the table: placeCopies reads it here instead)
++            r.copyAt = copyAt;
++            copyAt += r.units * 16;
++        }
++    }
++    if (!fastUbos(ps.vs, vsb, &f->vsUbos) || !fastUbos(ps.fs, fsb, &f->fsUbos)) return false;
++    // the vertex fetch: each attribute's buffer bound, its last element inside it
++    VertexFetch& fetch = f->fetch;
++    fetch.count = ps.fetchCount;
++    memset(fetch.used, 0, sizeof fetch.used);
++    for (const ProgramState::Attr& a : ps.attrs) {
++        if (a.bufferIndex >= vsb.buffers.size() || vsb.buffers[a.bufferIndex].buffer == nullptr) return false;
++        const Binding& x = vsb.buffers[a.bufferIndex];
++        if (x.offset > x.buffer->length()) return false;
++        const uint64_t bytes = x.buffer->length() - x.offset;
++        if (!((!a.perInstance && draw.indexBuffer != nullptr) || draw.indirect != nullptr)) {
++            const uint64_t last = a.perInstance ? uint64_t(draw.baseInstance) + uint64_t(draw.instanceCount == 0 ? 0 : draw.instanceCount - 1) / a.stepRate
++                                                : uint64_t(draw.vertexStart) + (draw.vertexCount == 0 ? 0 : draw.vertexCount - 1);
++            if (last * a.stride + a.need > bytes) return false;
++        }
++        fetch.used[a.bufferIndex] = true;
++        fetch.base[a.bufferIndex] = x.buffer->gpuAddress() + x.offset;
++        fetch.size[a.bufferIndex] = uint32_t(std::min<uint64_t>(bytes, 0xffffffffu));
++        fetch.stride[a.bufferIndex] = a.stride;
++    }
++    // the draw's numbers
++    for (int i = 0; i < 4; i++) {
++        if (!std::isfinite(draw.blendColor[i])) return false;
++    }
++    if (draw.depth.compare > 7) return false;
++    f->depthTest = draw.depth.compare != 7 || draw.depth.write;
++    const StencilState& st = draw.stencil;
++    if (st.enabled) {
++        if (pass.stencil == nullptr) return false;
++        for (const StencilFace* face : {&st.front, &st.back}) {
++            if (face->compare > 7 || face->stencilFail > 7 || face->depthFail > 7 || face->pass > 7) return false;
++        }
++    }
++    if (f->depthTest && pass.depth == nullptr) return false;
++    switch (draw.primitive) {
++    case Primitive::kTriangle: f->prim = DI_PT_TRILIST; break;
++    case Primitive::kTriangleStrip: f->prim = DI_PT_TRISTRIP; break;
++    case Primitive::kLine: f->prim = DI_PT_LINELIST; break;
++    case Primitive::kLineStrip: f->prim = DI_PT_LINESTRIP; break;
++    case Primitive::kPoint: f->prim = DI_PT_POINTLIST; break;
++    default: return false;
++    }
++    if (draw.indirect != nullptr || draw.visibilityMode != 0) return false;   // (the long way's)
++    if (draw.vertexCount == 0 || draw.instanceCount == 0) return false;
++    uint64_t maxIndices = 0;
++    if (draw.indexBuffer != nullptr) {
++        if (draw.indexType > 1) return false;
++        const uint32_t indexSize = draw.indexType == 0 ? 2 : 4;
++        if (draw.indexOffset % indexSize != 0 || draw.indexOffset > draw.indexBuffer->length()) return false;
++        maxIndices = (draw.indexBuffer->length() - draw.indexOffset) / indexSize;
++        if (draw.vertexCount > maxIndices || draw.baseVertex < 0) return false;
++        if (maxIndices > 0xffffffffull) maxIndices = 0xffffffffull;
++    }
++    f->maxIndices = maxIndices;
++    if (draw.cullMode > 2 || draw.winding > 1) return false;
++    const uint32_t W = pc.W, H = pc.H;
++    const Viewport& vp = draw.viewport;
++    if (!finite(vp.x) || !finite(vp.y) || !finite(vp.width) || !finite(vp.height) || !finite(vp.znear) || !finite(vp.zfar)) return false;
++    if (!(vp.width > 0.0) || !(vp.height > 0.0)) return false;
++    if (vp.x >= double(W) || vp.y >= double(H) || vp.x + vp.width <= 0.0 || vp.y + vp.height <= 0.0) return false;
++    Scissor sc = draw.scissor;
++    if (sc.width == 0) {
++        sc = Scissor{0, 0, W, H};
++    } else if (sc.height == 0 || uint64_t(sc.x) + sc.width > W || uint64_t(sc.y) + sc.height > H) {
++        return false;
++    }
++    f->sc = sc;
++    return true;
++}
++
++// One stage's texture and sampler descriptors straight into the draw's table: as many as the stage declares and no
++// more (the loads read no further). A slot the stage does not sample is zeros; the null texture's slot, and one the
++// draw leaves unbound, the null texture; a fetch's the attachment (PassCache keeps it). False: a bound texture the
++// stage cannot sample as it is (stageTextures says which and why).
++bool fastTextures(const StagePlan& p, const Bindings& b, const RenderPass& pass, PassCache& pc, const Texture* nullTexture, bool measured, uint8_t* tableCpu,
++                  uint32_t constAt, uint32_t sampAt, const GmemPlan* gmem) {
++    if (p.numTex == 0) return true;
++    for (uint32_t t = 0; t < p.numTex; t++) {
++        uint8_t* at = tableCpu + constAt + 64 * t;
++        const StagePlan::Tex& kt = p.tex[t];
++        if (kt.kind == StagePlan::kNone) {
++            memset(at, 0, 64);
++            continue;
++        }
++        if (kt.kind == StagePlan::kFetch) {
++            const uint32_t target = kt.fbTarget - 1u;
++            const uint32_t where = gmem != nullptr ? 1 : 0;
++            if (target >= kMaxColorOutputs) return false;
++            if (!((pc.fbHave[where] >> target) & 1)) {
++                const Attachment a = attachmentOf(pass, target);
++                if (a.texture == nullptr || a.slice != 0) return false;
++                TexConst d = a.texture->levelDescriptor(a.level);
++                if (gmem != nullptr) {
++                    // (stageTextures: the attachment's bin in GMEM, as the fetch reads it in a tile)
++                    d.dword[0] &= ~(A6XX_TEX_CONST_0_TILE_MODE__MASK | A6XX_TEX_CONST_0_SWAP__MASK);
++                    d.dword[0] |= A6XX_TEX_CONST_0_TILE_MODE(TILE6_2);
++                    d.dword[2] = A6XX_TEX_CONST_2_TYPE(A6XX_TEX_2D) | A6XX_TEX_CONST_2_PITCH(gmem->binW * a.texture->info().bytesPerPixel);
++                    d.dword[3] = 0;
++                    d.dword[4] = kGmemBase + gmem->base[target];
++                    d.dword[5] &= A6XX_TEX_CONST_5_DEPTH__MASK;
++                    for (uint32_t w = 6; w < 16; w++) d.dword[w] = 0;
++                }
++                memcpy(pc.fb[where][target], d.dword, 64);
++                pc.fbHave[where] |= uint8_t(1u << target);
++            }
++            memcpy(at, pc.fb[where][target], 64);
++            continue;
++        }
++        const Texture* tex = t < b.textures.size() ? b.textures[t] : nullptr;
++        if (kt.kind == StagePlan::kNull || tex == nullptr || measured) {
++            if (nullTexture == nullptr) return false;
++            memcpy(at, nullTexture->sampledWords(), 64);
++            continue;
++        }
++        KernelTexture shape{};
++        shape.dim = kt.dim;
++        shape.isArray = kt.isArray;
++        if (!tex->isShaped(shape) || kt.element != tex->info().element || (tex->usage() & kTextureUsageRead) == 0) return false;
++        memcpy(at, tex->sampledWords(), 64);
++    }
++    for (uint32_t m = 0; m < p.numSamp; m++) {
++        uint8_t* at = tableCpu + sampAt + 16 * m;
++        if (((p.samplerMask >> m) & 1) != 0 && m < b.samplers.size() && b.samplers[m] != nullptr) {
++            memcpy(at, b.samplers[m]->words, 16);
++        } else {
++            memset(at, 0, 16);   // (not named by the stage, or nothing bound: a valid sampler, nearest and repeat)
++        }
++    }
++    return true;
++}
++
++// the 3D IBO table straight into the draw's table (gfxIbos' rules); *COUNT the table's size
++bool fastIbos(const ProgramState& ps, const Bindings& vsb, const Bindings& fsb, uint8_t* tableCpu, uint32_t* count) {
++    *count = 0;
++    if (ps.vs.numSsbos == 0 && ps.fs.numSsbos == 0) return true;
++    const Binding* chosen[kMaxVertexBuffers] = {};
++    uint32_t n = 0;
++    for (int stage = 0; stage < 2; stage++) {
++        const Bindings& b = stage == 0 ? vsb : fsb;
++        const uint32_t base = stage == 0 ? 0 : ps.fsIboBase, numSsbos = stage == 0 ? ps.vs.numSsbos : ps.fs.numSsbos;
++        if (numSsbos > kMaxVertexBuffers) return false;
++        for (uint32_t tableSlot = base; tableSlot < numSsbos; tableSlot++) {
++            const uint32_t slot = tableSlot - base;
++            if (slot >= b.buffers.size() || b.buffers[slot].buffer == nullptr) {
++                if (tableSlot + 1 == numSsbos) return false;
++                n = std::max(n, tableSlot + 1);
++                continue;
++            }
++            const Binding& x = b.buffers[slot];
++            if (x.offset % 4 != 0 || x.offset >= x.buffer->length()) return false;
++            if (chosen[tableSlot] != nullptr && (chosen[tableSlot]->buffer != x.buffer || chosen[tableSlot]->offset != x.offset)) return false;
++            if (chosen[tableSlot] == nullptr) {
++                chosen[tableSlot] = &x;
++                const uint64_t elements = (x.buffer->length() - x.offset) / 4;
++                if (elements >= (1ull << 30)) return false;
++                const TexConst d = bufferIbo(x.buffer->gpuAddress() + x.offset, uint32_t(elements));
++                memcpy(tableCpu + kGfxIboAt + 64 * tableSlot, d.dword, 64);
++            }
++            n = std::max(n, tableSlot + 1);
++        }
++    }
++    // (a slot below the count that nothing is bound at: turnip's null descriptor, zeros)
++    for (uint32_t i = 0; i < n; i++) {
++        if (chosen[i] == nullptr) memset(tableCpu + kGfxIboAt + 64 * i, 0, 64);
++    }
++    *count = n;
++    return true;
++}
++
++// a draw's table from a kept state: the fetch flush's word, the IBO table, both stages' textures and samplers
++bool fastTables(const ProgramState& ps, PassCache& pc, const RenderPass& pass, const Bindings& vsb, const Bindings& fsb, const Texture* nullTexture,
++                bool nullFsTextures, uint8_t* tableCpu, const GmemPlan* gmem, uint32_t* iboCount) {
++    memset(tableCpu + kTableFbReadFlushAt, 0, 4);
++    return fastIbos(ps, vsb, fsb, tableCpu, iboCount) &&
++           fastTextures(ps.vs, vsb, pass, pc, nullTexture, false, tableCpu, kVsTexConstAt, kVsTexSampAt, gmem) &&
++           fastTextures(ps.fs, fsb, pass, pc, nullTexture, nullFsTextures, tableCpu, kFsTexConstAt, kFsTexSampAt, gmem);
++}
++
++// whether a draw of this stage's bindings puts the null texture somewhere (CommandBuffer::draw's rule)
++bool planWantsNull(const StagePlan& p, const Bindings& b, bool measured) {
++    if (p.needsNull) return true;
++    for (uint32_t t = 0; t < p.numTex; t++) {
++        if (p.tex[t].kind != StagePlan::kSampled) continue;
++        if (measured || t >= b.textures.size() || b.textures[t] == nullptr) return true;
++    }
++    return false;
++}
++// ...the same read off the stage itself, for a program with no state yet
++bool stageWantsNull(const Kernel& k, const Bindings& b, bool measured) {
++    for (uint32_t i = 0; i < kMaxTextureSlots && i < k.numTextureSlots; i++) {
++        const KernelTexture& kt = k.textures[i];
++        if (kt.kind != kTexSampled || kt.fbTarget != 0) continue;
++        if (kt.isNull || measured || i >= b.textures.size() || b.textures[i] == nullptr) return true;
++    }
++    return false;
++}
++
++// gmemDrawOk's rule for what a draw binds: a texture over an attachment's memory. 0, or 4 + the attachment. A slot the
++// null texture takes is not what is bound there.
++uint32_t boundOverAttachment(const StagePlan& p, const Bindings& b, const RenderPass& pass, bool measured) {
++    for (size_t t = 0; t < b.textures.size(); t++) {
++        const Texture* tex = b.textures[t];
++        if (tex == nullptr) continue;
++        if (t < p.numTex && (p.tex[t].kind == StagePlan::kNull || (measured && p.tex[t].kind == StagePlan::kSampled))) continue;
++        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
++            const Texture* a = attachmentOf(pass, i).texture;
++            if (a != nullptr && tex->buffer() == a->buffer()) return 4 + i;
++        }
++    }
++    return 0;
++}
++std::string tileWhy(uint32_t code) {
++    switch (code) {
++    case 1: return "a stage that writes its device buffers: replayed per tile it would write them per tile";
++    case 2: return "a stage that writes a texture";
++    case 3: return "a visibility result: the tiles would count each sample once a tile";
++    default: return "a texture over colour attachment " + n(code - 4) + "'s memory";
++    }
++}
++
++// whether a draw into B's attachments is a draw into A's: every attachment the same texture at the same level and
++// slice, every load action one that begins no pass (what CommandBuffer::draw's join asks, and what checkTarget read of
++// the pass when it opened)
++bool sameTargets(const RenderPass& a, const RenderPass& b) {
++    if (a.color0 != b.color0 || a.level != b.level || a.slice != b.slice || a.depth != b.depth || a.depthLevel != b.depthLevel ||
++        a.depthSlice != b.depthSlice || a.stencil != b.stencil || a.store != b.store || a.depthStore != b.depthStore || a.stencilStore != b.stencilStore) {
++        return false;
++    }
++    auto loads = [](LoadAction l) { return l == LoadAction::kLoad || l == LoadAction::kDontCare; };
++    if (!loads(b.load) || (b.depth != nullptr && !loads(b.depthLoad)) || (b.stencil != nullptr && !loads(b.stencilLoad))) return false;
++    for (uint32_t i = 0; i < kMaxColorOutputs - 1; i++) {
++        const ColorAttachment &x = a.more[i], &y = b.more[i];
++        if (x.texture != y.texture || x.level != y.level || x.slice != y.slice || x.store != y.store || (y.texture != nullptr && !loads(y.load))) return false;
++    }
++    return true;
++}
++
++// --- a draw onto a pass's stream from a kept state --------------------------------------------------------------------------
++// The groups in the order a draw has them. One kept as words goes through the shadow unless the stream last held those
++// very words for it; one made of the draw's numbers is made when the numbers are not the last draw's; the two stages'
++// loads and HLSQ_INVALIDATE_CMD, which no shadow drops, go as they are, every draw.
++void emitFast(pm4::Stream& to, CommandBuffer::RegShadow& regs, Cursor& cur, const ProgramState& ps, PassCache& pc, const DrawFacts& f, const Program& program,
++              const RenderPass& pass, const Draw& draw, const Bindings& vsb, const Bindings& fsb, uint64_t table, const Options& o, const GmemPlan* gmem,
++              bool afterFetch, pm4::Stream& scratch) {
++    DedupSink sink(to, regs);
++    uint32_t pending = 0;
++    auto flush = [&]() {
++        if (pending == 0) return;
++        emitDraw(sink, f, program, pass, draw, vsb, fsb, ps.vsProgram, ps.fsProgram, table, o, gmem, afterFetch, pending);
++        pending = 0;
++    };
++    auto kept = [&](uint32_t slot, const uint32_t* w, uint32_t count) {
++        Cursor::Last& l = cur.last[slot];
++        if (l.n == count && (l.at == w || count == 0 || memcmp(l.at, w, 4ull * count) == 0)) {
++            l.at = w;
++            return;
++        }
++        flush();
++        for (uint32_t i = 0; i < count;) {
++            const pm4::Header h = pm4::decode(w[i]);
++            sink.registers(h.reg, w + i + 1, h.count);
++            i += 1 + h.count;
++        }
++        l.at = w;
++        l.n = count;
++    };
++    auto asIs = [&](const ProgramState::Frag& fr) {
++        if (fr.n == 0) return;
++        flush();
++        to.append(ps.at(fr), fr.n);
++    };
++
++    if (ps.fbRead) pending |= kGBarrier;
++    // the pass's own groups, for what this program draws into
++    {
++        uint32_t valid = 0;
++        for (uint32_t i = 0; i < kMaxColorOutputs; i++) valid |= ps.pf.colorRegid[i] != kRegidNone ? 1u << i : 0u;
++        const uint32_t sig = ps.pf.numRt | valid << 4 | (gmem != nullptr ? 1u << 12 : 0u);
++        const PassCache::Frag* fr = nullptr;
++        for (const auto& x : pc.frags) {
++            if (x->sig == sig) fr = x.get();
++        }
++        if (fr == nullptr) {
++            scratch.clear();
++            emitDraw(scratch, f, program, pass, draw, vsb, fsb, ps.vsProgram, ps.fsProgram, table, o, gmem, afterFetch,
++                     kGZs | kGMrt | kGMsaa | kGRenderCntl | kGLrz);
++            pc.frags.push_back(std::make_unique<PassCache::Frag>(PassCache::Frag{sig, scratch.words()}));
++            fr = pc.frags.back().get();
++        }
++        kept(Cursor::kPass, fr->words.data(), uint32_t(fr->words.size()));
++    }
++    asIs(ps.invalidate);
++    kept(Cursor::kConfig, ps.at(ps.config), ps.config.n);
++    if (ps.vs.numSsbos != 0 || ps.fs.numSsbos != 0) pending |= kGIbos;
++    kept(Cursor::kVsRegs, ps.at(ps.vsRegs), ps.vsRegs.n);
++    asIs(ps.vsLoads);
++    if (!ps.vs.ranges.empty() || ps.vs.numUbos != 0) pending |= kGVsConsts;
++    if (ps.driverParams) pending |= kGDriverParams;
++    kept(Cursor::kFsRegs, ps.at(ps.fsRegs), ps.fsRegs.n);
++    asIs(ps.fsLoads);
++    if (!ps.fs.ranges.empty() || ps.fs.numUbos != 0) pending |= kGFsConsts;
++    pending |= kGFsTex | kGVsTex;
++    kept(Cursor::kVfd, ps.at(ps.vfd), ps.vfd.n);
++    {
++        Cursor::VfdIn in;
++        in.n = 0;
++        for (uint32_t bi = 0; f.fetch.count != 0 && bi < kMaxVertexBuffers; bi++) {
++            if (!f.fetch.used[bi]) continue;
++            if (in.n < Cursor::VfdIn::kMost) {
++                in.bi[in.n] = bi;
++                in.size[in.n] = f.fetch.size[bi];
++                in.stride[in.n] = f.fetch.stride[bi];
++                in.base[in.n] = f.fetch.base[bi];
++            }
++            in.n++;
++        }
++        in.indexOffset = draw.indexBuffer != nullptr ? uint32_t(draw.baseVertex) : draw.vertexStart;
++        in.baseInstance = draw.baseInstance;
++        in.restart = draw.indexBuffer != nullptr && draw.indexType == 0 ? 0xffffu : 0xffffffffu;
++        if (!cur.vfdSet || !(cur.vfd == in)) {
++            pending |= kGVfdDynamic;
++            cur.vfd = in;
++            cur.vfdSet = true;
++        }
++    }
++    kept(Cursor::kLink, ps.at(ps.link), ps.link.n);
++    {
++        const bool ordered = ps.fbRead && o.fbReadOrdered && gmem != nullptr;
++        const uint32_t in = draw.cullMode | draw.winding << 2 | (ordered ? 8u : 0u) | (draw.indexBuffer != nullptr ? 16u : 0u);
++        if (!cur.rastSet || cur.rast != in) {
++            pending |= kGRast;
++            cur.rast = in;
++            cur.rastSet = true;
++        }
++    }
++    {
++        Cursor::ViewportIn in;
++        const Viewport& vp = draw.viewport;
++        in.v[0] = vp.x, in.v[1] = vp.y, in.v[2] = vp.width, in.v[3] = vp.height, in.v[4] = vp.znear, in.v[5] = vp.zfar;
++        in.sc[0] = f.sc.x, in.sc[1] = f.sc.y, in.sc[2] = f.sc.width, in.sc[3] = f.sc.height;
++        in.W = f.W;
++        in.H = f.H;
++        if (!cur.viewportSet || !(cur.viewport == in)) {
++            pending |= kGViewport;
++            cur.viewport = in;
++            cur.viewportSet = true;
++        }
++    }
++    kept(Cursor::kBlend, ps.at(ps.blend), ps.blend.n);
++    {
++        Cursor::BlendIn in;
++        memcpy(in.color, draw.blendColor, sizeof in.color);
++        in.depthCompare = draw.depth.compare;
++        in.depthWrite = draw.depth.write ? 1 : 0;
++        in.hasDepth = pass.depth != nullptr ? 1 : 0;
++        in.hasKill = ps.hasKill ? 1 : 0;
++        in.depthRegid = ps.depthRegid;
++        const StencilState& st = draw.stencil;
++        in.stencilOn = st.enabled ? 1 : 0;
++        const StencilFace* faces[2] = {&st.front, &st.back};
++        for (int k = 0; k < 2; k++) {
++            in.face[k][0] = faces[k]->compare, in.face[k][1] = faces[k]->stencilFail, in.face[k][2] = faces[k]->depthFail;
++            in.face[k][3] = faces[k]->pass, in.face[k][4] = faces[k]->readMask, in.face[k][5] = faces[k]->writeMask;
++        }
++        in.reference[0] = st.frontReference;
++        in.reference[1] = st.backReference;
++        if (!cur.blendSet || !(cur.blend == in)) {
++            pending |= kGBlendDynamic;
++            cur.blend = in;
++            cur.blendSet = true;
++        }
++    }
++    pending |= kGDraw;
++    flush();
++    // (nothing a draw taken this way writes makes the shadow forget: no occlusion query, no memory write)
++}
++
++// (the tests': CommandBuffer::verifyDraws) The same draw the long way -- drawFacts over a table of its own, every group
++// through SHADOW, the pass's shadow as it was before the draw -- against what the short way put on TO from MARK on and
++// into its table. "" when they are the same, else what differs.
++std::string verifyDraw(const pm4::Stream& to, size_t mark, CommandBuffer::RegShadow& shadow, const Program& program, const RenderPass& pass, const Draw& draw,
++                       const Bindings& vsb, const Bindings& fsb, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, const uint8_t* tableCpu, const Options& o,
++                       const GmemPlan* gmem, bool afterFetch) {
++    std::vector<uint8_t> ownTable(kTableBytes, 0xa5);
++    ProgramFacts pf;
++    DrawFacts f;
++    std::string why;
++    if (!drawFacts(program, pass, draw, vsb, fsb, vsProgram, fsProgram, ownTable.data(), &why, false, gmem, &pf, &f)) {
++        return "the long way refuses it: " + why;
++    }
++    pm4::Stream long_;
++    long_.packet(pm4::kNop, nullptr, 0);
++    DedupSink sink(long_, shadow);
++    emitDraw(sink, f, program, pass, draw, vsb, fsb, vsProgram, fsProgram, table, o, gmem, afterFetch, kGAll);
++    const std::vector<uint32_t>& a = to.words();
++    const std::vector<uint32_t>& b = long_.words();
++    if (a.size() - mark != b.size()) return n(a.size() - mark) + " words, " + n(b.size()) + " the long way";
++    for (size_t i = 0; i < b.size(); i++) {
++        if (a[mark + i] != b[i]) {
++            char text[96];
++            snprintf(text, sizeof text, "word %zu of %zu is %#x, %#x the long way", i, b.size(), a[mark + i], b[i]);
++            return text;
++        }
++    }
++    const struct {
++        uint32_t at, bytes;
++        const char* what;
++    } parts[] = {{kTableFbReadFlushAt, 4, "the fetch flush's word"},        {kGfxIboAt, f.iboCount * 64, "the IBO descriptors"},
++                 {kFsTexConstAt, f.fsNumTex * 64, "the FS's textures"},     {kFsTexSampAt, f.fsNumSamp * 16, "the FS's samplers"},
++                 {kVsTexConstAt, f.vsNumTex * 64, "the VS's textures"},     {kVsTexSampAt, f.vsNumSamp * 16, "the VS's samplers"}};
++    for (const auto& p : parts) {
++        if (memcmp(tableCpu + p.at, ownTable.data() + p.at, p.bytes) != 0) return std::string(p.what) + " in its table are not the long way's";
++    }
++    return {};
++}
++
++std::atomic<bool> gVerifyDraws{false};
++std::atomic<bool> gKeepStates{true};
++std::atomic<uint64_t> gProgramUids{0};
++
++}  // namespace
++
+ }  // namespace render
+ 
+ // a pass's words onto the command buffer's stream, packet by packet, behind a NOP that marks where an encoder began
+@@ -2940,16 +3850,9 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
+             }
+             if (runLen != 0) to.registers(h.reg + runStart, &w[i + 1 + runStart], runLen);
+         } else {
+-            switch (h.opcode) {
+-            case pm4::kNop: case CP_WAIT_MEM_GTE: case CP_SKIP_IB2_ENABLE_GLOBAL: case CP_WAIT_FOR_IDLE: case CP_LOAD_STATE6_GEOM:
+-            case CP_LOAD_STATE6_FRAG: case CP_LOAD_STATE6: case CP_DRAW_INDX_OFFSET: case CP_DRAW_INDIRECT_MULTI: case CP_WAIT_REG_MEM:
+-            case CP_EVENT_WRITE: case CP_SET_MODE: case CP_SET_VISIBILITY_OVERRIDE: case CP_SET_MARKER: case CP_REG_TO_MEM:
+-            case pm4::kMemcpy: case pm4::kWaitMemWrites: case pm4::kWaitForMe:
+-                break;
+-            default:
++            if (!render::leavesRegisters(h.opcode)) {
+                 regs.clear();   // (CP_SET_DRAW_STATE and the like: what the registers hold is no longer known here)
+                 forgot = true;
+-                break;
+             }
+             to.packet(h.opcode, h.count ? &w[i + 1] : nullptr, h.count);
+         }
+@@ -2958,6 +3861,17 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
+     return forgot;
+ }
+ 
++uint64_t newProgramUid() { return render::gProgramUids.fetch_add(1) + 1; }
++
++render::StateCache& CommandQueue::states() {
++    std::lock_guard<std::mutex> g(lock_);
++    if (states_ == nullptr) states_ = std::make_shared<render::StateCache>();
++    return *states_;
++}
++
++void CommandBuffer::verifyDraws(bool on) { render::gVerifyDraws = on; }
++bool CommandBuffer::keepStates(bool on) { return render::gKeepStates.exchange(on); }
++
+ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const Draw& d, const Bindings& vsBindings, const Bindings& fsBindings,
+                          const render::Options& options) {
+     if (status_ > kEnqueued) {
+@@ -2967,92 +3881,175 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+     // copy first, by the 2D engine into the UBWC layout, in a pass of its own before this draw's
+     if (!freshen(vsBindings, options) || !freshen(fsBindings, options)) return false;
+     std::string why;
++    if (drawCache_ == nullptr) drawCache_ = std::make_shared<render::DrawCache>();
++    render::DrawCache& dc = *drawCache_;
++    // A draw into the open pass's attachments joins it: no batch start, no pass begin and no tail of its own, which a
++    // pass per draw spent on every draw (the CCU flush and the cache flush waited for, each time). It joins when the
++    // attachments are the same textures, it asks for no Clear (a Clear begins a pass), and the options are the same.
++    bool joins = open_ != nullptr && open_->pass.color0 == pass.color0 && open_->pass.level == pass.level && open_->pass.depth == pass.depth &&
++                 open_->pass.stencil == pass.stencil && !(pass.stencil != nullptr && pass.stencilLoad == LoadAction::kClear) &&
++                 pass.load != LoadAction::kClear &&
++                 !(pass.depth != nullptr && pass.depthLoad == LoadAction::kClear) && pass.store == open_->pass.store &&
++                 pass.depthStore == open_->pass.depthStore && std::memcmp(&open_->options, &options, sizeof options) == 0;
++    for (uint32_t i = 0; joins && i < kMaxColorOutputs - 1; i++) {
++        // (the attachments past 0 the same textures and stores, none asking for a Clear: the same pass)
++        const ColorAttachment &a = pass.more[i], &b = open_->pass.more[i];
++        joins = a.texture == b.texture && a.level == b.level && a.store == b.store && (a.texture == nullptr || a.load != LoadAction::kClear);
++    }
++
++    // --- what this program came to the last time it was drawn into a pass of this kind (render.cpp: ProgramState) ---
++    const bool measured = nullFsTextures_;   // (setNullFsTextures: what a draw costs without its reads)
++    uint32_t keyId = render::StateCache::kNoKey;
++    if (options.dedupRegs && render::gKeepStates.load(std::memory_order_relaxed)) {
++        if (joins) {
++            keyId = open_->cache->keyId;
++        } else {
++            render::StateKey key;
++            render::stateKeyOf(pass, options, &key);
++            keyId = queue_.states().keyId(key);
++        }
++    }
++    const render::ProgramState* ps = nullptr;
++    render::DrawCache::Hand* hand = nullptr;
++    if (keyId != render::StateCache::kNoKey && program.uid != 0) {
++        render::DrawCache::Slot& slot = dc.slots[(program.uid * 0x9e3779b97f4a7c15ull) >> 58];
++        if (slot.uid == program.uid && slot.keyId == keyId) {
++            ps = slot.state;
++        } else if (std::shared_ptr<const render::ProgramState> found = queue_.states().find(program.uid, keyId)) {
++            ps = found.get();
++            slot = render::DrawCache::Slot{program.uid, keyId, ps};
++            dc.kept.push_back(std::move(found));
++            // (its two stages' words where the queue keeps them: named by the submission and kept until it is done, as
++            // programAddress does for a program met the long way)
++            use(*ps->vsBuffer, false);
++            keep(ps->vsBuffer);
++            use(*ps->fsBuffer, false);
++            keep(ps->fsBuffer);
++        }
++    } else if (keyId != render::StateCache::kNoKey) {
++        // a Program made by hand: the one kept for this address, if it is still that Program byte for byte
++        auto same = [](const Kernel& k, const std::vector<uint32_t>& imm) {
++            return k.numImmediates == imm.size() && (imm.empty() || memcmp(k.immediates, imm.data(), 4 * imm.size()) == 0);
++        };
++        for (render::DrawCache::Hand& h : dc.hands) {
++            if (h.at == &program && h.keyId == keyId && memcmp(h.bytes.data(), &program, sizeof(Program)) == 0 && same(program.vs.k, h.vsImm) &&
++                same(program.fs.k, h.fsImm)) {
++                hand = &h;
++            }
++        }
++    }
++
+     // the null texture's slot is the front end's, not the application's: the queue's texture goes there, over anything
+     // bound at that index (an application cannot know the index, so whatever it bound there was not meant for it)
+-    Bindings vsWithNull, fsWithNull;
+-    const Bindings* vsb = &vsBindings;
+-    const Bindings* fsb = &fsBindings;
+-    std::shared_ptr<Texture> null;
+     // And so does a sampled slot the application left empty: an uber shader (chronod's widget renderer) declares
+     // textures that the branches a given draw takes never read, and Metal lets such a slot go unbound. What a read of
+     // it gives is undefined in Metal; here it is the null texture's zero, as Apple's GPUs answer. Both stages alike.
+-    for (const auto& [k, given, with, at] : {std::tuple<const Kernel*, const Bindings*, Bindings*, const Bindings**>{&program.vs.k, &vsBindings, &vsWithNull, &vsb},
+-                                             {&program.fs.k, &fsBindings, &fsWithNull, &fsb}}) {
+-        for (uint32_t i = 0; i < kMaxTextureSlots && i < k->numTextureSlots; i++) {
+-            const KernelTexture& kt = k->textures[i];
+-            if (kt.kind != kTexSampled || kt.fbTarget != 0) continue;
+-            const bool unbound = i >= given->textures.size() || given->textures[i] == nullptr;
+-            const bool measured = nullFsTextures_ && k == &program.fs.k;   // (setNullFsTextures: what a draw costs without its reads)
+-            if (!kt.isNull && !unbound && !measured) continue;
+-            if (null == nullptr && (null = queue_.nullTexture(&why)) == nullptr) {
+-                return fail(std::string("no null texture: ") + why);
+-            }
+-            if (*at != with) {
+-                *with = *given;
+-                *at = with;
++    const bool wantsNull = ps != nullptr ? render::planWantsNull(ps->vs, vsBindings, false) || render::planWantsNull(ps->fs, fsBindings, measured)
++                                         : render::stageWantsNull(program.vs.k, vsBindings, false) || render::stageWantsNull(program.fs.k, fsBindings, measured);
++    if (wantsNull && null_ == nullptr && (null_ = queue_.nullTexture(&why)) == nullptr) {
++        return fail(std::string("no null texture: ") + why);
++    }
++    // (the bindings with the null texture in them, as the long way reads them: copies, made only when it is taken -- a
++    // draw with a kept state reads the caller's own and puts the null texture's descriptor where it goes)
++    Bindings vsWithNull, fsWithNull;
++    const Bindings* vsb = &vsBindings;
++    const Bindings* fsb = &fsBindings;
++    bool substituted = false;
++    auto substitute = [&]() {
++        if (substituted) return;
++        substituted = true;
++        for (const auto& [k, given, with, at] : {std::tuple<const Kernel*, const Bindings*, Bindings*, const Bindings**>{&program.vs.k, &vsBindings, &vsWithNull, &vsb},
++                                                 {&program.fs.k, &fsBindings, &fsWithNull, &fsb}}) {
++            for (uint32_t i = 0; i < kMaxTextureSlots && i < k->numTextureSlots; i++) {
++                const KernelTexture& kt = k->textures[i];
++                if (kt.kind != kTexSampled || kt.fbTarget != 0) continue;
++                const bool unbound = i >= given->textures.size() || given->textures[i] == nullptr;
++                const bool none = measured && k == &program.fs.k;
++                if (!kt.isNull && !unbound && !none) continue;
++                if (*at != with) {
++                    *with = *given;
++                    *at = with;
++                }
++                if (with->textures.size() <= i) with->textures.resize(i + 1, nullptr);
++                with->textures[i] = null_.get();
++                if (!kt.isNull) with->nullMask |= 1u << i;
+             }
+-            if (with->textures.size() <= i) with->textures.resize(i + 1, nullptr);
+-            with->textures[i] = null.get();
+-            if (!kt.isNull) with->nullMask |= 1u << i;
+         }
+-    }
++    };
++    bool fast = ps != nullptr && ps->fast;
+     // private memory is the queue's too: a stage that wants some is given the queue's buffer, which the submission
+     // names for writing (the stage spills into it)
+-    for (const auto& [k, from, to] : {std::tuple<const Kernel*, const Bindings**, Bindings*>{&program.vs.k, &vsb, &vsWithNull}, {&program.fs.k, &fsb, &fsWithNull}}) {
+-        if (k->pvtmemSize == 0) continue;
+-        PrivateMemory pm;
+-        std::shared_ptr<Buffer> scratch = queue_.privateMemory(k->pvtmemSize, k->pvtmemPerWave, &pm, &why);
+-        if (scratch == nullptr) {
+-            return fail(std::string("no private memory: ") + why);
+-        }
+-        if (*from != to) {
+-            *to = **from;
+-            *from = to;
++    if (!fast && (program.vs.k.pvtmemSize != 0 || program.fs.k.pvtmemSize != 0)) {
++        substitute();
++        for (const auto& [k, from, to] : {std::tuple<const Kernel*, const Bindings**, Bindings*>{&program.vs.k, &vsb, &vsWithNull}, {&program.fs.k, &fsb, &fsWithNull}}) {
++            if (k->pvtmemSize == 0) continue;
++            PrivateMemory pm;
++            std::shared_ptr<Buffer> scratch = queue_.privateMemory(k->pvtmemSize, k->pvtmemPerWave, &pm, &why);
++            if (scratch == nullptr) {
++                return fail(std::string("no private memory: ") + why);
++            }
++            if (*from != to) {
++                *to = **from;
++                *from = to;
++            }
++            to->privateMemory = pm;
++            use(*scratch, true);
+         }
+-        to->privateMemory = pm;
+-        use(*scratch, true);
+     }
+     // the two programs' words, once per command buffer, and the draw's table, in pieces (command.hpp: Piece): a piece is
+     // 256-byte aligned, so SP_xS_OBJ_START is 128-byte aligned as the ST6_SHADER preload wants it (tu_shader.cc:1313-1316)
+-    const uint64_t vsProgram = programAddress(program.vs.k, &why);
+-    if (vsProgram == 0) {
+-        return fail(std::string("no memory for the vertex program: ") + why);
+-    }
+-    const uint64_t fsProgram = programAddress(program.fs.k, &why);
+-    if (fsProgram == 0) {
+-        return fail(std::string("no memory for the fragment program: ") + why);
++    uint64_t vsProgram = 0, fsProgram = 0;
++    if (ps != nullptr) {
++        vsProgram = ps->vsProgram;
++        fsProgram = ps->fsProgram;
++    } else {
++        vsProgram = programAddress(program.vs.k, &why);
++        if (vsProgram == 0) {
++            return fail(std::string("no memory for the vertex program: ") + why);
++        }
++        fsProgram = programAddress(program.fs.k, &why);
++        if (fsProgram == 0) {
++            return fail(std::string("no memory for the fragment program: ") + why);
++        }
++        if (hand != nullptr && hand->state->vsProgram == vsProgram && hand->state->fsProgram == fsProgram) {
++            ps = hand->state.get();
++            fast = ps->fast;
++        }
+     }
+     Piece table;
+     if (!piece(render::kTableBytes, &table, &why)) {
+         return fail(std::string("no memory for the draw's table: ") + why);
+     }
+-    // A draw into the open pass's attachments joins it: no batch start, no pass begin and no tail of its own, which a
+-    // pass per draw spent on every draw (the CCU flush and the cache flush waited for, each time). It joins when the
+-    // attachments are the same textures, it asks for no Clear (a Clear begins a pass), and the options are the same.
+-    bool joins = open_ != nullptr && open_->pass.color0 == pass.color0 && open_->pass.level == pass.level && open_->pass.depth == pass.depth &&
+-                 open_->pass.stencil == pass.stencil && !(pass.stencil != nullptr && pass.stencilLoad == LoadAction::kClear) &&
+-                 pass.load != LoadAction::kClear &&
+-                 !(pass.depth != nullptr && pass.depthLoad == LoadAction::kClear) && pass.store == open_->pass.store &&
+-                 pass.depthStore == open_->pass.depthStore && std::memcmp(&open_->options, &options, sizeof options) == 0;
+-    for (uint32_t i = 0; joins && i < kMaxColorOutputs - 1; i++) {
+-        // (the attachments past 0 the same textures and stores, none asking for a Clear: the same pass)
+-        const ColorAttachment &a = pass.more[i], &b = open_->pass.more[i];
+-        joins = a.texture == b.texture && a.level == b.level && a.store == b.store && (a.texture == nullptr || a.load != LoadAction::kClear);
+-    }
++    // (the rare kinds of draw go the long way whatever is kept: one whose numbers the GPU reads, one that counts samples)
++    if (d.indirect != nullptr || d.visibilityMode != 0) fast = false;
+     // GMEM is decided as a pass opens, before its first draw is encoded (a draw in a tile is encoded for the tile:
+     // encodeInPass). A draw a tile cannot replay ends a GMEM pass and opens a sysmem one of its own.
+     std::string gmemWhy;
+-    const bool tileable = options.gmem && gmem_ && render::gmemDrawOk(program, pass, d, *vsb, *fsb, &gmemWhy);
++    uint32_t tileCode = 0;
++    bool tileable = false;
++    if (options.gmem && gmem_) {
++        if (fast) {
++            tileCode = ps->tileCode;
++            if (tileCode == 0) tileCode = render::boundOverAttachment(ps->vs, vsBindings, pass, false);
++            if (tileCode == 0) tileCode = render::boundOverAttachment(ps->fs, fsBindings, pass, measured);
++            tileable = tileCode == 0;
++        } else {
++            substitute();
++            tileable = render::gmemDrawOk(program, pass, d, *vsb, *fsb, &gmemWhy);
++        }
++    }
++    // (why not, said only where it is kept: a string a draw was an allocation a draw)
++    auto whyNotTiled = [&]() { return tileCode != 0 ? render::tileWhy(tileCode) : gmemWhy; };
+     if (joins && open_->dual && !tileable) {
+         // (recorded both ways: the pass goes on in sysmem, what it has so far onto the stream)
+-        gmemWhy_ = gmemWhy;
++        gmemWhy_ = whyNotTiled();
+         appendStream(stream_, open_->sysStream);
+         open_->sysStream.clear();
+         open_->bodies.clear();
+         open_->dual = open_->gmem = false;
+     }
+     if (joins && open_->gmem && !tileable) {
+-        gmemWhy_ = gmemWhy;
++        gmemWhy_ = whyNotTiled();
+         joins = false;
+     }
+     if (!joins) {
+@@ -3068,7 +4065,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+         plan = open_->plan;
+     } else if (options.gmem && gmem_) {
+         gmem = render::gmemPlan(pass, &plan, &gmemWhy_) && tileable;
+-        if (!tileable) gmemWhy_ = gmemWhy;
++        if (!tileable) gmemWhy_ = whyNotTiled();
+         if (gmem && gmemMinDraws_ != 0) {
+             // Both ways, unless this pass's like has had few draws for a while: then it is sysmem and recorded only so
+             // (a light pass is most of CoreAnimation's, and recording each of its draws twice was 7.5 us a draw on the
+@@ -3098,7 +4095,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+         }
+     }
+     Piece passTable;
+-    pm4::Stream head, body, headSys, bodySys;
++    pm4::Stream head, headSys;
++    std::shared_ptr<render::PassCache> opened;   // a new pass's
+     if (!joins) {
+         if (!piece(render::kTableBytes, &passTable, &why)) {
+             return fail(std::string("no memory for the pass's table: ") + why);
+@@ -3116,51 +4114,101 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+             gmemClears_ = 0;
+             return refuseWork(why);
+         }
+-    }
++        // (encodeBegin took the pass: it has an attachment, and every one of them is one a pass can have)
++        opened = std::make_shared<render::PassCache>();
++        opened->keyId = keyId;
++        const auto [W, H] = render::windowOf(pass);
++        opened->W = W;
++        opened->H = H;
++        opened->samples = render::firstAttachment(pass)->samples();
++    } else if (fast && !render::sameTargets(open_->pass, pass)) {
++        // (the pass's attachments at another slice or with another action than it opened with: the long way judges it)
++        fast = false;
++    }
++    render::PassCache& pc = joins ? *open_->cache : *opened;
++    const render::GmemPlan* const tiled = gmem ? &plan : nullptr;
++    const bool afterFetch = joins && open_->lastFetched;
+     render::Options encodeOptions = options;
+-    // The state a draw's program and pass alone decide (render::Options' zsNone, mrt, msaaOff, renderCntl, lrzOff, vpc,
+-    // fsInputs, fsOutputs: register writes and nothing else) is not encoded again for a draw whose program, blending,
+-    // sample count and options are the last draw's in this pass: deduplication dropped every word of it anyway, and
+-    // making the words was most of a draw's encoding (some 190 of its 350). Not after a packet that made the
+-    // deduplication forget what the registers hold (staticKey emptied then).
+-    std::vector<uint8_t> staticKey;
+-    if (options.dedupRegs) {
+-        const void* ptrs[2] = {program.vs.k.words, program.fs.k.words};
+-        const uint32_t sizes[3] = {program.vs.k.numWords, program.fs.k.numWords, program.samples};
+-        auto add = [&](const void* p, size_t n) { staticKey.insert(staticKey.end(), static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + n); };
+-        add(ptrs, sizeof ptrs);
+-        add(sizes, sizeof sizes);
+-        add(&program.blend, sizeof program.blend);
+-        add(program.moreBlend, sizeof program.moreBlend);
+-        add(&encodeOptions, sizeof encodeOptions);
+-        if (joins && !open_->staticKey.empty() && open_->staticKey == staticKey) {
+-            encodeOptions.zsNone = encodeOptions.mrt = encodeOptions.msaaOff = encodeOptions.renderCntl = encodeOptions.lrzOff = false;
+-            encodeOptions.vpc = encodeOptions.fsInputs = encodeOptions.fsOutputs = false;
+-        }
+-    }
+     if (gmemOff_ & kGmemFetchBarrier) encodeOptions.fbReadOrdered = false;
+     // (a binned pass's draws are skipped by the tiles they miss: USE_VISIBILITY, which an override of 1 ignores)
+     if (gmem && (options.gmemBinning || gmemBinning_) && queue_.binningOk() && options.gmemBinningStage < 3) encodeOptions.visCullUse = true;
+-    if (!render::encodeInPass(body, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(), table.contents(), &why, encodeOptions,
+-                              gmem ? &plan : nullptr, joins && open_->lastFetched)) {
+-        gmemClears_ = 0;
+-        return refuseWork(why);
++    render::Options sysOptions = encodeOptions;   // (recorded both ways: the sysmem side's)
++    sysOptions.visCullUse = options.visCullUse;
++
++    // --- the draw's facts: by what it binds alone when the program's are kept, else in full (and refused by name) ---
++    render::DrawFacts& f = dc.facts;
++    // the same draw for sysmem when the pass is recorded both ways: its table the same words but for a fetch's
++    // descriptor, which reads memory there
++    Piece sysTable = table;
++    auto shortWay = [&]() {
++        uint32_t ibos = 0;
++        if (!render::fastFacts(*ps, pc, pass, d, vsBindings, fsBindings, &f) ||
++            !render::fastTables(*ps, pc, pass, vsBindings, fsBindings, null_.get(), measured, table.contents(), tiled, &ibos)) {
++            return false;
++        }
++        f.iboCount = ibos;
++        f.vsNumTex = ps->vs.numTex;
++        f.vsNumSamp = ps->vs.numSamp;
++        f.fsNumTex = ps->fs.numTex;
++        f.fsNumSamp = ps->fs.numSamp;
++        return true;
++    };
++    if (fast && !shortWay()) fast = false;
++    if (!fast) {
++        substitute();
++        if (!render::drawFacts(program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.contents(), &why, false, tiled, &dc.pf, &f)) {
++            gmemClears_ = 0;
++            return refuseWork(why);
++        }
+     }
+     if (dual) {
+-        // the same draw for sysmem: its table the same words but for a fetch's descriptor, which reads memory there
+-        Piece sysTable = table;
+         if (program.fs.fbRead && !piece(render::kTableBytes, &sysTable, &why)) {
+             gmemClears_ = 0;
+             return fail(std::string("no memory for the draw's table: ") + why);
+         }
+-        render::Options sysOptions = encodeOptions;
+-        sysOptions.visCullUse = options.visCullUse;
+-        if (!render::encodeInPass(bodySys, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, sysTable.gpuAddress(), sysTable.contents(), &why,
+-                                  sysOptions, nullptr, joins && open_->lastFetched)) {
++        if (fast && program.fs.fbRead) {
++            uint32_t ibos = 0;
++            if (!render::fastTables(*ps, pc, pass, vsBindings, fsBindings, null_.get(), measured, sysTable.contents(), nullptr, &ibos)) {
++                // (what the first table took the second takes: not reached; the long way judges both if it ever is)
++                fast = false;
++                substitute();
++                if (!render::drawFacts(program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.contents(), &why, false, tiled, &dc.pf, &f)) {
++                    gmemClears_ = 0;
++                    return refuseWork(why);
++                }
++            }
++        }
++        if (!fast && !render::drawFacts(program, pass, d, *vsb, *fsb, vsProgram, fsProgram, sysTable.contents(), &why, false, nullptr, &dc.pfSys, &dc.factsSys)) {
+             gmemClears_ = 0;
+             return refuseWork(why);
+         }
+     }
++    // The state a draw's program and pass alone decide (render::Options' zsNone, mrt, msaaOff, renderCntl, lrzOff, vpc,
++    // fsInputs, fsOutputs: register writes and nothing else) is not encoded again, the long way, for a draw whose
++    // program, blending, sample count and options are the last draw's in this pass: deduplication dropped every word of
++    // it anyway, and making the words was most of a draw's encoding (some 190 of its 350). Not after a packet that made
++    // the deduplication forget what the registers hold (staticKey emptied then).
++    std::vector<uint8_t>& staticKey = dc.staticKey;
++    staticKey.clear();
++    if (!fast && options.dedupRegs) {
++        const void* ptrs[2] = {program.vs.k.words, program.fs.k.words};
++        const uint32_t sizes[3] = {program.vs.k.numWords, program.fs.k.numWords, program.samples};
++        auto add = [&](const void* p, size_t n) { staticKey.insert(staticKey.end(), static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + n); };
++        add(ptrs, sizeof ptrs);
++        add(sizes, sizeof sizes);
++        add(&program.blend, sizeof program.blend);
++        add(program.moreBlend, sizeof program.moreBlend);
++        // (the options before the two lines above changed them, as they were keyed when the key was made of them: a pass's
++        // draws have the same two changes or none)
++        add(&options, sizeof options);
++        if (joins && !open_->staticKey.empty() && open_->staticKey == staticKey) {
++            encodeOptions.zsNone = encodeOptions.mrt = encodeOptions.msaaOff = encodeOptions.renderCntl = encodeOptions.lrzOff = false;
++            encodeOptions.vpc = encodeOptions.fsInputs = encodeOptions.fsOutputs = false;
++            sysOptions.zsNone = sysOptions.mrt = sysOptions.msaaOff = sysOptions.renderCntl = sysOptions.lrzOff = false;
++            sysOptions.vpc = sysOptions.fsInputs = sysOptions.fsOutputs = false;
++        }
++    }
++
+     if (!joins) {
+         {
+             const Texture* first = pass.color0 != nullptr ? pass.color0 : pass.depth;
+@@ -3182,6 +4230,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+         open_->pass = pass;
+         open_->options = options;
+         open_->table = passTable.gpuAddress();
++        open_->cache = std::move(opened);
+         if (dual) {
+             appendDeduped(open_->sysStream, headSys, open_->regs);
+             open_->headGmem = std::move(head);
+@@ -3241,19 +4290,122 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+         drawsProfiled_.push_back(dt);
+         drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1)));
+     }
++
++    // --- the draw's words, straight onto the pass's stream (and onto its sysmem side, for a pass recorded both ways) ---
++    RegShadow& shadow = open_->gmem ? open_->bodyRegs : open_->regs;
++    render::Cursor& cursor = open_->cache->cur[open_->gmem ? 1 : 0];
+     if (options.dedupRegs && open_->options.dedupRegs) {
+-        bool forgot = appendDeduped(into, body, open_->gmem ? open_->bodyRegs : open_->regs);
+-        if (open_->dual) forgot = appendDeduped(open_->sysStream, bodySys, open_->regs) || forgot;
+-        open_->staticKey = forgot ? std::vector<uint8_t>() : std::move(staticKey);
++        if (fast) {
++            // (render::gVerifyDraws: the same draw the long way, through a copy of the shadow as it was, must come to the
++            // same words and the same table -- the tests' check that what is kept is what drawFacts and emitDraw make)
++            const bool verify = render::gVerifyDraws.load(std::memory_order_relaxed);
++            RegShadow before, beforeSys;
++            const size_t mark = into.size(), markSys = open_->sysStream.size();
++            if (verify) {
++                before = shadow;
++                if (open_->dual) beforeSys = open_->regs;
++            }
++            into.packet(pm4::kNop, nullptr, 0);
++            render::emitFast(into, shadow, cursor, *ps, *open_->cache, f, program, pass, d, vsBindings, fsBindings, table.gpuAddress(), encodeOptions, tiled,
++                             afterFetch, dc.scratch);
++            if (open_->dual) {
++                open_->sysStream.packet(pm4::kNop, nullptr, 0);
++                render::emitFast(open_->sysStream, open_->regs, open_->cache->cur[0], *ps, *open_->cache, f, program, pass, d, vsBindings, fsBindings,
++                                 sysTable.gpuAddress(), sysOptions, nullptr, afterFetch, dc.scratch);
++            }
++            open_->staticKey.clear();   // (the long way's key: what it would skip is no longer what the last draw made)
++            counts_.keptDraws++;
++            if (verify) {
++                // (the long way's bindings, with the null texture in them: the check's alone -- what the draw names and
++                // keeps below goes on as it does unchecked)
++                const bool had = substituted;
++                substitute();
++                std::string differs = render::verifyDraw(into, mark, before, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(),
++                                                         table.contents(), encodeOptions, tiled, afterFetch);
++                if (differs.empty() && open_->dual) {
++                    differs = render::verifyDraw(open_->sysStream, markSys, beforeSys, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, sysTable.gpuAddress(),
++                                                 sysTable.contents(), sysOptions, nullptr, afterFetch);
++                }
++                if (!differs.empty()) return fail("a draw of " + std::string(program.name != nullptr ? program.name : "?") + " from its kept state: " + differs);
++                if (!had) {
++                    substituted = false;
++                    vsb = &vsBindings;
++                    fsb = &fsBindings;
++                }
++            }
++        } else {
++            into.packet(pm4::kNop, nullptr, 0);
++            render::DedupSink sink(into, shadow);
++            render::emitDraw(sink, f, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(), encodeOptions, tiled, afterFetch, render::kGAll);
++            bool forgot = sink.forgot();
++            if (open_->dual) {
++                open_->sysStream.packet(pm4::kNop, nullptr, 0);
++                render::DedupSink sys(open_->sysStream, open_->regs);
++                render::emitDraw(sys, dc.factsSys, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, sysTable.gpuAddress(), sysOptions, nullptr, afterFetch,
++                                 render::kGAll);
++                forgot = sys.forgot() || forgot;
++            }
++            if (forgot) {
++                open_->staticKey.clear();
++            } else {
++                open_->staticKey = staticKey;
++            }
++            // (written the long way: what the streams hold of the kept groups is no longer known)
++            open_->cache->cur[0].forget();
++            open_->cache->cur[1].forget();
++            // the first draw taken with this program in a pass of this kind: what it came to, kept for the next
++            if (ps == nullptr && keyId != render::StateCache::kNoKey) {
++                std::shared_ptr<render::ProgramState> made =
++                    render::buildState(program, keyId, options, dc.pf, f, pass, d, *vsb, *fsb, vsProgram, fsProgram);
++                if (program.uid != 0) {
++                    std::string no;
++                    made->vsBuffer = queue_.programBuffer(program.vs.k, &no);
++                    made->fsBuffer = queue_.programBuffer(program.fs.k, &no);
++                    if (made->vsBuffer != nullptr && made->fsBuffer != nullptr && made->vsBuffer->gpuAddress() == vsProgram &&
++                        made->fsBuffer->gpuAddress() == fsProgram) {
++                        queue_.states().put(made);
++                    }
++                } else {
++                    render::DrawCache::Hand h;
++                    h.at = &program;
++                    h.keyId = keyId;
++                    h.bytes.resize(sizeof(Program));
++                    memcpy(h.bytes.data(), &program, sizeof(Program));
++                    if (program.vs.k.numImmediates != 0) h.vsImm.assign(program.vs.k.immediates, program.vs.k.immediates + program.vs.k.numImmediates);
++                    if (program.fs.k.numImmediates != 0) h.fsImm.assign(program.fs.k.immediates, program.fs.k.immediates + program.fs.k.numImmediates);
++                    h.state = std::move(made);
++                    bool replaced = false;
++                    for (render::DrawCache::Hand& x : dc.hands) {
++                        if (x.at == h.at && x.keyId == h.keyId) {
++                            x = std::move(h);
++                            replaced = true;
++                            break;
++                        }
++                    }
++                    if (!replaced) {
++                        if (dc.hands.size() >= 64) dc.hands.erase(dc.hands.begin());
++                        dc.hands.push_back(std::move(h));
++                    }
++                }
++            }
++        }
+     } else {
+-        appendStream(into, body);
+-        if (open_->dual) appendStream(open_->sysStream, bodySys);
++        // (no deduplication asked: every draw writes all of its state)
++        into.packet(pm4::kNop, nullptr, 0);
++        render::emitDraw(into, f, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(), encodeOptions, tiled, afterFetch, render::kGAll);
++        if (open_->dual) {
++            open_->sysStream.packet(pm4::kNop, nullptr, 0);
++            render::emitDraw(open_->sysStream, dc.factsSys, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, sysTable.gpuAddress(), sysOptions, nullptr,
++                             afterFetch, render::kGAll);
++        }
++        open_->cache->cur[0].forget();
++        open_->cache->cur[1].forget();
+     }
+     if (timed) drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1) + 1));
+     counts_.draws++;
+     if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().draws++;
+     // a stage with device buffers may write them (ldib's table is stib's): its whole table is used for writing
+-    for (const auto& [b, writes] : {std::pair<const Bindings*, bool>{vsb, program.vs.k.numSsbos != 0}, {fsb, program.fs.k.numSsbos != 0}}) {
++    for (const auto& [b, writes] : {std::pair<const Bindings*, bool>{&vsBindings, program.vs.k.numSsbos != 0}, {&fsBindings, program.fs.k.numSsbos != 0}}) {
+         for (const Binding& x : b->buffers) {
+             if (x.buffer != nullptr) {
+                 use(*x.buffer, writes);
+@@ -3270,13 +4422,35 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+         use(*d.visibility, true);   // the result word is written; the command buffer keeps the buffer until it is
+     }
+     // both stages' sampled textures: read, and alive until the GPU is done (the descriptors in the table point at them)
+-    for (const Bindings* b : {vsb, fsb}) {
+-        for (const Texture* t : b->textures) {
+-            if (t != nullptr) {
++    if (substituted) {
++        for (const Bindings* b : {vsb, fsb}) {
++            for (const Texture* t : b->textures) {
++                if (t != nullptr) {
++                    use(*t->buffer(), false);
++                    keep(t->buffer());
++                }
++            }
++        }
++    } else {
++        // (the caller's own bindings: what is bound where the null texture goes is not what the draw reads)
++        for (int stage = 0; stage < 2; stage++) {
++            const Bindings& b = stage == 0 ? vsBindings : fsBindings;
++            const Kernel& k = stage == 0 ? program.vs.k : program.fs.k;
++            for (size_t i = 0; i < b.textures.size(); i++) {
++                const Texture* t = b.textures[i];
++                if (t == nullptr) continue;
++                if (i < kMaxTextureSlots && i < k.numTextureSlots && k.textures[i].kind == kTexSampled && k.textures[i].fbTarget == 0 &&
++                    (k.textures[i].isNull || (measured && stage == 1))) {
++                    continue;
++                }
+                 use(*t->buffer(), false);
+                 keep(t->buffer());
+             }
+         }
++        if (wantsNull) {
++            use(*null_->buffer(), false);
++            keep(null_->buffer());
++        }
+     }
+     return true;
+ }
+@@ -3420,6 +4594,11 @@ bool CommandBuffer::append(CommandBuffer& other) {
+     other.uses_.clear();
+     other.kept_.clear();
+     other.keptAny_.clear();
++    // (what OTHER remembers having named and kept is in those lists no longer: anything recorded into it after this
++    // names and keeps afresh)
++    memset(other.recent_, 0, sizeof other.recent_);
++    other.drawCache_.reset();
++    other.uploaded_.clear();
+     counts_.passes += other.counts_.passes;
+     counts_.draws += other.counts_.draws;
+     counts_.dispatches += other.counts_.dispatches;
+@@ -3428,6 +4607,7 @@ bool CommandBuffer::append(CommandBuffer& other) {
+     counts_.gmemPasses += other.counts_.gmemPasses;
+     counts_.binnedPasses += other.counts_.binnedPasses;
+     counts_.tiles += other.counts_.tiles;
++    counts_.keptDraws += other.counts_.keptDraws;
+     other.counts_ = Counts{};
+     return true;
+ }
+diff --git a/hakios-metal/src/texture.cpp b/hakios-metal/src/texture.cpp
+index ab5e573..7539430 100644
+--- a/hakios-metal/src/texture.cpp
++++ b/hakios-metal/src/texture.cpp
+@@ -848,6 +848,21 @@ a6xx::TexConst Texture::sampledDescriptor() const {
+     return d;
+ }
+ 
++const uint32_t* Texture::sampledWords() const {
++    if (sampledState_.load(std::memory_order_acquire) == 2) return sampledWords_;
++    const a6xx::TexConst d = sampledDescriptor();
++    uint8_t none = 0;
++    if (sampledState_.compare_exchange_strong(none, 1)) {
++        memcpy(sampledWords_, d.dword, sizeof sampledWords_);
++        sampledState_.store(2, std::memory_order_release);
++    } else {
++        // (another thread is writing the same sixteen words: until it has)
++        while (sampledState_.load(std::memory_order_acquire) != 2) {
++        }
++    }
++    return sampledWords_;
++}
++
+ a6xx::TexConst Texture::levelDescriptor(uint32_t level) const {
+     const TextureLevel L = this->level(level);
+     a6xx::TexConst d = texture2d(levelAddress(level), L.width, L.height, uint32_t(L.pitch), pitchAlign_ != ~0u ? pitchAlign_ : log2u(info_->bytesPerPixel),
+diff --git a/hakios-metal/tests/draw_state_test.cpp b/hakios-metal/tests/draw_state_test.cpp
+new file mode 100644
+index 0000000..b3fa747
+--- /dev/null
++++ b/hakios-metal/tests/draw_state_test.cpp
+@@ -0,0 +1,872 @@
++// What CommandBuffer::draw keeps of a program between draws (render.cpp: ProgramState, PassCache), held to the same
++// draw encoded in full. The runner turns CommandBuffer::verifyDraws on, so every draw taken from a kept state anywhere
++// in the tests is checked word for word against the long way (a difference ends the buffer in error); the tests here
++// are the cases that make a kept state wrong if it is kept wrongly -- a program changed after it was drawn with, a pass
++// of another kind, bindings the kept state cannot take -- and the rule the leaving-out of a group stands on.
++#include <cmath>
++#include <cstring>
++#include <limits>
++#include <map>
++#include <set>
++#include <thread>
++#include <vector>
++
++#include "hakios-metal/a6xx.hpp"
++#include "hakios-metal/command.hpp"
++#include "hakios-metal/fake_gpu.hpp"
++#include "hakios-metal/hakios_metal.h"
++#include "hakios-metal/render.hpp"
++#include "hakios-metal/testing.hpp"
++#include "hakios-metal/texture.hpp"
++#include "fixtures/tri_arr_vs_air.hpp"
++#include "fixtures/tri_attr_vs_air.hpp"
++#include "fixtures/tri_base_vs_air.hpp"
++#include "fixtures/tri_cflat_fs_air.hpp"
++#include "fixtures/tri_color_fs_air.hpp"
++#include "fixtures/tri_color_vs_air.hpp"
++#include "fixtures/tri_dbuf_fs_air.hpp"
++#include "fixtures/tri_dpos_vs_air.hpp"
++#include "fixtures/tri_fb_fs_air.hpp"
++#include "fixtures/tri_flat_fs_air.hpp"
++#include "fixtures/tri_flat_vs_air.hpp"
++#include "fixtures/tri_mrt_fs_air.hpp"
++#include "fixtures/tri_nullfb_fs_air.hpp"
++#include "fixtures/tri_oldcb_vs_air.hpp"
++#include "fixtures/tri_olddb_vs_air.hpp"
++#include "fixtures/tri_pvt_fs_air.hpp"
++#include "fixtures/tri_tex39_fs_air.hpp"
++#include "fixtures/tri_tex_fs_air.hpp"
++#include "fixtures/tri_upos_vs_air.hpp"
++#include "fixtures/tri_vtex_vs_air.hpp"
++#include "golden.hpp"
++#include "test.hpp"
++
++using namespace hakios::metal;
++namespace kernels = hakios::metal::kernels;
++
++namespace {
++struct Rig {
++    Rig() {
++        auto f = std::make_unique<FakeGpu>();
++        fake = f.get();
++        gpu = std::make_unique<Gpu>(std::move(f));
++        std::string why;
++        queue = CommandQueue::make(*gpu, &why);
++    }
++    FakeGpu* fake;
++    std::unique_ptr<Gpu> gpu;
++    std::unique_ptr<CommandQueue> queue;
++};
++
++std::shared_ptr<Texture> texture(Rig& r, uint32_t w, uint32_t h, uint32_t usage, PixelFormat format = PixelFormat::kRGBA8Unorm) {
++    TextureDesc d;
++    d.format = format;
++    d.width = w;
++    d.height = h;
++    d.usage = usage;
++    std::string why;
++    auto t = Texture::make(*r.gpu, d, &why);
++    CHECK(t != nullptr);
++    return t;
++}
++
++Draw quad(uint32_t w = 64, uint32_t h = 64) {
++    Draw d;
++    d.vertexCount = 6;
++    d.viewport = Viewport{0, 0, double(w), double(h), 0, 1};
++    return d;
++}
++
++// the buffer committed and waited for -- and the queue with it, until its thread has the submission's memory back: a
++// buffer recorded before that is given new memory, and every address made after it is another (the streams here are
++// summed, golden.hpp)
++void wait(Rig& r, const std::shared_ptr<CommandBuffer>& cb) {
++    cb->commit();
++    cb->waitUntilCompleted();
++    while (cb->status() == CommandBuffer::kCompleted && r.queue->idleCommandBuffers() == 0) std::this_thread::yield();
++}
++// ...and held to having completed without the fake finding fault
++void finish(Rig& r, const std::shared_ptr<CommandBuffer>& cb) {
++    wait(r, cb);
++    CHECK(cb->status() == CommandBuffer::kCompleted);
++    if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
++}
++
++// a Program as linkProgram leaves one: linked, with a uid
++Program linked(const Stage& vs, const Stage& fs, const char* name) {
++    Program p{vs, fs, Linkage{}, name};
++    std::string why;
++    CHECK(render::link(p.vs, p.fs, &p.link, &why));
++    p.uid = newProgramUid();
++    return p;
++}
++
++// the C interface's device, queue and a target, for the tests that go the plug-in's way
++struct CRig {
++    hakios_metal_device* device = hakios_metal_open_fake();
++    hakios_metal_queue* queue = hakios_metal_queue_new(device);
++    hakios_metal_texture* target = hakios_metal_texture_new(device, 2, 70, 64, 64, 1 | 4);   // 2D RGBA8Unorm, read and render target
++    ~CRig() {
++        hakios_metal_texture_free(target);
++        hakios_metal_queue_free(queue);
++        hakios_metal_close(device);
++    }
++    hakios_metal_render_pass pass() const {
++        hakios_metal_render_pass p{};
++        p.color0 = target;
++        p.load_action = 1;
++        p.store_action = 1;
++        return p;
++    }
++};
++
++// a command buffer of the C interface committed and waited for; its status
++hakios_metal_status done(hakios_metal_cb* cb) {
++    hakios_metal_cb_commit(cb, nullptr, nullptr);
++    hakios_metal_cb_wait(cb);
++    const hakios_metal_status s = hakios_metal_cb_status(cb);
++    if (s != HAKIOS_METAL_COMPLETED) std::printf("       %s\n", hakios_metal_cb_error(cb));
++    hakios_metal_cb_free(cb);
++    return s;
++}
++}  // namespace
++
++// The first draw with a program in a kind of pass is judged and written whole; the draws after it, in the same command
++// buffer and in the next ones of the queue, are taken from what that one came to.
++TEST(a_programs_state_is_kept_by_the_queue_from_one_command_buffer_to_the_next) {
++    Rig r;
++    auto t = texture(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead);
++    RenderPass pass;
++    pass.color0 = t.get();
++    const Program p = linked(kernels::tri_flat_vs_air, kernels::tri_flat_fs_air, "tri_flat");
++    auto first = r.queue->commandBuffer();
++    for (int i = 0; i < 4; i++) CHECK(first->draw(p, pass, quad(), Bindings{}, Bindings{}));
++    CHECK_EQ(first->counts().draws, 4u);
++    CHECK_EQ(first->counts().keptDraws, 3u);   // (all but the first)
++    finish(r, first);
++    auto second = r.queue->commandBuffer();
++    for (int i = 0; i < 4; i++) CHECK(second->draw(p, pass, quad(), Bindings{}, Bindings{}));
++    CHECK_EQ(second->counts().keptDraws, 4u);  // (the pass's own first draw too)
++    finish(r, second);
++    // ...and a pass of another kind (another format) is another state: its first draw the long way again
++    auto u = texture(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
++    RenderPass other;
++    other.color0 = u.get();
++    auto third = r.queue->commandBuffer();
++    CHECK(third->draw(p, other, quad(), Bindings{}, Bindings{}));
++    CHECK(third->draw(p, other, quad(), Bindings{}, Bindings{}));
++    CHECK(third->draw(p, pass, quad(), Bindings{}, Bindings{}));
++    CHECK_EQ(third->counts().keptDraws, 2u);
++    finish(r, third);
++    CHECK_EQ(r.fake->stats().faults, 0u);
++}
++
++// A Program made by hand carries no promise that it is the one drawn before: the state kept for it is used only while
++// the Program is the same byte for byte. Changed in place between two draws -- its blending, a field of a stage -- the
++// second draw is the changed program's (the runner's check against the long way says so, and the register here).
++TEST(a_program_made_by_hand_and_changed_in_place_is_drawn_as_it_is_now) {
++    Rig r;
++    auto t = texture(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead);
++    RenderPass pass;
++    pass.color0 = t.get();
++    Program p{kernels::tri_flat_vs_air, kernels::tri_flat_fs_air, Linkage{}, "tri_flat"};
++    auto cb = r.queue->commandBuffer();
++    CHECK(cb->draw(p, pass, quad(), Bindings{}, Bindings{}));
++    CHECK(cb->draw(p, pass, quad(), Bindings{}, Bindings{}));
++    CHECK_EQ(cb->counts().keptDraws, 1u);
++    p.blend.enabled = true;   // premultiplied source-over
++    p.blend.srcRgb = 1, p.blend.dstRgb = 5, p.blend.srcAlpha = 1, p.blend.dstAlpha = 5;
++    CHECK(cb->draw(p, pass, quad(), Bindings{}, Bindings{}));
++    CHECK_EQ(cb->counts().keptDraws, 1u);      // (not the kept one: the long way, and a state of its own)
++    CHECK(cb->draw(p, pass, quad(), Bindings{}, Bindings{}));
++    CHECK_EQ(cb->counts().keptDraws, 2u);
++    finish(r, cb);
++    CHECK_EQ(r.fake->stats().faults, 0u);
++    CHECK((r.fake->stats().lastDraw.mrtControl & a6xx::A6XX_RB_MRT_CONTROL_BLEND) != 0);
++}
++
++// The C interface's setters change a program after it was linked, and each makes it another program to a draw: what
++// was kept for it is not used again.
++TEST(a_program_changed_by_the_c_interface_is_another_program_to_a_draw) {
++    CRig r;
++    hakios_metal_program* p = hakios_metal_program_from_stages(kernels::tri_flat_vs_air, kernels::tri_flat_fs_air, 70);
++    CHECK(p != nullptr);
++    if (p == nullptr) return;
++    hakios_metal_render_pass pass = r.pass();
++    hakios_metal_cb* cb = hakios_metal_cb_new(r.queue);
++    for (int i = 0; i < 3; i++) CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, nullptr, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
++    hakios_metal_program_set_blend(p, 1, 0, 0, 1, 5, 1, 5, 0xf);
++    for (int i = 0; i < 3; i++) CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, nullptr, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
++    hakios_metal_program_set_blend(p, 0, 0, 0, 1, 0, 1, 0, 0x7);   // no blending, alpha not written
++    for (int i = 0; i < 3; i++) CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, nullptr, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
++    CHECK(done(cb) == HAKIOS_METAL_COMPLETED);
++    hakios_metal_program_free(p);
++}
++
++// A draw the kept state cannot take is judged the long way and refused by the sentence it always was: a constant buffer
++// not bound, after a draw that had it; a texture of the wrong class; a viewport outside the target. And the draw after,
++// with what it needs, is drawn.
++TEST(a_draw_its_kept_state_cannot_take_is_refused_by_name_the_long_way) {
++    CRig r;
++    hakios_metal_program* flat = hakios_metal_program_from_stages(kernels::tri_flat_vs_air, kernels::tri_cflat_fs_air, 70);
++    hakios_metal_program* tex = hakios_metal_program_from_stages(kernels::tri_color_vs_air, kernels::tri_tex_fs_air, 70);
++    CHECK(flat != nullptr && tex != nullptr);
++    if (flat == nullptr || tex == nullptr) return;
++    hakios_metal_buffer* uniforms = hakios_metal_buffer_new(r.device, 4096);
++    hakios_metal_texture* image = hakios_metal_texture_new(r.device, 2, 70, 16, 16, 1);
++    hakios_metal_texture* integers = hakios_metal_texture_new(r.device, 2, 53, 16, 16, 1);   // R32Uint
++    hakios_metal_sampler_desc sd{};
++    sd.normalized_coordinates = 1;
++    sd.max_anisotropy = 1;
++    hakios_metal_sampler* sampler = hakios_metal_sampler_new(r.device, &sd);
++    CHECK(uniforms != nullptr && image != nullptr && integers != nullptr && sampler != nullptr);
++    hakios_metal_render_pass pass = r.pass();
++    hakios_metal_cb* cb = hakios_metal_cb_new(r.queue);
++    hakios_metal_cb_skip_refused(cb, 1);
++    hakios_metal_buffer* bound[1] = {uniforms};
++    const uint64_t at8[1] = {8};
++    for (int i = 0; i < 2; i++) CHECK_EQ(hakios_metal_cb_draw(cb, flat, &pass, nullptr, nullptr, 3, 0, 6, 1, nullptr, nullptr, 0, bound, at8, 1), 0);
++    CHECK_EQ(hakios_metal_cb_draw(cb, flat, &pass, nullptr, nullptr, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), -1);
++    CHECK(strstr(hakios_metal_error(), "no buffer bound at index 0 (its constant buffer)") != nullptr);
++    CHECK_EQ(hakios_metal_cb_draw(cb, flat, &pass, nullptr, nullptr, 3, 0, 6, 1, nullptr, nullptr, 0, bound, at8, 1), 0);
++    hakios_metal_texture* textures[1] = {image};
++    hakios_metal_sampler* samplers[1] = {sampler};
++    for (int i = 0; i < 2; i++) {
++        CHECK_EQ(hakios_metal_cb_draw2(cb, tex, &pass, nullptr, nullptr, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0, textures, 1, samplers, 1), 0);
++    }
++    textures[0] = integers;
++    CHECK_EQ(hakios_metal_cb_draw2(cb, tex, &pass, nullptr, nullptr, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0, textures, 1, samplers, 1), -1);
++    CHECK(strstr(hakios_metal_error(), "reads it as texture2d<float>") != nullptr);
++    textures[0] = image;
++    const hakios_metal_viewport outside{100, 100, 10, 10, 0, 1};
++    CHECK_EQ(hakios_metal_cb_draw2(cb, tex, &pass, &outside, nullptr, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0, textures, 1, samplers, 1), -1);
++    CHECK(strstr(hakios_metal_error(), "covers no pixel of the 64 x 64 target") != nullptr);
++    CHECK_EQ(hakios_metal_cb_draw2(cb, tex, &pass, nullptr, nullptr, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0, textures, 1, samplers, 1), 0);
++    const char* last = nullptr;
++    CHECK_EQ(hakios_metal_cb_skipped(cb, &last), 3u);
++    CHECK(done(cb) == HAKIOS_METAL_COMPLETED);
++    hakios_metal_sampler_free(sampler);
++    hakios_metal_texture_free(integers);
++    hakios_metal_texture_free(image);
++    hakios_metal_buffer_free(uniforms);
++    hakios_metal_program_free(tex);
++    hakios_metal_program_free(flat);
++}
++
++// Programs changing from draw to draw in one pass, as a compositor's layers change them -- a textured one with a
++// vertex buffer, one of ten texture slots with one bound (the null texture in the other it samples), one with constants
++// bound where the load cannot read, a framebuffer fetch, two colour outputs -- in sysmem, in tiles, and recorded both
++// ways; each draw from its kept state is the draw the long way makes (the runner's check).
++TEST(a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full) {
++    for (int mode = 0; mode < 3; mode++) {
++        Rig r;
++        auto t = texture(r, 256, 256, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
++        auto u = texture(r, 256, 256, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
++        auto icon = texture(r, 16, 16, kTextureUsageRead), other = texture(r, 32, 32, kTextureUsageRead);
++        std::string why;
++        auto vertices = newBuffer(*r.gpu, 4096, &why), indices = newBuffer(*r.gpu, 4096, &why), uniforms = newBuffer(*r.gpu, 4096, &why);
++        Sampler smp;
++        CHECK(makeSampler(SamplerDesc{}, &smp, &why));
++        RenderPass pass;
++        pass.color0 = t.get();
++        pass.more[0].texture = u.get();
++        pass.more[0].load = LoadAction::kDontCare;
++        pass.more[0].store = StoreAction::kDontCare;
++        Program attr = linked(kernels::tri_attr_vs_air, kernels::tri_tex_fs_air, "attr+tex");
++        attr.vertexDescriptor.attributes[0] = VertexAttribute{VertexFormat::kFloat2, 0, 0};
++        attr.vertexDescriptor.attributes[1] = VertexAttribute{VertexFormat::kUChar4Normalized, 8, 0};
++        attr.vertexDescriptor.layouts[0] = VertexLayout{12, VertexStep::kPerVertex, 1};
++        Program slots = linked(kernels::tri_attr_vs_air, kernels::tri_tex39_fs_air, "attr+tex39");
++        slots.vertexDescriptor = attr.vertexDescriptor;
++        slots.blend.enabled = true;
++        slots.blend.srcRgb = 1, slots.blend.dstRgb = 5, slots.blend.srcAlpha = 1, slots.blend.dstAlpha = 5;
++        const Program flat = linked(kernels::tri_flat_vs_air, kernels::tri_cflat_fs_air, "flat+cflat");
++        const Program fetch = linked(kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, "flat+fb");
++        const Program mrt = linked(kernels::tri_flat_vs_air, kernels::tri_mrt_fs_air, "flat+mrt");
++        uint32_t kept = 0, draws = 0;
++        for (int frame = 0; frame < 2; frame++) {
++            auto cb = r.queue->commandBuffer();
++            cb->setGmem(mode != 0);
++            cb->setGmemMinDraws(mode == 2 ? 8 : 0);   // (2: recorded both ways, tiles for a pass of 8 or more)
++            cb->setGmemBinning(mode == 2);
++            for (int i = 0; i < 20; i++) {
++                Draw d = quad(256, 256);
++                if (i % 3 != 0) d.scissor = Scissor{uint32_t(8 * i), 16, 64, 64};
++                Bindings vsb, fsb;
++                const int k = i % 7;
++                const Program* p = k < 2 ? &attr : k == 2 ? &slots : k == 3 ? &fetch : k == 4 ? &mrt : k == 5 ? &slots : &attr;
++                if (p == &attr || p == &slots) {
++                    vsb.buffers = {Binding{vertices.get(), uint64_t(12 * i)}};
++                    d.indexBuffer = indices.get();
++                    d.indexOffset = uint64_t(2 * i);
++                }
++                if (p == &attr) {
++                    fsb.textures = {i % 2 ? icon.get() : other.get()};
++                    fsb.samplers = {&smp};
++                }
++                if (p == &slots) {
++                    fsb.textures = {nullptr, nullptr, nullptr, icon.get()};   // (slot 9, which it samples too, left unbound)
++                    fsb.samplers.assign(10, &smp);
++                }
++                CHECK(cb->draw(*p, pass, d, vsb, fsb));
++                if (!cb->error().empty()) std::printf("       mode %d draw %d: %s\n", mode, i, cb->error().c_str());
++            }
++            // (the fake holds a submission's constants to each later stage's constlen: the draws with uniforms last)
++            for (int i = 0; i < 4; i++) {
++                Bindings fsb;
++                fsb.buffers = {Binding{uniforms.get(), uint64_t(8 + 16 * i)}};
++                CHECK(cb->draw(flat, pass, quad(256, 256), Bindings{}, fsb));
++            }
++            kept += cb->counts().keptDraws;
++            draws += cb->counts().draws;
++            finish(r, cb);
++        }
++        // every draw of the second frame, and all but each program's first in the first
++        CHECK_EQ(draws, 48u);
++        CHECK_EQ(kept, 48u - 5u);
++        CHECK_EQ(r.fake->stats().faults, 0u);
++        if (r.fake->stats().faults != 0) std::printf("       mode %d: %s\n", mode, r.fake->stats().lastFault.c_str());
++    }
++}
++
++// What leaving a group out stands on: a group a draw does not write again is one whose registers still hold what the
++// group last wrote, which is so only if no other group of a draw writes them. Each group encoded alone, for programs of
++// every shape here: the registers each writes are its own (HLSQ_INVALIDATE_CMD, a command written every time, apart).
++TEST(the_groups_of_a_draw_write_registers_of_their_own) {
++    Rig r;
++    auto t = texture(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead);
++    auto u = texture(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead);
++    auto depth = texture(r, 64, 64, kTextureUsageRenderTarget, PixelFormat::kDepth32Float);
++    auto icon = texture(r, 16, 16, kTextureUsageRead);
++    std::string why;
++    auto vertices = newBuffer(*r.gpu, 4096, &why), uniforms = newBuffer(*r.gpu, 4096, &why), table = newBuffer(*r.gpu, render::kTableBytes, &why);
++    auto vsWords = newBuffer(*r.gpu, 4096, &why), fsWords = newBuffer(*r.gpu, 4096, &why);
++    Sampler smp;
++    CHECK(makeSampler(SamplerDesc{}, &smp, &why));
++    struct Case {
++        Program program;
++        Bindings vsb, fsb;
++        bool second, withDepth;
++    };
++    std::vector<Case> cases;
++    cases.push_back(Case{Program{kernels::tri_flat_vs_air, kernels::tri_flat_fs_air, Linkage{}, "tri_flat"}, {}, {}, false, false});
++    {
++        Case c{Program{kernels::tri_attr_vs_air, kernels::tri_tex_fs_air, Linkage{}, "attr+tex"}, {}, {}, false, true};
++        c.program.vertexDescriptor.attributes[0] = VertexAttribute{VertexFormat::kFloat2, 0, 0};
++        c.program.vertexDescriptor.attributes[1] = VertexAttribute{VertexFormat::kUChar4Normalized, 8, 0};
++        c.program.vertexDescriptor.layouts[0] = VertexLayout{12, VertexStep::kPerVertex, 1};
++        c.program.blend.enabled = true;
++        c.vsb.buffers = {Binding{vertices.get(), 0}};
++        c.fsb.textures = {icon.get()};
++        c.fsb.samplers = {&smp};
++        cases.push_back(c);
++    }
++    {
++        Case c{Program{kernels::tri_flat_vs_air, kernels::tri_cflat_fs_air, Linkage{}, "flat+cflat"}, {}, {}, false, false};
++        c.fsb.buffers = {Binding{uniforms.get(), 8}};
++        cases.push_back(c);
++    }
++    cases.push_back(Case{Program{kernels::tri_flat_vs_air, kernels::tri_mrt_fs_air, Linkage{}, "flat+mrt"}, {}, {}, true, false});
++    cases.push_back(Case{Program{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "flat+fb"}, {}, {}, false, false});
++    // render::Options' groups of a draw, each a bool of the struct (which holds bools and bytes alone)
++    const struct {
++        const char* name;
++        bool render::Options::* on;
++    } groups[] = {{"zsNone", &render::Options::zsNone},
++                  {"mrt", &render::Options::mrt},
++                  {"msaaOff", &render::Options::msaaOff},
++                  {"renderCntl", &render::Options::renderCntl},
++                  {"lrzOff", &render::Options::lrzOff},
++                  {"programConfig", &render::Options::programConfig},
++                  {"programVs", &render::Options::programVs},
++                  {"programFs", &render::Options::programFs},
++                  {"fsTextures", &render::Options::fsTextures},
++                  {"vsTextures", &render::Options::vsTextures},
++                  {"vfd", &render::Options::vfd},
++                  {"vpc", &render::Options::vpc},
++                  {"fsInputs", &render::Options::fsInputs},
++                  {"fsOutputs", &render::Options::fsOutputs},
++                  {"rast", &render::Options::rast},
++                  {"viewportScissor", &render::Options::viewportScissor},
++                  {"blendZsa", &render::Options::blendZsa}};
++    for (const Case& c : cases) {
++        RenderPass pass;
++        pass.color0 = t.get();
++        if (c.second) pass.more[0].texture = u.get();
++        if (c.withDepth) pass.depth = depth.get();
++        // what a draw writes with every group off: the depth buffer's registers when the pass has one (the group zsNone's
++        // other half, written whatever the switch says), and nothing else
++        std::map<uint32_t, const char*> owner;
++        for (int g = -1; g < int(sizeof groups / sizeof groups[0]); g++) {
++            render::Options o;
++            memset(static_cast<void*>(&o), 0, sizeof o);
++            if (g >= 0) o.*(groups[g].on) = true;
++            pm4::Stream s;
++            const bool ok = render::encodeInPass(s, c.program, pass, quad(), c.vsb, c.fsb, vsWords->gpuAddress(), fsWords->gpuAddress(), table->gpuAddress(),
++                                                 static_cast<uint8_t*>(table->contents()), &why, o);
++            CHECK(ok);
++            if (!ok) {
++                std::printf("       %s: %s\n", c.program.name, why.c_str());
++                break;
++            }
++            const char* name = g < 0 ? "(the depth buffer)" : groups[g].name;
++            std::set<uint32_t> mine;
++            const std::vector<uint32_t>& w = s.words();
++            for (size_t i = 0; i < w.size();) {
++                const pm4::Header h = pm4::decode(w[i]);
++                for (uint32_t k = 0; h.kind == pm4::Header::kRegisters && k < h.count; k++) mine.insert(h.reg + k);
++                i += 1 + h.count;
++            }
++            for (uint32_t reg : mine) {
++                if (reg == a6xx::REG_A6XX_HLSQ_INVALIDATE_CMD) continue;
++                auto had = owner.find(reg);
++                // (the depth buffer's registers are in every one of these streams when the pass has depth: theirs)
++                if (had != owner.end() && strcmp(had->second, "(the depth buffer)") == 0) continue;
++                CHECK(had == owner.end());
++                if (had != owner.end()) std::printf("       %s: register %#x is written by %s and by %s\n", c.program.name, reg, had->second, name);
++                owner.emplace(reg, name);
++            }
++        }
++    }
++}
++
++// --- the same random frames, from kept states and written whole ---------------------------------------------------------------
++namespace {
++// the test's own numbers, the same on every host
++struct Rng {
++    uint64_t s;
++    uint32_t next() {
++        s ^= s << 13;
++        s ^= s >> 7;
++        s ^= s << 17;
++        return uint32_t(s >> 24);
++    }
++    uint32_t below(uint32_t n) { return next() % n; }
++    bool one(uint32_t in) { return below(in) == 0; }
++};
++
++// what a recording came to
++struct Told {
++    std::vector<std::string> said;   // each draw: "" taken, else the sentence it was refused by; and each frame's end
++    golden::Sums sums;               // what the fake was given
++    uint32_t draws = 0, kept = 0;
++    uint64_t faults = 0;
++};
++
++struct Chain {
++    golden::Sums* into;
++    void (*next)(FakeGpu&, uint64_t, uint32_t, void*);
++    void* nextContext;
++};
++void chained(FakeGpu& gpu, uint64_t address, uint32_t words, void* context) {
++    Chain& c = *static_cast<Chain*>(context);
++    golden::hook(gpu, address, words, c.into);
++    if (c.next != nullptr) c.next(gpu, address, words, c.nextContext);
++}
++
++// what a program needs bound
++enum : uint32_t {
++    kVertices = 1, kTexture = 2, kTenSlots = 4, kFsUniforms = 8, kVsUbo = 16, kVsDevice = 32, kFsDevice = 64, kVsTexture = 128, kVsUbos = 256,
++    kVsDevices = 512, kManySlots = 1024,
++};
++
++// FRAMES frames of DRAWS draws by SEED's numbers: programs of every shape the fixtures have, in passes that change. Half
++// the draws are made anew -- their numbers and bindings their own -- and half are the draw before with one thing
++// changed (what a compositor's draws are to each other, and what the kept state's memory of the last draw is tried by);
++// every fourth is then made wrong in one thing. MODE 0 sysmem, 1 tiles, 2 recorded both ways and binned. ALL_UIDS:
++// every program one with a uid, so that a frame after the first is drawn from kept states alone.
++Told randomFrames(uint64_t seed, bool keep, int mode, uint32_t frames, uint32_t draws, bool allUids) {
++    Told out;
++    const bool was = CommandBuffer::keepStates(keep);
++    Chain chain{&out.sums, FakeGpu::submitHook, FakeGpu::submitHookContext};
++    FakeGpu::submitHookContext = &chain;
++    FakeGpu::submitHook = chained;
++    {
++        Rig r;
++        Rng rng{(seed + 1) * 0x9e3779b97f4a7c15ull};
++        const uint32_t W = 128, H = 96;
++        const uint32_t target = kTextureUsageRenderTarget | kTextureUsageRead;
++        auto colorA = texture(r, W, H, target, PixelFormat::kBGRA8Unorm), colorB = texture(r, W, H, target, PixelFormat::kBGRA8Unorm);
++        auto second = texture(r, W, H, target, PixelFormat::kBGRA8Unorm);
++        auto depth = texture(r, W, H, kTextureUsageRenderTarget, PixelFormat::kDepth32Float);
++        auto depthStencil = texture(r, W, H, kTextureUsageRenderTarget, PixelFormat::kDepth32FloatStencil8);
++        auto icon = texture(r, 16, 16, kTextureUsageRead), photo = texture(r, 32, 32, kTextureUsageRead);
++        auto integers = texture(r, 8, 8, kTextureUsageRead, PixelFormat::kR32Uint);
++        auto unread = texture(r, 8, 8, kTextureUsageRenderTarget);
++        std::shared_ptr<Texture> volume;
++        {
++            TextureDesc d;
++            d.type = TextureType::k3D;
++            d.width = d.height = 4;
++            d.depth = 2;
++            std::string why;
++            volume = Texture::make(*r.gpu, d, &why);
++            CHECK(volume != nullptr);
++        }
++        std::string why;
++        auto vertices = newBuffer(*r.gpu, 4096, &why), indices = newBuffer(*r.gpu, 4096, &why), uniforms = newBuffer(*r.gpu, 4096, &why);
++        auto otherVertices = newBuffer(*r.gpu, 4096, &why);   // (as long as the first: a fetch from it differs in its address alone)
++        auto device = newBuffer(*r.gpu, 4096, &why), otherDevice = newBuffer(*r.gpu, 4096, &why), small = newBuffer(*r.gpu, 64, &why);
++        auto numbers = newBuffer(*r.gpu, 4096, &why), results = newBuffer(*r.gpu, 4096, &why);
++        {
++            // an indirect draw's words, at every offset one is asked at: 6 vertices, 1 instance, from 0
++            uint32_t* w = static_cast<uint32_t*>(numbers->contents());
++            for (uint32_t i = 0; i < 64; i += 4) w[i] = 6, w[i + 1] = 1, w[i + 2] = 0, w[i + 3] = 0;
++        }
++        Sampler smpA, smpB;
++        SamplerDesc linear;
++        linear.minFilter = linear.magFilter = 1;
++        CHECK(makeSampler(SamplerDesc{}, &smpA, &why) && makeSampler(linear, &smpB, &why));
++
++        struct Recipe {
++            Program program;
++            uint32_t needs;
++        };
++        std::vector<Recipe> recipes;
++        auto add = [&](const Stage& vs, const Stage& fs, const char* name, uint32_t needs) {
++            Program p{vs, fs, Linkage{}, name};
++            if (needs & kVertices) {
++                p.vertexDescriptor.attributes[0] = VertexAttribute{VertexFormat::kFloat2, 0, 0};
++                p.vertexDescriptor.attributes[1] = VertexAttribute{VertexFormat::kUChar4Normalized, 8, 0};
++                p.vertexDescriptor.layouts[0] = VertexLayout{12, VertexStep::kPerVertex, 1};
++            }
++            // (every other one a program with a uid, as linkProgram makes them; the rest made by hand)
++            if (allUids || recipes.size() % 2 == 0) {
++                std::string no;
++                CHECK(render::link(p.vs, p.fs, &p.link, &no));
++                p.uid = newProgramUid();
++            }
++            recipes.push_back(Recipe{p, needs});
++        };
++        add(kernels::tri_flat_vs_air, kernels::tri_flat_fs_air, "flat", 0);
++        add(kernels::tri_attr_vs_air, kernels::tri_tex_fs_air, "attr+tex", kVertices | kTexture);
++        add(kernels::tri_attr_vs_air, kernels::tri_tex39_fs_air, "attr+tex39", kVertices | kTenSlots);
++        add(kernels::tri_flat_vs_air, kernels::tri_cflat_fs_air, "flat+cflat", kFsUniforms);
++        add(kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, "flat+fb", 0);
++        add(kernels::tri_flat_vs_air, kernels::tri_mrt_fs_air, "flat+mrt", 0);
++        add(kernels::tri_upos_vs_air, kernels::tri_flat_fs_air, "upos+flat", kVsUbo);
++        add(kernels::tri_dpos_vs_air, kernels::tri_flat_fs_air, "dpos+flat", kVsDevice);
++        add(kernels::tri_vtex_vs_air, kernels::tri_color_fs_air, "vtex+color", kVsTexture);
++        add(kernels::tri_arr_vs_air, kernels::tri_flat_fs_air, "arr+flat", 0);
++        add(kernels::tri_base_vs_air, kernels::tri_color_fs_air, "base+color", 0);
++        add(kernels::tri_flat_vs_air, kernels::tri_pvt_fs_air, "flat+pvt", 0);
++        add(kernels::tri_oldcb_vs_air, kernels::tri_flat_fs_air, "oldcb+flat", kVsUbos);
++        add(kernels::tri_olddb_vs_air, kernels::tri_flat_fs_air, "olddb+flat", kVsDevices);
++        add(kernels::tri_dpos_vs_air, kernels::tri_dbuf_fs_air, "dpos+dbuf", kVsDevice | kFsDevice);
++        add(kernels::tri_color_vs_air, kernels::tri_nullfb_fs_air, "color+nullfb", kManySlots);
++        add(kernels::tri_attr_vs_air, kernels::tri_tex_fs_air, "attr+tex blended", kVertices | kTexture);
++        recipes.back().program.blend.enabled = true;
++        recipes.back().program.blend.srcRgb = 1, recipes.back().program.blend.dstRgb = 5;
++
++        RenderPass passes[4];
++        passes[0].color0 = colorA.get();
++        passes[1].color0 = colorA.get();
++        passes[1].more[0].texture = second.get();
++        passes[1].more[0].load = LoadAction::kDontCare;
++        passes[1].more[0].store = StoreAction::kDontCare;
++        passes[2].color0 = colorB.get();
++        passes[2].depth = depth.get();
++        passes[3].color0 = colorB.get();
++        passes[3].depth = depthStencil.get();
++        passes[3].stencil = depthStencil.get();
++        const double nan = std::numeric_limits<double>::quiet_NaN();
++
++        for (uint32_t frame = 0; frame < frames; frame++) {
++            auto cb = r.queue->commandBuffer();
++            cb->setSkipRefused(true);
++            cb->setGmem(mode != 0);
++            cb->setGmemMinDraws(mode == 2 ? 8 : 0);
++            cb->setGmemBinning(mode == 2);
++            uint32_t which = rng.below(4), recipe = rng.below(uint32_t(recipes.size()));
++            Draw lastDraw;
++            Bindings lastVs, lastFs;
++            bool haveLast = false;
++            for (uint32_t i = 0; i < draws; i++) {
++                Draw d;
++                Bindings vsb, fsb;
++                RenderPass pass;
++                if (haveLast && rng.one(2)) {
++                    // the draw before, with one thing changed (or nothing, where the thing is not this draw's to change)
++                    d = lastDraw;
++                    vsb = lastVs;
++                    fsb = lastFs;
++                    pass = passes[which];
++                    const bool indexed = d.indexBuffer != nullptr;
++                    StencilFace* const face = rng.one(2) ? &d.stencil.front : &d.stencil.back;
++                    switch (rng.below(41)) {
++                    case 0: d.viewport.x += 1; break;
++                    case 1: d.viewport.y += 1; break;
++                    case 2: d.viewport.width += 1; break;
++                    case 3: d.viewport.height += 1; break;
++                    case 4: d.viewport.znear = d.viewport.znear == 0 ? 0.25 : 0; break;
++                    case 5: d.viewport.zfar = d.viewport.zfar == 1 ? 0.75 : 1; break;
++                    case 6: d.scissor = d.scissor.width == 0 ? Scissor{1, 1, 8, 8} : Scissor{d.scissor.x ^ 1u, d.scissor.y, d.scissor.width, d.scissor.height}; break;
++                    case 7: d.scissor = d.scissor.width == 0 ? Scissor{0, 0, W, H} : Scissor{d.scissor.x, d.scissor.y ^ 1u, d.scissor.width, d.scissor.height}; break;
++                    case 8: if (d.scissor.width > 1) d.scissor.width -= 1; break;
++                    case 9: if (d.scissor.height > 1) d.scissor.height -= 1; break;
++                    case 10: d.cullMode = (d.cullMode + 1) % 3; break;
++                    case 11: d.winding ^= 1u; break;
++                    case 12: if (!indexed) d.vertexStart ^= 1u; break;
++                    case 13: if (indexed) d.baseVertex ^= 1; break;
++                    case 14: d.baseInstance ^= 1u; break;
++                    case 15: if (indexed) d.indexType ^= 1u, d.indexOffset = 0; break;
++                    case 16: if (recipes[recipe].needs & kVertices) d.indexBuffer = indexed ? nullptr : indices.get(), d.indexOffset = 0; break;
++                    case 17: if (!vsb.buffers.empty() && (recipes[recipe].needs & kVertices)) vsb.buffers[0].offset ^= 12u; break;
++                    case 18: d.blendColor[rng.below(4)] += 0.25f; break;
++                    case 19: if (pass.depth != nullptr) d.depth.compare = (d.depth.compare + 1) % 8; break;
++                    case 20: if (pass.depth != nullptr) d.depth.write = !d.depth.write; break;
++                    case 21: if (pass.stencil != nullptr) d.stencil.enabled = !d.stencil.enabled; break;
++                    case 22: if (pass.stencil != nullptr) face->compare = (face->compare + 1) % 8; break;
++                    case 23: if (pass.stencil != nullptr) face->stencilFail = (face->stencilFail + 1) % 8; break;
++                    case 24: if (pass.stencil != nullptr) face->depthFail = (face->depthFail + 1) % 8; break;
++                    case 25: if (pass.stencil != nullptr) face->pass = (face->pass + 1) % 8; break;
++                    case 26: if (pass.stencil != nullptr) face->readMask ^= 1u; break;
++                    case 27: if (pass.stencil != nullptr) face->writeMask ^= 1u; break;
++                    case 28: if (pass.stencil != nullptr) d.stencil.frontReference ^= 1u; break;
++                    case 29: if (pass.stencil != nullptr) d.stencil.backReference ^= 1u; break;
++                    case 30: for (const Texture*& t : fsb.textures) t = t == icon.get() ? photo.get() : t == photo.get() ? icon.get() : t; break;
++                    case 31: for (const Sampler*& m : fsb.samplers) m = m == &smpA ? &smpB : &smpA; break;
++                    case 32: if (recipes[recipe].needs & kFsUniforms) fsb.buffers[0].offset ^= 16u; break;
++                    case 33: d.instanceCount = d.instanceCount == 1 ? 2 : 1; break;
++                    case 34: d.vertexCount = d.vertexCount == 6 ? 3 : 6; break;
++                    case 35: d.primitive = Primitive((uint32_t(d.primitive) + 1) % 5); break;
++                    case 36: if (indexed) d.indexOffset ^= 4u; break;
++                    case 37: for (const Texture*& t : vsb.textures) t = t == icon.get() ? photo.get() : icon.get(); break;
++                    case 38: if (recipes[recipe].needs & (kVsUbo | kVsUbos)) vsb.buffers[0].offset ^= 16u; break;
++                    case 39:
++                        if (recipes[recipe].needs & kVertices) vsb.buffers[0].buffer = vsb.buffers[0].buffer == vertices.get() ? otherVertices.get() : vertices.get();
++                        break;
++                    default: break;   // (the same draw again)
++                    }
++                } else {
++                    // the pass stays for a while, the program for a draw or a few
++                    if (rng.one(12)) which = rng.below(4);
++                    if (!rng.one(3)) recipe = rng.below(uint32_t(recipes.size()));
++                    pass = passes[which];
++                    d.vertexCount = rng.one(4) ? 3 : 6;
++                    d.viewport = Viewport{0, 0, double(W), double(H), 0, 1};
++                    if (rng.one(3)) d.viewport = Viewport{double(rng.below(64)), double(rng.below(48)), double(8 + rng.below(56)), double(8 + rng.below(40)), 0, 1};
++                    if (rng.one(3)) d.scissor = Scissor{rng.below(64), rng.below(48), 1 + rng.below(64), 1 + rng.below(48)};
++                    if (rng.one(4)) d.cullMode = rng.below(3);
++                    if (rng.one(4)) d.winding = rng.below(2);
++                    if (rng.one(6)) d.instanceCount = 1 + rng.below(3);
++                    if (rng.one(8)) d.baseInstance = rng.below(4);
++                    if (rng.one(6)) d.primitive = Primitive(rng.below(5));
++                    if (rng.one(8)) {
++                        for (float& c : d.blendColor) c = float(rng.below(5)) / 4;
++                    }
++                    if (pass.depth != nullptr && rng.one(2)) {
++                        d.depth.compare = rng.below(8);
++                        d.depth.write = rng.one(2);
++                    }
++                    if (pass.stencil != nullptr && rng.one(2)) {
++                        d.stencil.enabled = true;
++                        for (StencilFace* face : {&d.stencil.front, &d.stencil.back}) {
++                            face->compare = rng.below(8), face->stencilFail = rng.below(8), face->depthFail = rng.below(8), face->pass = rng.below(8);
++                            face->readMask = rng.one(2) ? 0xff : rng.below(256), face->writeMask = rng.one(2) ? 0xff : rng.below(256);
++                        }
++                        d.stencil.frontReference = rng.below(4), d.stencil.backReference = rng.below(4);
++                    }
++                    const uint32_t needs = recipes[recipe].needs;
++                    if (needs & kVertices) {
++                        vsb.buffers = {Binding{rng.one(2) ? vertices.get() : otherVertices.get(), uint64_t(12 * rng.below(8))}};
++                        if (rng.one(2)) {
++                            d.indexBuffer = indices.get();
++                            d.indexType = rng.one(4) ? 1 : 0;
++                            d.indexOffset = uint64_t((d.indexType == 1 ? 4 : 2) * rng.below(16));
++                            d.baseVertex = int32_t(rng.below(3));
++                        } else {
++                            d.vertexStart = rng.below(4);
++                        }
++                    }
++                    if (needs & kTexture) {
++                        fsb.textures = {rng.one(2) ? icon.get() : photo.get()};
++                        fsb.samplers = {rng.one(2) ? &smpA : &smpB};
++                    }
++                    if (needs & kTenSlots) {
++                        fsb.textures = {nullptr, nullptr, nullptr, icon.get()};
++                        if (rng.one(2)) {
++                            fsb.textures.resize(10, nullptr);
++                            fsb.textures[9] = photo.get();
++                        }
++                        fsb.samplers.assign(2, rng.one(2) ? &smpA : &smpB);
++                    }
++                    if (needs & kManySlots) {
++                        fsb.textures.assign(16, nullptr);
++                        for (uint32_t t = 0; t < 16; t++) {
++                            if (rng.one(3)) fsb.textures[t] = rng.one(2) ? icon.get() : photo.get();
++                        }
++                        fsb.samplers = {&smpA};
++                    }
++                    if (needs & kFsUniforms) fsb.buffers = {Binding{uniforms.get(), uint64_t(rng.one(2) ? 16 * rng.below(8) : 8 + 16 * rng.below(8))}};
++                    if (needs & kVsUbo) vsb.buffers = {Binding{uniforms.get(), uint64_t(16 * rng.below(4))}};
++                    if (needs & kVsUbos) vsb.buffers = {Binding{uniforms.get(), uint64_t(16 * rng.below(4))}, Binding{vertices.get(), uint64_t(16 * rng.below(4))}};
++                    if (needs & kVsDevice) vsb.buffers = {Binding{device.get(), uint64_t(4 * rng.below(4))}};
++                    if (needs & kVsDevices) vsb.buffers = {Binding{device.get(), uint64_t(4 * rng.below(4))}, Binding{otherDevice.get(), 0}};
++                    if (needs & kFsDevice) fsb.buffers = {vsb.buffers[0]};   // (one table for both stages: the same buffer at the same index)
++                    if (needs & kVsTexture) {
++                        vsb.textures = {rng.one(2) ? icon.get() : photo.get()};
++                        vsb.samplers = {&smpA};
++                    }
++                }
++                lastDraw = d;
++                lastVs = vsb;
++                lastFs = fsb;
++                haveLast = true;
++                if (rng.one(24)) pass.load = LoadAction::kClear;
++                Recipe& rc = recipes[recipe];
++                // (a program changed after it was drawn with: by hand in place, one with a uid given another)
++                if (rng.one(16)) {
++                    rc.program.blend.enabled = !rc.program.blend.enabled;
++                    rc.program.blend.srcRgb = 1, rc.program.blend.dstRgb = 5, rc.program.blend.srcAlpha = 1, rc.program.blend.dstAlpha = 5;
++                    if (rc.program.uid != 0) rc.program.uid = newProgramUid();
++                }
++                // every fourth draw wrong in one thing (or in nothing, where the thing is not this draw's to get wrong)
++                if (rng.one(4)) {
++                    switch (rng.below(54)) {
++                    case 0: d.viewport.width = 0; break;
++                    case 1: d.viewport.height = -4; break;
++                    case 2: d.viewport.x = 4096; break;
++                    case 3: d.viewport.znear = nan; break;
++                    case 4: d.viewport.y = -1000; break;
++                    case 5: d.scissor = Scissor{100, 0, 64, 16}; break;
++                    case 6: d.scissor = Scissor{0, 90, 8, 16}; break;
++                    case 7: d.scissor = Scissor{0, 0, 8, 0}; break;
++                    case 8: d.vertexCount = 0; break;
++                    case 9: d.instanceCount = 0; break;
++                    case 10: d.cullMode = 3; break;
++                    case 11: d.winding = 2; break;
++                    case 12: d.primitive = Primitive(7); break;
++                    case 13: d.blendColor[2] = float(nan); break;
++                    case 14: d.depth.compare = 9; break;
++                    case 15: d.depth.compare = 1, d.depth.write = true; break;
++                    case 16: d.stencil.enabled = true; break;
++                    case 17: d.stencil.enabled = true, d.stencil.front.compare = 8; break;
++                    case 18: d.indexBuffer = indices.get(), d.indexType = 2; break;
++                    case 19: d.indexBuffer = indices.get(), d.indexType = 0, d.indexOffset = 3; break;
++                    case 20: d.indexBuffer = indices.get(), d.indexOffset = 8192; break;
++                    case 21: d.indexBuffer = indices.get(), d.indexType = 1, d.indexOffset = 4088, d.vertexCount = 6; break;
++                    case 22: d.indexBuffer = indices.get(), d.baseVertex = -1; break;
++                    case 23: vsb.buffers.clear(); break;
++                    case 24: if (!vsb.buffers.empty()) vsb.buffers[0].offset = 8192; break;
++                    case 25: if (!vsb.buffers.empty()) vsb.buffers[0].offset = 4090; break;
++                    case 26: if (!vsb.buffers.empty()) vsb.buffers[0].buffer = small.get(), vsb.buffers[0].offset = 0, d.vertexStart = 40; break;
++                    case 27: fsb.buffers.clear(); break;
++                    case 28: if (!fsb.buffers.empty()) fsb.buffers[0].offset += 2; break;
++                    case 29: if (!fsb.buffers.empty()) fsb.buffers[0].offset = 8192; break;
++                    case 30: if (!fsb.buffers.empty()) fsb.buffers[0] = Binding{small.get(), 60}; break;
++                    case 31: for (const Texture*& t : fsb.textures) t = t != nullptr ? integers.get() : nullptr; break;
++                    case 32: if (!fsb.textures.empty()) fsb.textures.back() = unread.get(); break;
++                    case 33: for (const Texture*& t : fsb.textures) t = t != nullptr ? volume.get() : nullptr; break;
++                    case 34: fsb.textures.clear(); break;
++                    case 35: fsb.samplers.clear(); break;
++                    case 36: for (const Texture*& t : fsb.textures) t = t != nullptr ? pass.color0 : nullptr; break;
++                    case 37: d.indirect = numbers.get(), d.indirectOffset = uint64_t(16 * rng.below(4)); break;
++                    case 38: d.visibility = results.get(), d.visibilityMode = 1 + rng.below(2), d.visibilityOffset = uint64_t(8 * rng.below(8)), d.visibilityReset = rng.one(2); break;
++                    case 39: for (const Texture*& t : vsb.textures) t = integers.get(); break;
++                    case 40: if (!fsb.buffers.empty()) fsb.buffers[0] = Binding{otherDevice.get(), 0}; break;
++                    case 41: if (vsb.buffers.size() > 1) vsb.buffers.pop_back(); break;
++                    case 42: if (vsb.buffers.size() > 1) vsb.buffers[0].buffer = nullptr; break;
++                    case 43: if (!vsb.buffers.empty()) vsb.buffers[0].offset += 1; break;
++                    case 44: vsb.textures.clear(), vsb.samplers.clear(); break;
++                    case 45: pass.more[1].texture = unread.get(); break;
++                    case 46: d.vertexStart = 4000, d.indexBuffer = nullptr; break;
++                    case 47: d.viewport.zfar = std::numeric_limits<double>::infinity(); break;
++                    case 48: pass.slice = 1; break;
++                    case 49: pass.more[0].slice = 1; break;
++                    case 50: pass.more[0].level = 1; break;
++                    case 51: pass.depthSlice = 1; break;
++                    case 52: d.stencil.enabled = true, d.stencil.back.depthFail = 8; break;
++                    case 53: pass.stencilStore = StoreAction::kStore; break;
++                    }
++                }
++                const bool taken = cb->draw(rc.program, pass, d, vsb, fsb);
++                out.said.push_back(taken ? std::string() : cb->error().empty() ? cb->lastSkipped() : "the buffer ended: " + cb->error());
++                out.draws += taken ? 1 : 0;
++            }
++            out.kept += cb->counts().keptDraws;
++            const CommandBuffer::Counts c = cb->counts();
++            wait(r, cb);
++            out.said.push_back("frame " + std::to_string(frame) + ": " + std::to_string(c.passes) + " passes, " + std::to_string(c.draws) + " draws, " +
++                               std::to_string(c.gmemPasses) + " in tiles, " + std::to_string(c.tiles) + " tiles, status " + std::to_string(int(cb->status())) + " " +
++                               cb->error() + " | " + cb->gmemRefusal());
++        }
++        out.faults = r.fake->stats().faults;
++    }
++    FakeGpu::submitHook = chain.next;
++    FakeGpu::submitHookContext = chain.nextContext;
++    CommandBuffer::keepStates(was);
++    return out;
++}
++}  // namespace
++
++// What a draw's kept state decides, it decides as the long way does: the same random frames recorded with every draw
++// judged and written whole and with the programs' states kept come to the same draws taken, the same draws refused by
++// the same sentences, the same passes, and word for word the same submissions.
++TEST(random_frames_are_the_same_from_kept_states_as_written_whole) {
++    uint32_t taken = 0, kept = 0, refused = 0;
++    for (int mode = 0; mode < 3; mode++) {
++        for (uint64_t seed = 0; seed < 64; seed++) {
++            const bool allUids = seed % 2 == 1;
++            const Told whole = randomFrames(seed * 3 + uint64_t(mode), false, mode, 3, 80, allUids);
++            const Told fromKept = randomFrames(seed * 3 + uint64_t(mode), true, mode, 3, 80, allUids);
++            CHECK_EQ(whole.kept, 0u);
++            CHECK_EQ(whole.said.size(), fromKept.said.size());
++            for (size_t i = 0; i < whole.said.size() && i < fromKept.said.size(); i++) {
++                if (whole.said[i] == fromKept.said[i]) continue;
++                CHECK(whole.said[i] == fromKept.said[i]);
++                std::printf("       mode %d seed %llu, draw %zu: written whole \"%s\", from its kept state \"%s\"\n", mode, (unsigned long long)seed, i,
++                            whole.said[i].c_str(), fromKept.said[i].c_str());
++                break;
++            }
++            CHECK_EQ(whole.sums.submits, fromKept.sums.submits);
++            CHECK_EQ(whole.sums.words, fromKept.sums.words);
++            CHECK_EQ(whole.sums.draws, fromKept.sums.draws);
++            CHECK_EQ(whole.sums.loads, fromKept.sums.loads);
++            CHECK_EQ(whole.sums.stream, fromKept.sums.stream);
++            CHECK_EQ(whole.sums.state, fromKept.sums.state);
++            CHECK_EQ(whole.sums.named, fromKept.sums.named);
++            CHECK_EQ(whole.sums.names, fromKept.sums.names);
++            CHECK_EQ(whole.faults, fromKept.faults);
++            taken += fromKept.draws;
++            kept += fromKept.kept;
++            for (const std::string& s : fromKept.said) refused += !s.empty() && s.compare(0, 6, "frame ") != 0 ? 1 : 0;
++        }
++    }
++    std::printf("       %u draws taken, %u of them from a kept state; %u refused\n", taken, kept, refused);
++    // (the test is of the kept states: most of the draws taken must be from one)
++    CHECK(kept * 2 > taken);
++    CHECK(refused * 10 > taken);
++}
++
++// A command buffer finds a program's state by the program's uid in a few slots; more programs than slots, drawn in
++// turn, push each other out of them, and each is still drawn as itself (the runner's check against the long way).
++TEST(more_programs_than_a_command_buffer_has_slots_for_are_each_drawn_as_themselves) {
++    Rig r;
++    auto t = texture(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead);
++    RenderPass pass;
++    pass.color0 = t.get();
++    std::vector<Program> programs;
++    for (uint32_t i = 0; i < 200; i++) {
++        Program p = linked(kernels::tri_flat_vs_air, i % 2 ? kernels::tri_flat_fs_air : kernels::tri_cflat_fs_air, "many");
++        p.blend.enabled = (i / 2) % 2 != 0;
++        p.blend.srcRgb = 1 + i % 5, p.blend.dstRgb = 5, p.blend.writeMask = 1 + i % 15;
++        programs.push_back(p);
++    }
++    std::string why;
++    auto uniforms = newBuffer(*r.gpu, 4096, &why);
++    Bindings fsb;
++    fsb.buffers = {Binding{uniforms.get(), 16}};
++    uint32_t kept = 0;
++    for (int frame = 0; frame < 2; frame++) {
++        auto cb = r.queue->commandBuffer();
++        for (int round = 0; round < 3; round++) {
++            for (const Program& p : programs) CHECK(cb->draw(p, pass, quad(), Bindings{}, fsb));
++        }
++        kept += cb->counts().keptDraws;
++        finish(r, cb);
++    }
++    // all but each program's first draw
++    CHECK_EQ(kept, 2u * 3u * 200u - 200u);
++    CHECK_EQ(r.fake->stats().faults, 0u);
++}
+diff --git a/hakios-metal/tests/golden/tests-a610.txt b/hakios-metal/tests/golden/tests-a610.txt
+index dafdb36..0d718ef 100644
+--- a/hakios-metal/tests/golden/tests-a610.txt
++++ b/hakios-metal/tests/golden/tests-a610.txt
+@@ -135,6 +135,15 @@ the_fake_refuses_a_load_of_ibos_into_the_texture_block submits 1 words 142 draws
+ the_fake_refuses_a_zero_ibo_descriptor submits 2 words 268 draws 0 loads 6 stream f656501605a3ede5 state 81494f49fbe365ae names 0 0000000000000000
+ a_dispatch_loads_the_ubo_descriptors_an_ldc_reads_through submits 2 words 228 draws 0 loads 4 stream e5232c3cb200baa8 state 01bfc3782cab1405 names 0 0000000000000000
+ a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround submits 1 words 1127 draws 0 loads 3 stream abcfbe21613cc005 state 32f038a0aab14085 names 4 bb062d7fae986371
++a_programs_state_is_kept_by_the_queue_from_one_command_buffer_to_the_next submits 3 words 2895 draws 11 loads 22 stream 4ff66e4800bfa836 state 09bde857f6d3d994 names 13 38f44a1414b10600
++a_program_made_by_hand_and_changed_in_place_is_drawn_as_it_is_now submits 1 words 760 draws 4 loads 8 stream 3124737029797cdf state 1b6f8d91e4c1b5b5 names 4 82e9056f7ae1d6e6
++a_program_changed_by_the_c_interface_is_another_program_to_a_draw submits 1 words 882 draws 9 loads 18 stream 7ad80caa8188a98b state 3819d717c8bda6ac names 4 82e9056f7ae1d6e6
++a_draw_its_kept_state_cannot_take_is_refused_by_name_the_long_way submits 1 words 916 draws 6 loads 21 stream 7fc53092d23928bf state 6a704e6fd77244ca names 8 2e72016e06717bd7
++a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full submits 6 words 39624 draws 480 loads 1720 stream bc087cb1a59646d1 state 1feac55f7d610fc9 names 98 4f1ea5a3e689aba6
++the_groups_of_a_draw_write_registers_of_their_own submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
++       39692 draws taken, 26778 of them from a kept state; 6388 refused
++random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 9714400 draws 81284 loads 238788 stream caf6ee37819e542d state aff691bad74dccdd names 39698 8433597f78a9fec2
++more_programs_than_a_command_buffer_has_slots_for_are_each_drawn_as_themselves submits 2 words 41800 draws 1200 loads 3000 stream cff598f3a12f1875 state 21ac3e4de18e2525 names 50 ff709ab37b62cffe
+ end_only_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ fill_id_text_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ fill_id_air_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+diff --git a/hakios-metal/tests/golden/tests-a635.txt b/hakios-metal/tests/golden/tests-a635.txt
+index 804f1fa..b11bd57 100644
+--- a/hakios-metal/tests/golden/tests-a635.txt
++++ b/hakios-metal/tests/golden/tests-a635.txt
+@@ -135,6 +135,15 @@ the_fake_refuses_a_load_of_ibos_into_the_texture_block submits 1 words 145 draws
+ the_fake_refuses_a_zero_ibo_descriptor submits 2 words 274 draws 0 loads 6 stream 63c73bc6ec578015 state 81494f49fbe365ae names 0 0000000000000000
+ a_dispatch_loads_the_ubo_descriptors_an_ldc_reads_through submits 2 words 234 draws 0 loads 4 stream 1c284906c094d544 state 01bfc3782cab1405 names 0 0000000000000000
+ a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround submits 1 words 1130 draws 0 loads 3 stream 8dcbe08bc49a37d2 state 767fa2306040d214 names 4 bb062d7fae986371
++a_programs_state_is_kept_by_the_queue_from_one_command_buffer_to_the_next submits 3 words 2895 draws 11 loads 22 stream 0b1b2ca465b80e3a state 09bde857f6d3d994 names 13 38f44a1414b10600
++a_program_made_by_hand_and_changed_in_place_is_drawn_as_it_is_now submits 1 words 760 draws 4 loads 8 stream 17db46b630d582d5 state 1b6f8d91e4c1b5b5 names 4 82e9056f7ae1d6e6
++a_program_changed_by_the_c_interface_is_another_program_to_a_draw submits 1 words 882 draws 9 loads 18 stream 6c62378d52407e41 state 3819d717c8bda6ac names 4 82e9056f7ae1d6e6
++a_draw_its_kept_state_cannot_take_is_refused_by_name_the_long_way submits 1 words 916 draws 6 loads 21 stream e1fb977932e98a2d state 6a704e6fd77244ca names 8 2e72016e06717bd7
++a_compositors_pass_of_changing_programs_is_drawn_from_kept_states_as_in_full submits 6 words 24432 draws 288 loads 1032 stream f12a0503c667ac99 state 2b9afb08f54ec5d9 names 98 4f1ea5a3e689aba6
++the_groups_of_a_draw_write_registers_of_their_own submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
++       39692 draws taken, 26778 of them from a kept state; 6388 refused
++random_frames_are_the_same_from_kept_states_as_written_whole submits 1152 words 9716800 draws 81284 loads 238788 stream b07b39e085627359 state 7cb488da1169ac1d names 39698 8433597f78a9fec2
++more_programs_than_a_command_buffer_has_slots_for_are_each_drawn_as_themselves submits 2 words 41800 draws 1200 loads 3000 stream 52ca32fc2f9646cd state 21ac3e4de18e2525 names 50 ff709ab37b62cffe
+ end_only_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ fill_id_text_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+ fill_id_air_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+diff --git a/hakios-metal/tests/main.cpp b/hakios-metal/tests/main.cpp
+index f28537a..b223b55 100644
+--- a/hakios-metal/tests/main.cpp
++++ b/hakios-metal/tests/main.cpp
+@@ -1,21 +1,29 @@
+ #include <cstring>
+ 
+ #include "golden.hpp"
++#include "hakios-metal/command.hpp"
+ #include "test.hpp"
+ 
+-// tests [--golden] [NAME]: every test whose name holds NAME. With --golden, instead of the verdicts, what each test
+-// submitted to the fake GPU, summed (golden.hpp): a line a test, compared with tests/golden/tests-<chip>.txt by
+-// `make -f tools/dev.mk check`.
++// tests [--golden] [--long] [NAME]: every test whose name holds NAME. With --golden, instead of the verdicts, what each
++// test submitted to the fake GPU, summed (golden.hpp): a line a test, compared with tests/golden/tests-<chip>.txt by
++// `make -f tools/dev.mk check`. With --long no draw is taken from a program's kept state (CommandBuffer::keepStates):
++// the sums are the same, which check holds them to (the tests that count the draws so taken fail then, as they should).
++// With --unchecked the draws taken from kept states are not each checked against the long way (CommandBuffer::
++// verifyDraws): the driver as a device runs it, with the tests' own verdicts and the same sums.
+ int main(int argc, char** argv) {
+     int ran = 0;
+-    bool sums = false;
++    bool sums = false, checked = true;
+     const char* only = nullptr;
+     for (int i = 1; i < argc; i++) {
+         if (strcmp(argv[i], "--golden") == 0) sums = true;
++        else if (strcmp(argv[i], "--long") == 0) hakios::metal::CommandBuffer::keepStates(false);
++        else if (strcmp(argv[i], "--unchecked") == 0) checked = false;
+         else only = argv[i];
+     }
+     golden::Sums s;
+     if (sums) golden::sumInto(&s);
++    // every draw the tests make from a program's kept state is checked against the same draw encoded in full
++    hakios::metal::CommandBuffer::verifyDraws(checked);
+     // tests whose submissions depend on which thread got there first (a command buffer let go while the GPU has it:
+     // whether its memory is back in the queue's pools when the next one asks is the race the test is about), so that
+     // the addresses in their streams differ from run to run: counted, not summed
+diff --git a/hakios-metal/tools/dev.mk b/hakios-metal/tools/dev.mk
+index b8fe8ee..265eb8e 100644
+--- a/hakios-metal/tools/dev.mk
++++ b/hakios-metal/tools/dev.mk
+@@ -39,12 +39,18 @@ $(OUT)/drawbench: $(CORE_O) $(OUT)/obj/tools/drawbench.o
+ 	$(CXX) $(OPT) -pthread -o $@ $^
+ 
+ # the golden streams: every scene of drawbench and every test's submissions, word for word what they were when
+-# tests/golden/ was written (drawbench --golden, tests --golden)
++# tests/golden/ was written (drawbench --golden, tests --golden), with the draws taken from their programs' kept states
++# (each checked against the long way as it is taken, and again with no such check: --unchecked, the driver as a device
++# runs it) and with every draw written whole (--long)
+ check: $(OUT)/tests $(OUT)/drawbench
+ 	$(OUT)/tests > $(OUT)/tests.log 2>&1; tail -1 $(OUT)/tests.log; grep -q ' 0 failed checks' $(OUT)/tests.log
+ 	$(OUT)/drawbench --golden | diff -u tests/golden/drawbench-$(CHIP).txt -
+ 	$(OUT)/tests --golden | diff -u tests/golden/tests-$(CHIP).txt -
+-	@echo "golden streams: the same ($(CHIP))"
++	$(OUT)/drawbench --golden --long | diff -u tests/golden/drawbench-$(CHIP).txt -
++	$(OUT)/tests --golden --long 2>/dev/null | diff -u tests/golden/tests-$(CHIP).txt -
++	$(OUT)/tests --unchecked > $(OUT)/tests-unchecked.log 2>&1; tail -1 $(OUT)/tests-unchecked.log; grep -q ' 0 failed checks' $(OUT)/tests-unchecked.log
++	$(OUT)/tests --golden --unchecked | diff -u tests/golden/tests-$(CHIP).txt -
++	@echo "golden streams: the same -- from kept states (each draw checked, and unchecked) and written whole ($(CHIP))"
+ golden: $(OUT)/tests $(OUT)/drawbench
+ 	@mkdir -p tests/golden
+ 	$(OUT)/drawbench --golden > tests/golden/drawbench-$(CHIP).txt
+diff --git a/hakios-metal/tools/drawbench.cpp b/hakios-metal/tools/drawbench.cpp
+index c9c62e8..91d0a44 100644
+--- a/hakios-metal/tools/drawbench.cpp
++++ b/hakios-metal/tools/drawbench.cpp
+@@ -3,6 +3,8 @@
+ //
+ //   drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv]     the measurements
+ //   drawbench --golden                                                                     each scene's sums, nothing else
++//   drawbench --verify ...                                                                 every draw checked against itself encoded in full
++//   drawbench --long ...                                                                   no draw taken from its program's kept state
+ //
+ // The scenes are frames a window server draws, at the phone's size (750 x 1624):
+ //   A B C D E F P Q R G H   the core's own interface (CommandBuffer::draw) with hand-made Programs: the scenes of the
+@@ -69,7 +71,7 @@ namespace {
+ 
+ // --- what is asked -------------------------------------------------------------------------------------------------
+ struct Asked {
+-    bool golden = false, hist = false, csv = false;
++    bool golden = false, hist = false, csv = false, verify = false;
+     uint32_t runs = 5;
+     size_t coldBytes = 0;
+     std::string scenes, stages;
+@@ -854,6 +856,8 @@ int main(int argc, char** argv) {
+         const std::string a = argv[i];
+         auto value = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
+         if (a == "--golden") asked.golden = true;
++        else if (a == "--verify") asked.verify = true;
++        else if (a == "--long") CommandBuffer::keepStates(false);
+         else if (a == "--hist") asked.hist = true;
+         else if (a == "--csv") asked.csv = true;
+         else if (a == "--runs") asked.runs = std::max(1, atoi(value()));
+@@ -861,11 +865,13 @@ int main(int argc, char** argv) {
+         else if (a == "--scene") asked.scenes = value();
+         else if (a == "--stages") asked.stages = value();
+         else {
+-            std::printf("drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv] | --golden\n");
++            std::printf("drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv] [--verify] [--long] | --golden [--long]\n");
+             return 2;
+         }
+     }
+     if (asked.golden) asked.coldBytes = 0;
++    // (--verify, and always for the golden sums: every draw taken from a program's kept state against the same draw in full)
++    CommandBuffer::verifyDraws(asked.golden || asked.verify);
+     FakeGpu::submitHook = onSubmit;
+     const Scene scenes[] = {
+         {"A", "light frame: 1 command buffer, 1 pass (Load), 20 blended draws (14 textured, 6 with uniforms), sysmem", 20, 0, 6, 0, false, true, 1},

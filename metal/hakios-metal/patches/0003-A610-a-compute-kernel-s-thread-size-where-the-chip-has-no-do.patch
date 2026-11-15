@@ -1,0 +1,87 @@
+Subject: A610: a compute kernel's thread size where the chip has no double threadsize
+
+Mesa 25.0.7, fd6_compute.cc:96-127 (cs_program_emit) and fd6_program.cc:170-180: without
+supports_double_threadsize (a6xx_gen1_low) HLSQ_CS_CNTL_1 and SP_CS_CTRL_REG0 carry THREAD128 and the kernel's own
+size goes to HLSQ_FS_CNTL_0; the SP's copies of the id registers and HLSQ_CS_CTRL_REG1 are has_lpac's alone
+(a6xx_gen4). The fake GPU checks the same.
+
+---
+diff --git a/hakios-metal/include/hakios-metal/compute.hpp b/hakios-metal/include/hakios-metal/compute.hpp
+index 147a5d5..28bf645 100644
+--- a/hakios-metal/include/hakios-metal/compute.hpp
++++ b/hakios-metal/include/hakios-metal/compute.hpp
+@@ -25,6 +25,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include "hakios-metal/a6xx.hpp"
+ #include "hakios-metal/kernel.hpp"
+ #include "hakios-metal/pm4.hpp"
+ 
+@@ -106,7 +107,7 @@ static_assert(kTableIbosAt + kMaxIbos * 64 <= kTableTexConstAt && kTableTexConst
+ struct Options {
+     bool prelude = true;        // SP_MODE_CONTROL, SP_PERFCTR_ENABLE, SP_FLOAT_CNTL, as computerator opens with
+     bool invalidateCmd = true;  // HLSQ_INVALIDATE_CMD before the program
+-    bool hlsqCopies = true;     // the gen4 (has_lpac) copies: HLSQ_CS_CTRL_REG1, SP_CS_CNTL_0/1
++    bool hlsqCopies = a6xx::kHasLpac;   // the gen4 (has_lpac) copies: HLSQ_CS_CTRL_REG1, SP_CS_CNTL_0/1 (fd6_compute.cc:119-127: has_lpac alone)
+     bool pvtmemZero = true;     // the private-memory registers written as zero (Gallium does; computerator leaves them)
+     bool invalidate = true;     // CP_EVENT_WRITE CACHE_INVALIDATE before the dispatch (Gallium's barrier)
+     bool marker = true;         // CP_SET_MARKER RM6_COMPUTE
+diff --git a/hakios-metal/src/compute.cpp b/hakios-metal/src/compute.cpp
+index 181e558..9ea5c21 100644
+--- a/hakios-metal/src/compute.cpp
++++ b/hakios-metal/src/compute.cpp
+@@ -427,7 +427,9 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
+         stream.registers(REG_A6XX_SP_CS_CONFIG, v, 2);
+     }
+     reg(stream, REG_A6XX_SP_CS_CTRL_REG0,
+-        spCsCtrlReg0(uint32_t(k.maxReg + 1), uint32_t(k.maxHalfReg + 1), k.branchstackHw, threadsize, k.mergedRegs, k.earlyPreamble));
++        spCsCtrlReg0(uint32_t(k.maxReg + 1), uint32_t(k.maxHalfReg + 1), k.branchstackHw,
++                     // (a chip without double threadsize has THREAD128 here: fd6_program.cc:170-180, MESA_SHADER_COMPUTE)
++                     kSupportsDoubleThreadsize ? threadsize : THREAD128, k.mergedRegs, k.earlyPreamble));
+     // the shared memory and constant split, in both the SP's and (gen4's) the HLSQ's copy, the same value: Gallium gives
+     // the HLSQ the real size where computerator writes 1, and the one that is right when they disagree is not measured
+     uint32_t ctrl1 = spCsCtrlReg1(shared, k.constlen);
+@@ -436,8 +438,13 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
+         reg(stream, REG_A6XX_HLSQ_CS_CTRL_REG1, ctrl1);
+     }
+     {
+-        uint32_t v[2] = {csCntl0(k.workGroupIdRegid, k.localIdRegid), csCntl1(threadsize)};
++        // A chip without double threadsize (the A610: a6xx_gen1_low) takes a kernel's thread size from HLSQ_FS_CNTL_0, and
++        // HLSQ_CS_CNTL_1's is always THREAD128 (Mesa 25.0.7 fd6_compute.cc:96-117, cs_program_emit)
++        uint32_t v[2] = {csCntl0(k.workGroupIdRegid, k.localIdRegid), csCntl1(kSupportsDoubleThreadsize ? threadsize : THREAD128)};
+         stream.registers(REG_A6XX_HLSQ_CS_CNTL_0, v, 2);   // HLSQ_CS_CNTL_0, HLSQ_CS_CNTL_1
++        if (!kSupportsDoubleThreadsize) {
++            reg(stream, REG_A6XX_HLSQ_FS_CNTL_0, A6XX_HLSQ_FS_CNTL_0_THREADSIZE(threadsize));
++        }
+         if (o.hlsqCopies) {
+             stream.registers(REG_A6XX_SP_CS_CNTL_0, v, 2); // SP_CS_CNTL_0, SP_CS_CNTL_1 (has_lpac)
+         }
+diff --git a/hakios-metal/src/fake_gpu.cpp b/hakios-metal/src/fake_gpu.cpp
+index 4fb84ff..72e33e6 100644
+--- a/hakios-metal/src/fake_gpu.cpp
++++ b/hakios-metal/src/fake_gpu.cpp
+@@ -663,15 +663,21 @@ bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
+     uint32_t ctrl0 = reg(REG_A6XX_SP_CS_CTRL_REG0);
+     uint32_t spThreads = fieldOf(ctrl0, A6XX_SP_CS_CTRL_REG0_THREADSIZE__MASK, A6XX_SP_CS_CTRL_REG0_THREADSIZE__SHIFT);
+     uint32_t hlsqThreads = fieldOf(reg(REG_A6XX_HLSQ_CS_CNTL_1), A6XX_HLSQ_CS_CNTL_1_THREADSIZE__MASK, A6XX_HLSQ_CS_CNTL_1_THREADSIZE__SHIFT);
++    if (!kSupportsDoubleThreadsize && (hlsqThreads != THREAD128 || spThreads != THREAD128)) {
++        // (fd6_compute.cc:96-117 and fd6_program.cc:170-180: both THREAD128 there, the size itself in HLSQ_FS_CNTL_0)
++        fault("HLSQ_CS_CNTL_1 and SP_CS_CTRL_REG0 are not THREAD128 on a chip without double threadsize");
++        return false;
++    }
+     if (spThreads != hlsqThreads) {
+         fault("SP_CS_CTRL_REG0 and HLSQ_CS_CNTL_1 disagree about the thread size");
+         return false;
+     }
+-    if (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1)) {
++    // (the SP's copies exist on a chip with has_lpac alone: on another they are not written, and not looked at)
++    if (kHasLpac && (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1))) {
+         fault("the HLSQ's and the SP's copies of the id registers (CS_CNTL_0, CS_CNTL_1) differ");
+         return false;
+     }
+-    if (reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
++    if (kHasLpac && reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
+         fault("SP_CS_CTRL_REG1 and HLSQ_CS_CTRL_REG1 differ about shared memory and the constant split");
+         return false;
+     }

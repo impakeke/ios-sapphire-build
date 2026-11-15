@@ -1,0 +1,363 @@
+Subject: A draw's table is not zeroed whole; drawbench records without submitting, and in passes
+
+Every reused slab was zeroed when a command buffer took it: 256 KiB for every 32 draws' tables, 8 KiB a draw
+(CommandBuffer::piece under libsystem_platform in perfil-1: about 1 us a draw on the phone; 8% of a recorded draw on
+the host). Of its table a draw's GPU work reads what the draw writes: the descriptors its loads name, as many as
+they name; the copies of constants the stream itself makes there; and the words the stream addresses singly, all
+below the border colours (a fetch's flush, an occlusion query's two snapshots).
+
+- CommandQueue::takeSlab hands a slab back as it is and says so; CommandBuffer::piece zeroes each piece as it is
+  cut from such a slab, as before for every caller but one.
+- CommandBuffer::draw takes its table (and the second one of a pass recorded both ways) as is and zeroes its first
+  128 bytes.
+- CommandQueue::poisonReused, for the tests and the golden streams: a slab that comes back is filled with 0xa5, so
+  that what a draw leaves unwritten is not last frame's tables for the same draw. The golden sums of what the loads
+  name are what they were.
+
+tools/drawbench.cpp:
+- --record N: a C scene's frame recorded N more times and let go unsubmitted, so that a sampling profiler sees a
+  process that records draws and little else.
+- scene U: T's frame in five passes of 22 draws, as the phone's command buffers hold it (4.9 passes and 128 to 140
+  draws each): what a pass costs beside its draws.
+- the vertex stage's textures are told once a frame, as the plug-in tells them from now on (at an encoder's first
+  draw and when they change), not before every draw.
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/command.hpp b/hakios-metal/include/hakios-metal/command.hpp
+index 5bc46da..c707d67 100644
+--- a/hakios-metal/include/hakios-metal/command.hpp
++++ b/hakios-metal/include/hakios-metal/command.hpp
+@@ -348,9 +348,12 @@ private:
+         uint64_t gpuAddress() const { return buffer->gpuAddress() + offset; }
+         uint8_t* contents() const { return static_cast<uint8_t*>(buffer->contents()) + offset; }
+     };
+-    bool piece(uint64_t bytes, Piece* out, std::string* why);
++    // AS_IS: the piece may hold what another command buffer wrote there (a slab the queue had back): for a caller that
++    // writes every byte the GPU is then told to read. Otherwise the piece is zeros, as memory new from the kernel is.
++    bool piece(uint64_t bytes, Piece* out, std::string* why, bool asIs = false);
+     std::shared_ptr<Buffer> slab_;
+     uint64_t slabUsed_ = 0;
++    bool slabUsedBefore_ = false;   // the slab came back from another command buffer: its pieces are zeroed as they are cut
+     std::vector<std::shared_ptr<Buffer>> slabs_;   // every slab this buffer took, given back to the queue when it is done
+     // A program's words where they are already in this command buffer, so that every draw with the program does not
+     // upload them again. Found by the caller's pointer, but taken only when the words still look the same: the pointer
+@@ -423,7 +426,13 @@ public:
+     // A slab for draw tables (CommandBuffer::piece): one a completed command buffer gave back, zeroed as a new one comes,
+     // or a new one. The kernel's making of a 256 KB buffer, once every 32 draws, was most of a draw's CPU time on the
+     // phone (40 us a draw on a fast core, where the same encoding on the host takes 5).
+-    std::shared_ptr<Buffer> takeSlab(uint64_t bytes, std::string* why);
++    // (*USED_BEFORE: it is one a command buffer gave back, holding what that one wrote -- not zeroed here, a quarter
++    // of a megabyte for every 32 draws: CommandBuffer::piece zeroes the pieces that need it)
++    std::shared_ptr<Buffer> takeSlab(uint64_t bytes, std::string* why, bool* usedBefore);
++    // (for the tests) a slab that comes back is filled with 0xa5 before it is used again: what a draw leaves unwritten
++    // in its table is then nothing a GPU could take for a descriptor -- and not the same frame's tables from the time
++    // before, which would hide a draw that wrote none
++    static void poisonReused(bool on);
+     void giveSlabs(std::vector<std::shared_ptr<Buffer>>* slabs);
+     // ...and any other buffer a command buffer makes for itself (a large piece, its counter stamps): BYTES rounded up to
+     // a power of two from 4 KB, zeroed; given back the same way, 32 MB of them kept at most
+diff --git a/hakios-metal/src/command.cpp b/hakios-metal/src/command.cpp
+index bf31527..34fb79f 100644
+--- a/hakios-metal/src/command.cpp
++++ b/hakios-metal/src/command.cpp
+@@ -77,7 +77,7 @@ constexpr uint64_t kPieceAlign = 256;
+ constexpr uint64_t kPageAlign = 4096;
+ }  // namespace
+ 
+-bool CommandBuffer::piece(uint64_t bytes, Piece* out, std::string* why) {
++bool CommandBuffer::piece(uint64_t bytes, Piece* out, std::string* why, bool asIs) {
+     bytes = (std::max<uint64_t>(bytes, 1) + kPieceAlign - 1) & ~(kPieceAlign - 1);
+     const uint64_t align = bytes >= kPageAlign ? kPageAlign : kPieceAlign;
+     if (slab_ != nullptr) {
+@@ -90,13 +90,14 @@ bool CommandBuffer::piece(uint64_t bytes, Piece* out, std::string* why) {
+         if (out->buffer != nullptr) slabs_.push_back(out->buffer);
+     } else {
+         if (slab_ == nullptr || kSlabBytes - slabUsed_ < bytes) {
+-            slab_ = queue_.takeSlab(kSlabBytes, why);
++            slab_ = queue_.takeSlab(kSlabBytes, why, &slabUsedBefore_);
+             slabUsed_ = 0;
+             if (slab_ != nullptr) slabs_.push_back(slab_);
+         }
+         out->buffer = slab_;
+         out->offset = slabUsed_;
+         if (slab_ != nullptr) {
++            if (slabUsedBefore_ && !asIs) memset(static_cast<uint8_t*>(slab_->contents()) + slabUsed_, 0, bytes);
+             slabUsed_ += bytes;
+         }
+     }
+@@ -140,7 +141,18 @@ uint64_t sizeClass(uint64_t bytes) {
+ }
+ }  // namespace
+ 
++namespace {
++std::atomic<bool> gPoisonReused{false};
++}  // namespace
++
+ std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* why) {
++    bool usedBefore = false;
++    std::shared_ptr<Buffer> b = takeSlab(bytes, why, &usedBefore);
++    if (b != nullptr && usedBefore) memset(b->contents(), 0, b->length());   // (as a new one comes from the kernel)
++    return b;
++}
++
++std::shared_ptr<Buffer> CommandQueue::takeSlab(uint64_t bytes, std::string* why, bool* usedBefore) {
+     const uint64_t size = sizeClass(bytes);
+     std::shared_ptr<Buffer> b;
+     {
+@@ -152,12 +164,15 @@ std::shared_ptr<Buffer> CommandQueue::takeBuffer(uint64_t bytes, std::string* wh
+             freeBytes_ -= size;
+         }
+     }
++    *usedBefore = b != nullptr;
+     if (b == nullptr) return newBuffer(gpu_, size, why);
+     gBuffersReused++;
+-    memset(b->contents(), 0, size);   // (as a new one comes from the kernel)
++    if (gPoisonReused.load(std::memory_order_relaxed)) memset(b->contents(), 0xa5, b->length());
+     return b;
+ }
+ 
++void CommandQueue::poisonReused(bool on) { gPoisonReused = on; }
++
+ void CommandQueue::giveBuffer(std::shared_ptr<Buffer> b) {
+     // (only one no one else holds, of a size takeBuffer makes: a piece's buffer kept elsewhere is still someone's)
+     if (b == nullptr || b.use_count() != 1 || b->contents() == nullptr || b->length() != sizeClass(b->length())) return;
+@@ -167,8 +182,6 @@ void CommandQueue::giveBuffer(std::shared_ptr<Buffer> b) {
+     freeBuffers_[b->length()].push_back(std::move(b));
+ }
+ 
+-std::shared_ptr<Buffer> CommandQueue::takeSlab(uint64_t bytes, std::string* why) { return takeBuffer(bytes, why); }
+-
+ void CommandQueue::giveSlabs(std::vector<std::shared_ptr<Buffer>>* slabs) {
+     for (auto& b : *slabs) giveBuffer(std::move(b));
+     slabs->clear();
+diff --git a/hakios-metal/src/render.cpp b/hakios-metal/src/render.cpp
+index e7c0c86..1b9ae44 100644
+--- a/hakios-metal/src/render.cpp
++++ b/hakios-metal/src/render.cpp
+@@ -4016,10 +4016,16 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+             fast = ps->fast;
+         }
+     }
++    // (The table is the draw's to write: what the GPU is told to read of it -- the descriptors a load names, as many as
++    // it names, the copies of constants the stream itself makes there -- the draw writes, and its words up to the border
++    // colours, which the stream addresses one by one (a fetch's flush, an occlusion query's snapshots), are zeroed here.
++    // The rest of its 8 KiB is left as the slab had it: zeroing every reused slab whole was a quarter of a megabyte
++    // for every 32 draws.)
+     Piece table;
+-    if (!piece(render::kTableBytes, &table, &why)) {
++    if (!piece(render::kTableBytes, &table, &why, true)) {
+         return fail(std::string("no memory for the draw's table: ") + why);
+     }
++    memset(table.contents(), 0, render::kTableBorderColorAt);
+     // (the rare kinds of draw go the long way whatever is kept: one whose numbers the GPU reads, one that counts samples)
+     if (d.indirect != nullptr || d.visibilityMode != 0) fast = false;
+     // GMEM is decided as a pass opens, before its first draw is encoded (a draw in a tile is encoded for the tile:
+@@ -4162,9 +4168,12 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+         }
+     }
+     if (dual) {
+-        if (program.fs.fbRead && !piece(render::kTableBytes, &sysTable, &why)) {
+-            gmemClears_ = 0;
+-            return fail(std::string("no memory for the draw's table: ") + why);
++        if (program.fs.fbRead) {
++            if (!piece(render::kTableBytes, &sysTable, &why, true)) {
++                gmemClears_ = 0;
++                return fail(std::string("no memory for the draw's table: ") + why);
++            }
++            memset(sysTable.contents(), 0, render::kTableBorderColorAt);
+         }
+         if (fast && program.fs.fbRead) {
+             uint32_t ibos = 0;
+diff --git a/hakios-metal/tests/main.cpp b/hakios-metal/tests/main.cpp
+index b223b55..3283ae0 100644
+--- a/hakios-metal/tests/main.cpp
++++ b/hakios-metal/tests/main.cpp
+@@ -24,6 +24,8 @@ int main(int argc, char** argv) {
+     if (sums) golden::sumInto(&s);
+     // every draw the tests make from a program's kept state is checked against the same draw encoded in full
+     hakios::metal::CommandBuffer::verifyDraws(checked);
++    // ...and memory a command buffer takes over from another is not the other's tables (CommandQueue::poisonReused)
++    hakios::metal::CommandQueue::poisonReused(true);
+     // tests whose submissions depend on which thread got there first (a command buffer let go while the GPU has it:
+     // whether its memory is back in the queue's pools when the next one asks is the race the test is about), so that
+     // the addresses in their streams differ from run to run: counted, not summed
+diff --git a/hakios-metal/tools/drawbench.cpp b/hakios-metal/tools/drawbench.cpp
+index 91d0a44..c5d8617 100644
+--- a/hakios-metal/tools/drawbench.cpp
++++ b/hakios-metal/tools/drawbench.cpp
+@@ -5,6 +5,7 @@
+ //   drawbench --golden                                                                     each scene's sums, nothing else
+ //   drawbench --verify ...                                                                 every draw checked against itself encoded in full
+ //   drawbench --long ...                                                                   no draw taken from its program's kept state
++//   drawbench --record N --scene S ...                                                     (the C scenes) the frame recorded N more times, unsubmitted: for a profiler
+ //
+ // The scenes are frames a window server draws, at the phone's size (750 x 1624):
+ //   A B C D E F P Q R G H   the core's own interface (CommandBuffer::draw) with hand-made Programs: the scenes of the
+@@ -13,9 +14,10 @@
+ //                           programs: vertex buffers and an index buffer, uniforms bound at multiples of 8, a stage that
+ //                           declares ten texture slots and binds one, framebuffer fetches, two colour outputs, the
+ //                           programs changing from draw to draw as a compositor's layers change them
+-//   S T                     with --stages DIR: the same through the C interface with the stages of a phone's own cache
++//   S T U                   with --stages DIR: the same through the C interface with the stages of a phone's own cache
+ //                           (<DIR>/*.stage, compiler.cpp's stageCacheSave: CoreAnimation's functions as the driver
+-//                           compiled them there), every vertex stage linked with every fragment stage that links
++//                           compiled them there), every vertex stage linked with every fragment stage that links;
++//                           U is T's frame in five passes of 22 draws, as the phone's command buffers hold it
+ // Each scene is recorded once to warm the queue's pools, then N times measured (--runs, 5): the time inside the draw
+ // calls alone, a draw; the heap allocations in them; the words the command processor is given.
+ // --cold KB touches KB kilobytes before each draw, so that a draw starts with as little in the processor's caches as
+@@ -72,7 +74,7 @@ namespace {
+ // --- what is asked -------------------------------------------------------------------------------------------------
+ struct Asked {
+     bool golden = false, hist = false, csv = false, verify = false;
+-    uint32_t runs = 5;
++    uint32_t runs = 5, record = 0;
+     size_t coldBytes = 0;
+     std::string scenes, stages;
+ } asked;
+@@ -430,16 +432,21 @@ struct Frame {
+     std::vector<hakios_metal_texture*> icons;
+     hakios_metal_buffer* index = nullptr;
+     bool gmem = true;
++    // the frame in several passes: PASSES in turn, each for DRAWS_A_PASS draws (0: the one pass above for all of them)
++    std::vector<hakios_metal_render_pass> passes;
++    uint32_t drawsAPass = 0;
+ };
+ 
+-// one frame through the C interface: the draws of F in order; false with the first refusal when one is refused
+-void drawFrame(CRig& r, Frame& f, Result& res, bool measured) {
+-    Clock clock;
+-    gSums.reset();
+-    hakios_metal_cb* cb = pluginCb(r, f.gmem);
++// the draws of F in order into CB, each timed by CLOCK when there is one; a refusal is counted and the first kept
++void recordDraws(hakios_metal_cb* cb, Frame& f, Result& res, Clock* timed) {
++    Clock none;
++    Clock& clock = timed != nullptr ? *timed : none;
+     hakios_metal_render_pass pass = f.pass;
++    // (-hakiosDrawOnce: tells the command buffer the vertex stage's textures at an encoder's first draw and when they change)
++    hakios_metal_cb_set_vertex_textures(cb, nullptr, 0, nullptr, 0);
+     for (size_t i = 0; i < f.order.size(); i++) {
+         Layer& l = f.layers[f.order[i]];
++        if (f.drawsAPass != 0 && i % f.drawsAPass == 0) pass = f.passes[(i / f.drawsAPass) % f.passes.size()];
+         hakios_metal_viewport vp{0, 0, 750, 1624, 0, 1};
+         hakios_metal_scissor sc{};
+         const bool scissored = i % 3 != 0;   // (most of a compositor's layers are clipped to their bounds)
+@@ -450,8 +457,7 @@ void drawFrame(CRig& r, Frame& f, Result& res, bool measured) {
+         for (unsigned k = 0; k < l.fsCount; k++) fso[k] = l.fsOffsets[k] + (l.fsUniform[k] ? 8ull * (1 + 2 * (i % 512)) : 0);
+         hakios_metal_texture* tex[16];
+         for (unsigned k = 0; k < l.texCount; k++) tex[k] = l.texVaries[k] ? f.icons[(i + k) % f.icons.size()] : l.tex[k];
+-        clock.begin();
+-        hakios_metal_cb_set_vertex_textures(cb, nullptr, 0, nullptr, 0);   // (-hakiosDrawOnce: sets them before every draw)
++        if (timed != nullptr) clock.begin();
+         int drawn;
+         if (l.indexed) {
+             drawn = hakios_metal_cb_draw_indexed(cb, l.program, &pass, &vp, scissored ? &sc : nullptr, 3, 6, 0, f.index, 12 * (i % 64), 1, 0, 0, l.vs, vso,
+@@ -460,13 +466,21 @@ void drawFrame(CRig& r, Frame& f, Result& res, bool measured) {
+             drawn = hakios_metal_cb_draw3(cb, l.program, &pass, &vp, scissored ? &sc : nullptr, 3, 0, 6, 1, 0, l.vs, vso, l.vsCount, l.fs, fso, l.fsCount, tex,
+                                           l.texCount, l.samp, l.sampCount);
+         }
+-        clock.end();
++        if (timed != nullptr) clock.end();
+         if (drawn != 0) {
+             res.refused++;
+             if (res.error.empty()) res.error = l.name + ": " + hakios_metal_error();
+         }
+         pass.load_action = 1;   // (hm_spend_clears: a Clear is the first draw's)
+     }
++}
++
++// one frame through the C interface, committed and waited for
++void drawFrame(CRig& r, Frame& f, Result& res, bool measured) {
++    Clock clock;
++    gSums.reset();
++    hakios_metal_cb* cb = pluginCb(r, f.gmem);
++    recordDraws(cb, f, res, &clock);
+     const uint64_t c0 = nowNs();
+     hakios_metal_cb_commit(cb, nullptr, nullptr);
+     const uint64_t c1 = nowNs();
+@@ -490,6 +504,14 @@ void runFrames(CRig& r, Frame& f, const char* letter, const std::string& name) {
+     res.name = name;
+     const uint32_t frames = 1 + (asked.golden ? 1 : asked.runs);
+     for (uint32_t frame = 0; frame < frames; frame++) drawFrame(r, f, res, frame != 0);
++    // --record N: the frame recorded N more times and let go unsubmitted, nothing timed: a process that does little
++    // but record draws, for a sampling profiler to look at
++    for (uint32_t n = 0; n < asked.record; n++) {
++        hakios_metal_cb* cb = pluginCb(r, f.gmem);
++        Result unused;
++        recordDraws(cb, f, unused, nullptr);
++        hakios_metal_cb_free(cb);
++    }
+     gResults.push_back(res);
+ }
+ 
+@@ -704,7 +726,7 @@ bool loadStage(const std::string& path, LoadedStage* out) {
+ }
+ 
+ void runStageScenes() {
+-    if (asked.stages.empty() || !(wanted("S") || wanted("T"))) return;
++    if (asked.stages.empty() || !(wanted("S") || wanted("T") || wanted("U"))) return;
+     std::vector<std::unique_ptr<LoadedStage>> vss, fss;
+     {
+         std::vector<std::string> files;
+@@ -727,16 +749,30 @@ void runStageScenes() {
+         std::printf("drawbench: no stages in %s\n", asked.stages.c_str());
+         return;
+     }
+-    for (const char* letter : {"S", "T"}) {
++    for (const char* letter : {"S", "T", "U"}) {
+         if (!wanted(letter)) continue;
+         CRig r;
+         Common c(r);
+         Frame f;
+-        f.gmem = letter[0] == 'S';
++        f.gmem = letter[0] != 'T';
+         f.pass = c.mainPass(true);
+         f.index = c.index;
+         f.icons = c.icons;
+         hakios_metal_texture* lut = hakios_metal_texture_new_3d(r.device, kBGRA8, 16, 16, 16, kUsageRead);
++        if (letter[0] == 'U') {
++            // the frame as the phone's command buffers hold it (03 M6: 4.9 passes and 128 to 140 draws a buffer): five
++            // passes of 22 draws -- two layers' own surfaces, the screen, a third surface, the screen again -- each short
++            // of the 56 draws a pass is tiled for, so each is recorded for sysmem once the queue has seen its like
++            hakios_metal_render_pass own[3];
++            for (hakios_metal_render_pass& p : own) {
++                p = hakios_metal_render_pass{};
++                p.color0 = hakios_metal_texture_new(r.device, k2D, kBGRA8, 750, 1624, kUsageRead | kUsageTarget);
++                p.load_action = 1;
++                p.store_action = 1;
++            }
++            f.passes = {own[0], own[1], c.mainPass(true), own[2], c.mainPass(true)};
++            f.drawsAPass = 22;
++        }
+         // every fragment stage with the first vertex stage it links with -- the one of its own family first, by the
+         // names' common beginning (variable_blur_frag_lph with variable_blur_vert_lph) -- bound as its tables ask
+         for (const auto& fs : fss) {
+@@ -842,8 +878,9 @@ void runStageScenes() {
+                 for (uint32_t run = 0; run < 1 + i % 4 && f.order.size() < 110; run++) f.order.push_back(taken[at % taken.size()]);
+             }
+             char name[200];
+-            snprintf(name, sizeof name, "C interface: %zu programs of the phone's stage cache (%zu drawn), a main pass of 110 draws, two attachments, %s",
+-                     f.layers.size(), taken.size(), f.gmem ? "GMEM binned" : "sysmem");
++            snprintf(name, sizeof name, "C interface: %zu programs of the phone's stage cache (%zu drawn), %s, %s", f.layers.size(), taken.size(),
++                     f.drawsAPass != 0 ? "110 draws in five passes of 22 (three surfaces and the screen twice)" : "a main pass of 110 draws, two attachments",
++                     f.drawsAPass != 0 ? "sysmem once the queue knows them" : f.gmem ? "GMEM binned" : "sysmem");
+             runFrames(r, f, letter, name);
+         }
+     }
+@@ -858,6 +895,7 @@ int main(int argc, char** argv) {
+         if (a == "--golden") asked.golden = true;
+         else if (a == "--verify") asked.verify = true;
+         else if (a == "--long") CommandBuffer::keepStates(false);
++        else if (a == "--record") asked.record = uint32_t(std::max(0, atoi(value())));
+         else if (a == "--hist") asked.hist = true;
+         else if (a == "--csv") asked.csv = true;
+         else if (a == "--runs") asked.runs = std::max(1, atoi(value()));
+@@ -872,6 +910,7 @@ int main(int argc, char** argv) {
+     if (asked.golden) asked.coldBytes = 0;
+     // (--verify, and always for the golden sums: every draw taken from a program's kept state against the same draw in full)
+     CommandBuffer::verifyDraws(asked.golden || asked.verify);
++    CommandQueue::poisonReused(asked.golden || asked.verify);
+     FakeGpu::submitHook = onSubmit;
+     const Scene scenes[] = {
+         {"A", "light frame: 1 command buffer, 1 pass (Load), 20 blended draws (14 textured, 6 with uniforms), sysmem", 20, 0, 6, 0, false, true, 1},

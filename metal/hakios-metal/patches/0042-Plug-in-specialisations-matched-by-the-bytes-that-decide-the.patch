@@ -1,0 +1,287 @@
+Subject: Plug-in: specialisations matched by the bytes that decide them; the alignment answers behind a switch, off
+
+A pipeline of the generic uber shader kept up to 64 contents of its deciding
+buffer, each matched by all its bytes and never dropped. The garbage after the
+structure's last field made every arrival of a configuration a new content: a
+slot, a compilation in the background -- and once the slots were full, the
+unspecialised program (32064 instruction words) for everything new until the
+window server restarted. A slot now keeps the bytes its program's compilation
+read (hakios_metal_program_known_reads), and a content that agrees with it in
+those is that slot; 128 slots, and a line in the console if they ever fill.
+metal_spec_mask=0 matches by all the bytes again.
+
+The alignment answers of e22b881 are behind metal_align, and off: with all of
+them at 64 CoreAnimation takes nearly every image as client storage
+(-newBufferWithBytesNoCopy: and a texture over the buffer, labelled
+com.apple.coreanimation.image-client-storage in the frame traces) where it
+uploaded most of them, and a no-copy buffer here is a copy made when the buffer
+is made: the widgets whose bitmaps arrive later -- the Calendar, the headlines
+-- were drawn from the empty copy, invisible. Bit 1 answers the IOSurface pair,
+bit 2 the linear four; which of them brings client storage on is not
+established, and neither belongs on by default until a no-copy buffer shares
+the caller's memory. The first queue prints the answers in force.
+
+metal_swizzle=0 leaves a descriptor's swizzle unapplied, for a bisect.
+
+
+---
+diff --git a/userland/src/HakiosMetalCA.m b/userland/src/HakiosMetalCA.m
+index 83a1911..d3e514c 100644
+--- a/userland/src/HakiosMetalCA.m
++++ b/userland/src/HakiosMetalCA.m
+@@ -1241,7 +1241,8 @@ - (hakios_metal_sampler *)hakiosSampler;
+ - (uint64_t)hakiosFtName:(struct hm_ft_rec *)ft;   /* metal_trace=frame: its id, its samp line written the first time */
+ @end
+ 
+-#define HM_SPEC_MOST 64   /* the contents of its deciding buffer an uber shader's pipeline is specialised for */
++#define HM_SPEC_MOST 128  /* the contents of its deciding buffer an uber shader's pipeline is specialised for */
++#define HM_SPEC_ALIASES 8 /* ...and the last contents found to be one of them but for bytes that decide nothing */
+ 
+ @interface HakiosMetalComputePipelineState : _MTLComputePipelineState {
+ 	HakiosMetalDevice *_device;
+@@ -1262,7 +1263,10 @@ @interface HakiosMetalRenderPipelineState : _MTLRenderPipelineState {
+ 	/* an uber shader's specialisations (hakiosProgramFor:): its fragment bitcode and constants, the constant buffer
+ 	 * whose bytes choose its path, and for each content seen (HM_SPEC_MOST at most) its bytes, their hash and the
+ 	 * program compiled for it (NULL while it compiles, or when it could not be) -- plain arrays under a lock, because
+-	 * every draw of the pipeline asks */
++	 * every draw of the pipeline asks. Once a content's program is compiled, the bytes of it that the compilation
++	 * read are known (_specMasks, hakios_metal_program_known_reads): a content that holds the same in those bytes is
++	 * that content, whatever its other bytes are (the three after the last field of CoreAnimation's 52 are whatever
++	 * its buffer held before). */
+ 	NSData *_fsAir;
+ 	hakios_metal_constant _fsConstants[64];
+ 	unsigned _fsConstantCount;
+@@ -1273,6 +1277,11 @@ @interface HakiosMetalRenderPipelineState : _MTLRenderPipelineState {
+ 	uint64_t _specHashes[HM_SPEC_MOST];
+ 	hakios_metal_program *_specPrograms[HM_SPEC_MOST];
+ 	uint8_t *_specKeys;                 /* HM_SPEC_MOST x _specLength bytes */
++	uint8_t *_specMasks;                /* the same shape: 0xff where the content's byte decided its program (all, until it is known) */
++	BOOL _specMasked[HM_SPEC_MOST];     /* its mask is known */
++	uint64_t _specAliasHashes[HM_SPEC_ALIASES];   /* contents matched through a mask lately: their hash and the slot */
++	uint8_t _specAliasSlots[HM_SPEC_ALIASES];
++	unsigned _specAliasNext;
+ 	struct hm_ft_pipe *_ftPipe;         /* metal_trace=frame: how a trace describes it (made with it while the switch is on) */
+ }
+ - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device program:(hakios_metal_program *)program
+@@ -3631,20 +3640,63 @@ - (BOOL)hasUnifiedMemory { return YES; }
+ /* Where a texture's rows lie in memory this device did not lay out -- an IOSurface, a buffer -- they must start at a
+  * multiple of 64 bytes and be a multiple of 64 bytes apart: the a6xx reads a texture's pitch and writes a render
+  * target's in 64-byte units (hakios-metal's texture.cpp: wrapSurface, overBuffer). These are the device's answers to
+- * whoever lays such memory out. CoreAnimation asks iosurfaceReadOnlyTextureAlignmentBytes as it makes its Metal context
+- * and creates its IOSurfaces by the answer (CADeviceSetMinimumAlignment); a client of linear textures asks
+- * minimumLinearTextureAlignmentForPixelFormat:. Left to the base class they were Apple's own for this profile, and a
+- * surface made by them (rows of 2848 bytes for 712 pixels) is one the GPU cannot take where it lies: read through a
+- * copy (-hakiosShadow:). A surface another process lays out without asking this device is still what it is. */
+-- (NSUInteger)iosurfaceTextureAlignmentBytes { return 64; }
+-- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes { return 64; }
+-- (NSUInteger)linearTextureAlignmentBytes { return 64; }
+-- (NSUInteger)deviceLinearTextureAlignmentBytes { return 64; }
+-- (NSUInteger)deviceLinearReadOnlyTextureAlignmentBytes { return 64; }
++ * whoever lays such memory out.
++ *
++ * Boot-arg metal_align says which of them this device answers itself, 64; the rest are the base class's, Apple's own
++ * for the profile. Bit 1: iosurfaceTextureAlignmentBytes and iosurfaceReadOnlyTextureAlignmentBytes, which
++ * CoreAnimation asks as it makes its Metal context and lays its memory out by (CADeviceSetMinimumAlignment). Bit 2:
++ * linearTextureAlignmentBytes, deviceLinear(ReadOnly)TextureAlignmentBytes and
++ * minimumLinearTextureAlignmentForPixelFormat:. Both are OFF by default, because with all of them answered
++ * CoreAnimation takes nearly every image as client storage (com.apple.coreanimation.image-client-storage:
++ * -newBufferWithBytesNoCopy: over the image's own memory and a texture over that buffer) where with the base class's
++ * answers it uploads most of them (-replaceRegion:) -- and a no-copy buffer here is not the caller's memory but a
++ * copy of it made when the buffer is made. What the caller's memory holds later is never seen: the widgets whose
++ * pictures arrive after their buffers were made (the Calendar, the headlines: bitmaps of other processes) were drawn
++ * from the empty copy, invisible. Which of the two bits brings client storage on is not established; neither is to
++ * be on by default until a no-copy buffer is the memory it names. Without the answers a surface whose rows the GPU
++ * cannot take where they lie (2848 bytes for 712 pixels) is read through a copy (-hakiosShadow:), as before. */
++static unsigned
++hm_align(void)
++{
++	static int bits = -1;
++
++	if (bits < 0) {
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++		const char *at;
++
++		bits = 0;
++		if (hm_bootargs(args, &size) == 0 && (at = strstr(args, "metal_align=")) != NULL) {
++			bits = atoi(at + strlen("metal_align="));
++		}
++	}
++	return (unsigned)bits;
++}
++
++/* the base class's answer to a selector of no arguments (64 if it has none) */
++- (NSUInteger)hakiosBaseAlignment:(SEL)name
++{
++	struct objc_super up = { self, class_getSuperclass([HakiosMetalDevice class]) };
++
++	if (![up.super_class instancesRespondToSelector:name]) {
++		return 64;
++	}
++	return ((NSUInteger (*)(struct objc_super *, SEL))objc_msgSendSuper)(&up, name);
++}
++
++- (NSUInteger)iosurfaceTextureAlignmentBytes { return (hm_align() & 1) ? 64 : [self hakiosBaseAlignment:_cmd]; }
++- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes { return (hm_align() & 1) ? 64 : [self hakiosBaseAlignment:_cmd]; }
++- (NSUInteger)linearTextureAlignmentBytes { return (hm_align() & 2) ? 64 : [self hakiosBaseAlignment:_cmd]; }
++- (NSUInteger)deviceLinearTextureAlignmentBytes { return (hm_align() & 2) ? 64 : [self hakiosBaseAlignment:_cmd]; }
++- (NSUInteger)deviceLinearReadOnlyTextureAlignmentBytes { return (hm_align() & 2) ? 64 : [self hakiosBaseAlignment:_cmd]; }
+ - (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
+ {
+-	(void)format;
+-	return 64;
++	struct objc_super up = { self, class_getSuperclass([HakiosMetalDevice class]) };
++
++	if ((hm_align() & 2) || ![up.super_class instancesRespondToSelector:_cmd]) {
++		return 64;
++	}
++	return ((NSUInteger (*)(struct objc_super *, SEL, MTLPixelFormat))objc_msgSendSuper)(&up, _cmd, format);
+ }
+ 
+ /* the GPU memory this device has allocated and not given back (hakios-metal counts every buffer it asks the kernel
+@@ -3694,8 +3746,10 @@ - (id)newCommandQueueWithDescriptor:(id)descriptor
+ 				if ([up.super_class instancesRespondToSelector:name]) {
+ 					base = (unsigned long)((NSUInteger (*)(struct objc_super *, SEL))objc_msgSendSuper)(&up, name);
+ 				}
+-				hm_print("alignment declared for a texture's rows over an IOSurface or a buffer: 64 bytes (the base class's for a "
+-					 "read-only IOSurface: %lu)\n", base);
++				hm_print("alignment declared for a texture's rows: over an IOSurface %lu bytes (the base class's: %lu), over a buffer "
++					 "%lu (metal_align=%u: bit 1 the first, bit 2 the second)\n",
++					 (unsigned long)[self iosurfaceReadOnlyTextureAlignmentBytes], base,
++					 (unsigned long)[self deviceLinearReadOnlyTextureAlignmentBytes], hm_align());
+ 			});
+ 		}
+ 	}
+@@ -5828,12 +5882,25 @@ - (id)newTextureViewWithPixelFormat:(MTLPixelFormat)pixelFormat textureType:(MTL
+  * the core refuses the swizzle. */
+ - (instancetype)hakiosSwizzledBy:(MTLTextureSwizzleChannels)swizzle
+ {
++	static int off = -1;
+ 	hakios_metal_texture *swizzled;
+ 
+ 	if (swizzle.red == MTLTextureSwizzleRed && swizzle.green == MTLTextureSwizzleGreen && swizzle.blue == MTLTextureSwizzleBlue &&
+ 	    swizzle.alpha == MTLTextureSwizzleAlpha) {
+ 		return self;
+ 	}
++	if (off < 0) {
++		/* boot-arg metal_swizzle=0 (a bisect's): the descriptor's swizzle is not looked at, the texture read as it lies */
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++
++		off = hm_bootargs(args, &size) == 0 && strstr(args, "metal_swizzle=0") != NULL;
++	}
++	if (off) {
++		HM_ONCE("a texture was asked for with a swizzle of (%u %u %u %u): not applied (metal_swizzle=0)\n", swizzle.red, swizzle.green,
++			swizzle.blue, swizzle.alpha);
++		return self;
++	}
+ 	swizzled = hakios_metal_texture_new_swizzled(_texture, swizzle.red, swizzle.green, swizzle.blue, swizzle.alpha);
+ 	if (swizzled == NULL) {
+ 		hm_print("refused: a texture swizzled (%u %u %u %u): %s; nil\n", swizzle.red, swizzle.green, swizzle.blue, swizzle.alpha,
+@@ -8976,6 +9043,7 @@ - (void)dealloc
+ 		if (_specPrograms[i] != NULL) hakios_metal_program_free(_specPrograms[i]);
+ 	}
+ 	free(_specKeys);
++	free(_specMasks);
+ 	[_fsAir release];
+ 	hm_ft_pipe_free(_ftPipe);
+ 	if (_program != NULL) {
+@@ -9042,10 +9110,12 @@ - (void)hakiosKeepFragment:(NSData *)air constants:(const hakios_metal_constant
+ 	}
+ 	if (_specBinding < 0) return;
+ 	_specKeys = calloc(HM_SPEC_MOST, _specLength);
+-	if (_specKeys == NULL) {
++	_specMasks = malloc((size_t)HM_SPEC_MOST * _specLength);
++	if (_specKeys == NULL || _specMasks == NULL) {
+ 		_specBinding = -1;
+ 		return;
+ 	}
++	memset(_specMasks, 0xff, (size_t)HM_SPEC_MOST * _specLength);
+ 	_specLock = OS_UNFAIR_LOCK_INIT;
+ 	_fsAir = [air retain];
+ 	_fsConstantCount = count < 64 ? count : 64;
+@@ -9074,6 +9144,22 @@ - (void)hakiosKeepFragment:(NSData *)air constants:(const hakios_metal_constant
+ /* the program for a draw whose fragment buffers are BUFFERS: the one compiled for what the deciding buffer holds, or
+  * the pipeline's own while that one compiles (on a queue of its own: a compilation is 0.4 s on the host, and a frame
+  * must not wait for it). 64 contents at most a pipeline; past them the pipeline's own. */
++/* boot-arg metal_spec_mask=0 (a bisect's): a content is another's only when all its bytes are the same, as before the
++ * bytes a compilation read were known */
++static BOOL
++hm_spec_exact(void)
++{
++	static int exact = -1;
++
++	if (exact < 0) {
++		char args[1024] = "";
++		size_t size = sizeof(args) - 1;
++
++		exact = hm_bootargs(args, &size) == 0 && strstr(args, "metal_spec_mask=0") != NULL;
++	}
++	return exact != 0;
++}
++
+ - (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count
+ {
+ 	static dispatch_queue_t compiling;
+@@ -9101,6 +9187,32 @@ - (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers
+ 			break;
+ 		}
+ 	}
++	/* not these very bytes: the same as a content already compiled in every byte its compilation read? (the last few
++	 * such contents by their hash first, then the slots whose masks are known) */
++	for (unsigned a = 0; slot < 0 && a < HM_SPEC_ALIASES; a++) {
++		const unsigned i = _specAliasSlots[a];
++
++		if (_specAliasHashes[a] == hash && i < _specCount && _specMasked[i]) {
++			const uint8_t *was = _specKeys + (size_t)i * _specLength, *mask = _specMasks + (size_t)i * _specLength;
++			BOOL same = YES;
++
++			for (unsigned b = 0; same && b < _specLength; b++) same = ((key[b] ^ was[b]) & mask[b]) == 0;
++			if (same) slot = (int)i;
++		}
++	}
++	for (unsigned i = 0; slot < 0 && i < _specCount; i++) {
++		if (!_specMasked[i]) continue;
++		const uint8_t *was = _specKeys + (size_t)i * _specLength, *mask = _specMasks + (size_t)i * _specLength;
++		BOOL same = YES;
++
++		for (unsigned b = 0; same && b < _specLength; b++) same = ((key[b] ^ was[b]) & mask[b]) == 0;
++		if (same) {
++			slot = (int)i;
++			_specAliasHashes[_specAliasNext % HM_SPEC_ALIASES] = hash;
++			_specAliasSlots[_specAliasNext % HM_SPEC_ALIASES] = (uint8_t)i;
++			_specAliasNext++;
++		}
++	}
+ 	if (slot >= 0) {
+ 		if (_specPrograms[slot] != NULL) found = _specPrograms[slot];
+ 	} else if (_specCount < HM_SPEC_MOST) {
+@@ -9108,7 +9220,11 @@ - (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers
+ 		_specHashes[slot] = hash;
+ 		memcpy(_specKeys + (size_t)slot * _specLength, key, _specLength);
+ 		_specPrograms[slot] = NULL;
++		_specMasked[slot] = NO;
+ 		start = YES;
++	} else {
++		HM_ONCE("specialise: a pipeline has %d contents of its deciding buffer compiled and is asked for another: its own program, "
++			"unspecialised, draws that one\n", HM_SPEC_MOST);
+ 	}
+ 	os_unfair_lock_unlock(&_specLock);
+ 	if (start) {
+@@ -9133,8 +9249,16 @@ - (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers
+ 					 _specLength, _specBinding, hakios_metal_program_stage_words(p, 1), hakios_metal_program_stage_words(_program, 1),
+ 					 (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+ 			}
++			/* the bytes its compilation read: from now on a content that agrees in them is this one */
++			uint8_t reads[256];
++			const unsigned known = p != NULL ? hakios_metal_program_known_reads(p, reads, _specLength) : 0;
++
+ 			os_unfair_lock_lock(&_specLock);
+ 			_specPrograms[slot] = p;   /* (NULL when it could not be compiled: the pipeline's own goes on for this content) */
++			if (known == _specLength && !hm_spec_exact()) {
++				memcpy(_specMasks + (size_t)slot * _specLength, reads, _specLength);
++				_specMasked[slot] = YES;
++			}
+ 			os_unfair_lock_unlock(&_specLock);
+ 			[self release];
+ 		});

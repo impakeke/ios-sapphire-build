@@ -1,0 +1,419 @@
+Subject: A memoryless attachment lives in the tiles: none loads it, none stores it
+
+CoreAnimation attaches a second colour attachment to every pass, a texture of
+MTLStorageModeMemoryless (com.apple.coreanimation.memoryless-texture): draws
+write it and later draws of the same pass read it back by framebuffer fetch.
+Its load action is DontCare and its store action is the one a colour
+attachment has by default, Store -- which on a GPU that keeps such a texture
+in tile memory alone means nothing. Here the texture was given memory like any
+other and its store action was obeyed: every tile of the phone's main pass
+stored 128 x 128 pixels of it to rows nobody reads (the frame trace of the
+home: each pass overwrites what the last one stored, unread).
+
+Texture::setMemoryless (C: hakios_metal_texture_set_memoryless) says what the
+texture is. The tiles of a GMEM pass then neither load nor store it, with one
+exception: where one pass of the caller's is recorded as two here (a draw that
+cannot join the open pass, carrying Load for every attachment as the plug-in
+gives every draw of an encoder after its first), the first half stores it and
+the second loads it -- closePass is told the pass of the draw that closes it.
+A command buffer appended to another keeps it stored, since what follows is
+not known there. The texture keeps its rows for the passes drawn in sysmem.
+
+PassTime says which attachments the tiles loaded and stored
+(hakios_metal_cb_pass_moved). drawbench's second attachment is now what the
+phone's is, memoryless with DontCare and Store, and --no-memoryless makes it an
+ordinary texture again. For the main pass of the phone's own programs (scene S,
+78 tiles): 78 loads and 156 stores, 4.88 MB read and 9.77 MB written, become
+78 and 78, 4.88 MB and 4.88 MB. No golden stream of a scene changes (their
+second attachment was DontCare/DontCare before); the new test's line is added.
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/command.hpp b/hakios-metal/include/hakios-metal/command.hpp
+index 514359b..e1a06fa 100644
+--- a/hakios-metal/include/hakios-metal/command.hpp
++++ b/hakios-metal/include/hakios-metal/command.hpp
+@@ -171,7 +171,7 @@ public:
+     // (WROTE, READ: of a tiled pass, the attachments a draw's fragment stage has an output for, and those a draw
+     // reads through framebuffer fetch -- what TOUCHED's low byte is the union of)
+     enum : uint16_t { kPassReads = 0x100, kPassBelowBar = 0x200, kPassNoLoad = 0x400 };
+-    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; uint8_t wrote = 0, read = 0; std::string sysmemWhy; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
++    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0; uint16_t touched = 0; uint8_t wrote = 0, read = 0, loaded = 0, stored = 0; std::string sysmemWhy; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
+     static constexpr uint32_t kMaxProfiled = 64;
+     void setProfile(bool on) { profile_ = on; }
+     // ...and each draw of a sysmem pass on its own, the first kMaxProfiledDraws: a wait for idle before it and after it,
+@@ -360,7 +360,11 @@ private:
+         // what the pass's streams last held of a draw's groups, and what its attachments come to (render.cpp: PassCache)
+         std::shared_ptr<render::PassCache> cache;
+     };
+-    void closePass();
++    // NEXT: the pass of the draw that could not join the open one, when it is such a draw that closes it (nullptr for
++    // anything else: a copy, a dispatch, the commit). A memoryless attachment the tiles wrote is stored for it alone:
++    // when NEXT has the same texture attached with Load, the caller's one pass goes on in a second one here.
++    // KEPT: stored whatever follows (a command buffer appended to another: what follows is not known here).
++    void closePass(const RenderPass* next = nullptr, bool kept = false);
+     void useAttachments(const RenderPass& pass);
+     // An open pass let go is the queue's to hand to the next pass, as a new one in everything but what its streams and
+     // its register shadows have taken from the heap (render.cpp): a frame is eight passes or so, and each made those
+diff --git a/hakios-metal/include/hakios-metal/hakios_metal.h b/hakios-metal/include/hakios-metal/hakios_metal.h
+index a03c36f..a7fcba1 100644
+--- a/hakios-metal/include/hakios-metal/hakios_metal.h
++++ b/hakios-metal/include/hakios-metal/hakios_metal.h
+@@ -132,6 +132,11 @@ hakios_metal_texture *hakios_metal_texture_new(hakios_metal_device *device, unsi
+  * sampled and never drawn into or written by a kernel. NULL with the reason. */
+ hakios_metal_texture *hakios_metal_texture_new_compressed(hakios_metal_device *device, unsigned pixel_format, unsigned width, unsigned height,
+     unsigned usage);
++/* MTLStorageModeMemoryless: TEXTURE's contents exist only while a render pass draws into it. It keeps its rows (a pass
++ * drawn in sysmem draws into them); the tiles of a GMEM pass neither load nor store it, whatever load and store actions
++ * the pass names for it. Set before the texture is first attached. */
++void hakios_metal_texture_set_memoryless(hakios_metal_texture *texture, int memoryless);
++int hakios_metal_texture_memoryless(hakios_metal_texture *texture);
+ /* where a texture's pixels live: 0 its own memory, 1 an IOSurface, 2 a buffer's rows, 3 compressed (with rows of its own) */
+ unsigned hakios_metal_texture_origin(hakios_metal_texture *texture);
+ /* ...of LEVELS mip levels (MTLTextureDescriptor.mipmapLevelCount: 1 to floor(log2(max(width, height))) + 1) */
+@@ -508,6 +513,8 @@ int hakios_metal_cb_pass_attachments(hakios_metal_cb *cb, unsigned i, unsigned *
+ /* ...and of a tiled pass, apart: the attachments its draws' fragment stages have an output for (WROTE) and those a draw
+  * reads through framebuffer fetch (READ), as masks; -1 past the profiled passes */
+ int hakios_metal_cb_pass_access(hakios_metal_cb *cb, unsigned i, unsigned *wrote, unsigned *read);
++/* the attachments the tiles of profiled pass I loaded and stored, as masks (0 and 0 for a sysmem pass); -1 past the passes */
++int hakios_metal_cb_pass_moved(hakios_metal_cb *cb, unsigned i, unsigned *loaded, unsigned *stored);
+ int hakios_metal_cb_pass_tiles(hakios_metal_cb *cb, unsigned i);
+ /* why CB's last pass refused for GMEM was refused ("" when none was); valid while CB lives */
+ const char *hakios_metal_cb_gmem_refusal(hakios_metal_cb *cb);
+diff --git a/hakios-metal/include/hakios-metal/texture.hpp b/hakios-metal/include/hakios-metal/texture.hpp
+index 8ea68f1..a44eaee 100644
+--- a/hakios-metal/include/hakios-metal/texture.hpp
++++ b/hakios-metal/include/hakios-metal/texture.hpp
+@@ -299,6 +299,14 @@ public:
+     // layer size in bytes, and its blocks across and down as log2 (fdl_layout's)
+     bool compressed() const { return ubwc_; }
+     bool overBufferRows() const { return overBuffer_; }
++    // MTLStorageModeMemoryless: a render target whose contents exist only while a pass draws into it, undefined before
++    // the pass and after it. It has rows like any other texture (a pass drawn in sysmem draws into them); the tiles of a
++    // GMEM pass neither load nor store it, whatever the pass's actions say for it (a colour attachment's default store
++    // action is Store, and that is what CoreAnimation leaves on the one it reads back by framebuffer fetch) -- except
++    // where one pass of the caller's is recorded as two here, and the second has to find what the first drew
++    // (CommandBuffer::closePass). Set once, before the texture is first attached.
++    bool memoryless() const { return memoryless_; }
++    void setMemoryless(bool on) { memoryless_ = on; }
+     uint64_t flagAddress() const { return buffer_->gpuAddress() + ubwcOffset_; }
+     uint32_t flagPitch() const { return ubwcPitch_; }
+     uint32_t flagLayerSize() const { return ubwcLayerSize_; }
+@@ -363,6 +371,7 @@ private:
+     static std::shared_ptr<Texture> adopt(Texture* t);   // every Texture is made through this: its id, and the registry
+     SurfacePlane chroma_{0, 0};   // a two-plane format's second plane, in the buffer
+     bool overBuffer_ = false;     // made by overBuffer: its rows a Buffer's, which the CPU writes as it likes
++    bool memoryless_ = false;     // setMemoryless
+     bool ubwc_ = false;           // TextureDesc::compressed: TILE6_3 and a flag buffer
+     // ...and the linear rows this processor writes and reads (replace, read): copied into the compressed layout by the
+     // GPU before a draw samples the texture after they changed (CommandBuffer::draw, freshen)
+diff --git a/hakios-metal/src/c_api.cpp b/hakios-metal/src/c_api.cpp
+index 17ad152..acf0346 100644
+--- a/hakios-metal/src/c_api.cpp
++++ b/hakios-metal/src/c_api.cpp
+@@ -546,6 +546,12 @@ hakios_metal_texture* hakios_metal_texture_new_levels(hakios_metal_device* d, un
+     return r;
+ }
+ 
++void hakios_metal_texture_set_memoryless(hakios_metal_texture* t, int memoryless) {
++    if (t != nullptr) t->texture->setMemoryless(memoryless != 0);
++}
++
++int hakios_metal_texture_memoryless(hakios_metal_texture* t) { return t != nullptr && t->texture->memoryless() ? 1 : 0; }
++
+ unsigned hakios_metal_texture_origin(hakios_metal_texture* t) {
+     const Texture& x = *t->texture;
+     return x.compressed() ? 3 : x.overBufferRows() ? 2 : x.surface() != 0 ? 1 : 0;
+@@ -987,6 +993,15 @@ int hakios_metal_cb_pass_access(hakios_metal_cb* cb, unsigned i, unsigned* wrote
+     return 0;
+ }
+ 
++int hakios_metal_cb_pass_moved(hakios_metal_cb* cb, unsigned i, unsigned* loaded, unsigned* stored) {
++    syncOne(cb);
++    const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
++    if (i >= t.size()) return -1;
++    *loaded = t[i].loaded;
++    *stored = t[i].stored;
++    return 0;
++}
++
+ int hakios_metal_cb_pass_tiles(hakios_metal_cb* cb, unsigned i) {
+     syncOne(cb);
+     const std::vector<CommandBuffer::PassTime> t = cb->cb->passTimes();
+diff --git a/hakios-metal/src/render.cpp b/hakios-metal/src/render.cpp
+index 287a568..15a639f 100644
+--- a/hakios-metal/src/render.cpp
++++ b/hakios-metal/src/render.cpp
+@@ -4468,7 +4468,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
+         joins = false;
+     }
+     if (!joins) {
+-        closePass();
++        closePass(&pass);
+     }
+     render::GmemPlan plan;
+     bool gmem = false, dual = false;
+@@ -5051,8 +5051,11 @@ bool CommandBuffer::append(CommandBuffer& other) {
+     if (!other.error_.empty()) {
+         return fail(other.error_);
+     }
+-    closePass();         // each pass ends in its own stream: nothing of this one's continues into the other's
+-    other.closePass();
++    // (each pass ends in its own stream: nothing of this one's continues into the other's -- but what the other's first
++    // pass loads may be what this one's last pass drew, and the other's last what a later one loads: a memoryless
++    // attachment is stored by both)
++    closePass(nullptr, true);
++    other.closePass(nullptr, true);
+     appendStream(stream_, other.stream_);
+     other.stream_ = pm4::Stream{};
+     uses_.insert(uses_.end(), other.uses_.begin(), other.uses_.end());
+@@ -5080,7 +5083,7 @@ bool CommandBuffer::append(CommandBuffer& other) {
+     return true;
+ }
+ 
+-void CommandBuffer::closePass() {
++void CommandBuffer::closePass(const RenderPass* next, bool kept) {
+     if (open_ == nullptr) {
+         return;
+     }
+@@ -5089,6 +5092,16 @@ void CommandBuffer::closePass() {
+     // it the store would put back what it never loaded into the rows of the next layer or level; CoreAnimation's second
+     // screen, DontCare, is 2436 rows, a multiple of 4), or the tiles clear it; stored when written or cleared, unless
+     // its store action is DontCare.
++    // A memoryless attachment (Texture::memoryless) has nothing to load but what an earlier half of the same pass
++    // stored for it (its load action Load, which a pass of the caller's cannot begin with), and is stored only for a
++    // later half: when the draw that closes this pass (NEXT) has it attached with Load, or KEPT. Otherwise its tiles
++    // are the whole of its life, as on a GPU that keeps such a texture in tile memory alone.
++    auto keptFor = [&](uint32_t i, const Texture* t) {
++        if (kept) return true;
++        if (next == nullptr) return false;
++        const Texture* n = i == 0 ? next->color0 : next->more[i - 1].texture;
++        return n == t && (i == 0 ? next->load : next->more[i - 1].load) == LoadAction::kLoad;
++    };
+     auto loadStore = [&](uint32_t y1, uint32_t H, uint32_t* load, uint32_t* store) {
+         // (past the right edge the granules land in the row's own padding, which gmemPlan saw the pitch hold; only the
+         // rows past the bottom may be another layer's or level's)
+@@ -5101,6 +5114,11 @@ void CommandBuffer::closePass() {
+             if (t == nullptr || (!every && !cleared && (((open_->written | open_->read) >> i) & 1) == 0)) continue;
+             const LoadAction la = i == 0 ? open_->pass.load : open_->pass.more[i - 1].load;
+             const StoreAction sa = i == 0 ? open_->pass.store : open_->pass.more[i - 1].store;
++            if (t->memoryless() && !every) {
++                if (!cleared && la == LoadAction::kLoad) *load |= 1u << i;
++                if ((cleared || ((open_->written >> i) & 1)) && sa != StoreAction::kDontCare && keptFor(i, t)) *store |= 1u << i;
++                continue;
++            }
+             if (!cleared && (every || !(la == LoadAction::kDontCare && inside))) *load |= 1u << i;
+             if ((every || cleared || ((open_->written >> i) & 1)) && sa != StoreAction::kDontCare) *store |= 1u << i;
+         }
+@@ -5284,6 +5302,8 @@ void CommandBuffer::closePass() {
+                                                 (load == 0 ? kPassNoLoad : 0u));
+             profiled_.back().wrote = uint8_t(open_->written);
+             profiled_.back().read = uint8_t(open_->read);
++            profiled_.back().loaded = uint8_t(load);
++            profiled_.back().stored = uint8_t(store);
+         }
+     }
+     {
+diff --git a/hakios-metal/tests/golden/tests-a610.txt b/hakios-metal/tests/golden/tests-a610.txt
+index 8e7188f..9f8095e 100644
+--- a/hakios-metal/tests/golden/tests-a610.txt
++++ b/hakios-metal/tests/golden/tests-a610.txt
+@@ -281,6 +281,7 @@ draw_state_groups_give_each_draw_that_runs_the_state_the_plain_stream_gives_it s
+ the_twins_of_the_draw_state_groups_show submits 8 words 253563 draws 1275 loads 3800 stream 1175313443c1f0fb state fc5f1d947f4170f3 names 86 03f88d6dca514ea9
+ bins_laid_from_the_render_areas_corner_are_not_the_vscs submits 2 words 3097 draws 10 loads 10 stream 7cd25ae192e2a72f state 16abf57547b8731c names 10 92ae1a2586e14416
+ a_pass_gives_gmem_to_the_attachments_its_draws_touch submits 8 words 215546 draws 676 loads 1180 stream 9defd63235c719a4 state aaa025495783bbd5 names 42 ff850aa65d41c62c
++a_memoryless_attachment_is_neither_loaded_nor_stored_by_the_tiles submits 4 words 204114 draws 626 loads 1252 stream edc7dc8b2239c4f8 state 1b680b28b92a9375 names 25 ddc97120730bece7
+ a_grid_whose_pipes_would_hold_more_than_32_bins_is_not_binned submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+        24 tiles: waits for idle with the barrier a group 80, in the stream 106, the plain stream 106, every draw ordered 56
+ a_fetchs_barrier_runs_where_a_tile_draws_the_fetch submits 5 words 109840 draws 500 loads 1300 stream 003ad3c00efcbda5 state c2bc8fdaa4cf0a01 names 30 7b3e8fd04d1dff98
+diff --git a/hakios-metal/tests/golden/tests-a635.txt b/hakios-metal/tests/golden/tests-a635.txt
+index 64eecea..af1070d 100644
+--- a/hakios-metal/tests/golden/tests-a635.txt
++++ b/hakios-metal/tests/golden/tests-a635.txt
+@@ -281,6 +281,7 @@ draw_state_groups_give_each_draw_that_runs_the_state_the_plain_stream_gives_it s
+ the_twins_of_the_draw_state_groups_show submits 8 words 73223 draws 357 loads 1064 stream 3ae7edf283416487 state c0eab84a5725910d names 86 03f88d6dca514ea9
+ bins_laid_from_the_render_areas_corner_are_not_the_vscs submits 2 words 3273 draws 10 loads 10 stream c18dc558daf5c895 state 16abf57547b8731c names 10 92ae1a2586e14416
+ a_pass_gives_gmem_to_the_attachments_its_draws_touch submits 8 words 59260 draws 184 loads 316 stream e6237e1d2495e55f state 0d69f2a311459f55 names 42 ff850aa65d41c62c
++a_memoryless_attachment_is_neither_loaded_nor_stored_by_the_tiles submits 4 words 57545 draws 170 loads 340 stream 9eb726229477e22c state 42f8b10dce7bf335 names 25 ddc97120730bece7
+ a_grid_whose_pipes_would_hold_more_than_32_bins_is_not_binned submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000 names 0 0000000000000000
+        6 tiles: waits for idle with the barrier a group 26, in the stream 34, the plain stream 34, every draw ordered 20
+ a_fetchs_barrier_runs_where_a_tile_draws_the_fetch submits 5 words 32124 draws 140 loads 364 stream 3b2c7b9d0ceef757 state fb1d6719dced4b65 names 30 7b3e8fd04d1dff98
+diff --git a/hakios-metal/tests/render_test.cpp b/hakios-metal/tests/render_test.cpp
+index a0ec289..0142d6b 100644
+--- a/hakios-metal/tests/render_test.cpp
++++ b/hakios-metal/tests/render_test.cpp
+@@ -6365,6 +6365,108 @@ TEST(a_pass_gives_gmem_to_the_attachments_its_draws_touch) {
+ 
+ // The VSC's pipes: the bins of a grid grouped as fd's gmem layout groups them, and no binning at all when a pipe would
+ // hold more than the 32 bins CP_SET_BIN_DATA5 can name.
++// A memoryless attachment (MTLStorageModeMemoryless: CoreAnimation's second colour attachment, which its draws write
++// and read back by framebuffer fetch inside the pass, with the store action a colour attachment has by default: Store)
++// lives in the tiles: none of them loads it and none stores it, and its rows in memory are left as they were. The
++// same texture without the storage mode is stored by every tile, as the pass asks. Where one pass of the caller's is
++// recorded as two -- a draw that cannot join the open pass, with Load on every attachment as the plug-in gives every
++// draw of an encoder after its first -- the first half stores it and the second loads it; the second half's end is
++// the pass's.
++TEST(a_memoryless_attachment_is_neither_loaded_nor_stored_by_the_tiles) {
++    const Program mrt{kernels::tri_flat_vs_air, kernels::tri_mrt_fs_air, Linkage{}, "tri_mrt"};
++    for (int memoryless = 0; memoryless < 2; memoryless++) {
++        Rig r;
++        auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
++        auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
++        u->setMemoryless(memoryless != 0);
++        fillCoords(*u, 0x80000000u);
++        RenderPass a;
++        a.color0 = t.get();
++        a.more[0].texture = u.get();
++        a.more[0].load = LoadAction::kDontCare;   // (Metal's defaults for a colour attachment)
++        a.more[0].store = StoreAction::kStore;
++        render::GmemPlan both;
++        CHECK(render::gmemPlan(a, &both, nullptr));
++        auto cb = r.queue->commandBuffer();
++        cb->setProfile(true);
++        CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
++        RenderPass later = a;
++        later.load = later.more[0].load = LoadAction::kLoad;
++        CHECK(cb->draw(mrt, later, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
++        cb->commit();
++        cb->waitUntilCompleted();
++        const auto s = r.fake->stats();
++        CHECK(cb->status() == CommandBuffer::kCompleted);
++        CHECK_EQ(s.faults, 0u);
++        if (s.faults) std::printf("       %s\n", s.lastFault.c_str());
++        CHECK_EQ(s.tiles, both.tiles());
++        CHECK_EQ(s.tileLoads, both.tiles());                              // the first attachment's alone, either way
++        CHECK_EQ(s.tileStores, (memoryless ? 1u : 2u) * both.tiles());
++        CHECK_EQ(s.storedPixels, (memoryless ? 1u : 2u) * s.loadedPixels);
++        CHECK((coordsWrong(*u, 0x80000000u) == 0) == (memoryless != 0));   // its rows: untouched, or the tiles' stores
++        const auto times = cb->passTimes();
++        CHECK_EQ(times.size(), size_t(1));
++        if (times.size() == 1) CHECK(times[0].wrote == 3 && times[0].loaded == 1 && times[0].stored == (memoryless ? 1 : 3));
++    }
++    // one pass of the caller's in two here: the second draw's options are another's, and it cannot join
++    {
++        Rig r;
++        auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
++        auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
++        u->setMemoryless(true);
++        RenderPass a;
++        a.color0 = t.get();
++        a.more[0].texture = u.get();
++        a.more[0].load = LoadAction::kDontCare;
++        render::GmemPlan both;
++        CHECK(render::gmemPlan(a, &both, nullptr));
++        auto cb = r.queue->commandBuffer();
++        cb->setProfile(true);
++        CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
++        RenderPass later = a;
++        later.load = later.more[0].load = LoadAction::kLoad;
++        render::Options binned;
++        binned.gmemBinning = true;
++        CHECK(cb->draw(mrt, later, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}, binned));
++        cb->commit();
++        cb->waitUntilCompleted();
++        const auto s = r.fake->stats();
++        CHECK(cb->status() == CommandBuffer::kCompleted && s.faults == 0);
++        if (s.faults) std::printf("       %s\n", s.lastFault.c_str());
++        CHECK_EQ(s.tiles, 2 * both.tiles());
++        CHECK_EQ(s.tileStores, 3 * both.tiles());   // both attachments by the first half, the first alone by the second
++        CHECK_EQ(s.tileLoads, 3 * both.tiles());    // the first alone by the first half, both by the second
++        const auto times = cb->passTimes();
++        CHECK_EQ(times.size(), size_t(2));
++        if (times.size() == 2) CHECK(times[0].loaded == 1 && times[0].stored == 3 && times[1].loaded == 3 && times[1].stored == 1);
++    }
++    // ...and a pass that begins anew on the same textures (its attachment DontCare again) is owed nothing by the one before
++    {
++        Rig r;
++        auto t = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
++        auto u = target(r, 750, 1624, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
++        u->setMemoryless(true);
++        RenderPass a;
++        a.color0 = t.get();
++        a.more[0].texture = u.get();
++        a.more[0].load = LoadAction::kDontCare;
++        render::GmemPlan both;
++        CHECK(render::gmemPlan(a, &both, nullptr));
++        auto cb = r.queue->commandBuffer();
++        CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}));
++        render::Options binned;
++        binned.gmemBinning = true;
++        CHECK(cb->draw(mrt, a, wholeDraw(3, 750, 1624), Bindings{}, Bindings{}, binned));
++        cb->commit();
++        cb->waitUntilCompleted();
++        const auto s = r.fake->stats();
++        CHECK(cb->status() == CommandBuffer::kCompleted && s.faults == 0);
++        CHECK_EQ(s.tiles, 2 * both.tiles());
++        CHECK_EQ(s.tileStores, 2 * both.tiles());
++        CHECK_EQ(s.tileLoads, 2 * both.tiles());
++    }
++}
++
+ TEST(a_grid_whose_pipes_would_hold_more_than_32_bins_is_not_binned) {
+     render::GmemPlan p;
+     uint32_t x = 0, y = 0;
+diff --git a/hakios-metal/tools/drawbench.cpp b/hakios-metal/tools/drawbench.cpp
+index 1ff67bc..f543d1d 100644
+--- a/hakios-metal/tools/drawbench.cpp
++++ b/hakios-metal/tools/drawbench.cpp
+@@ -81,6 +81,7 @@ struct Asked {
+     bool gpu = false;    // --gpu: what the fake GPU's command processor and tiles did for the last measured frame
+     int gmemOff = 0;     // --gmem-off BITS: metal_gmem_off, as the plug-in passes it on (0, as with no boot-arg)
+     int gmemDraws = -1;  // --gmem-draws N: metal_gmem_draws (56 with no boot-arg)
++    bool memoryless = true;   // --no-memoryless: the second attachment an ordinary texture, stored as its pass asks
+ } asked;
+ 
+ uint64_t nowNs() { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
+@@ -353,9 +354,12 @@ void runCore(const Scene& s) {
+         pass.color0 = fb.get();
+         pass.load = s.clear ? LoadAction::kClear : LoadAction::kLoad;
+         if (s.second) {
++            // (CoreAnimation's memoryless texture, with the actions it leaves on it: DontCare and a colour attachment's
++            // default store action, Store)
++            fb2->setMemoryless(asked.memoryless);
+             pass.more[0].texture = fb2.get();
+             pass.more[0].load = LoadAction::kDontCare;
+-            pass.more[0].store = StoreAction::kDontCare;
++            pass.more[0].store = StoreAction::kStore;
+         }
+         for (uint32_t i = 0; i < s.draws; i++) {
+             Draw d;
+@@ -557,6 +561,7 @@ struct Common {
+         device = hakios_metal_buffer_new(r.device, 64 * 1024);
+         fb = hakios_metal_texture_new(r.device, k2D, kBGRA8, 750, 1624, kUsageRead | kUsageTarget);
+         fb2 = hakios_metal_texture_new(r.device, k2D, kBGRA8, 750, 1624, kUsageRead | kUsageTarget);
++        hakios_metal_texture_set_memoryless(fb2, asked.memoryless ? 1 : 0);
+         wallpaper = hakios_metal_texture_new(r.device, k2D, kBGRA8, 750, 1624, kUsageRead);
+         for (int i = 0; i < 24; i++) icons.push_back(hakios_metal_texture_new(r.device, k2D, kBGRA8, 120, 120, kUsageRead));
+         hakios_metal_sampler_desc sd{};
+@@ -576,9 +581,9 @@ struct Common {
+         p.load_action = 1;
+         p.store_action = 1;
+         if (second) {
+-            p.more[0].texture = fb2;   // CoreAnimation's second screen: DontCare / DontCare
++            p.more[0].texture = fb2;   // CoreAnimation's memoryless texture: DontCare / Store (the default it leaves)
+             p.more[0].load_action = 0;
+-            p.more[0].store_action = 0;
++            p.more[0].store_action = 1;
+         }
+         return p;
+     }
+@@ -1048,8 +1053,9 @@ int main(int argc, char** argv) {
+         else if (a == "--gpu") asked.gpu = true;
+         else if (a == "--gmem-off") asked.gmemOff = atoi(value());
+         else if (a == "--gmem-draws") asked.gmemDraws = atoi(value());
++        else if (a == "--no-memoryless") asked.memoryless = false;
+         else {
+-            std::printf("drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv] [--gpu] [--gmem-off BITS] [--gmem-draws N] [--verify] [--long]"
++            std::printf("drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv] [--gpu] [--gmem-off BITS] [--gmem-draws N] [--no-memoryless] [--verify] [--long]"
+                         " | --golden [--long]\n");
+             return 2;
+         }
+@@ -1066,7 +1072,7 @@ int main(int argc, char** argv) {
+         {"D", "the heavy frame with GMEM off (every pass sysmem), 46 of its draws with uniforms", 140, 0, 46, 3, false, false, 1},
+         {"E", "the same with 23 framebuffer-fetch draws, GMEM off", 140, 23, 46, 3, false, false, 1},
+         {"F", "the heavy frame of C split over 4 command buffers (3 offscreen + main)", 140, 0, 0, 3, false, true, 4},
+-        {"P", "the phone's main pass: 108 textured draws into two 750x1624 attachments (the second DontCare), GMEM binned", 108, 0, 0, 0, false, true, 1, true, 0},
++        {"P", "the phone's main pass: 108 textured draws into two 750x1624 attachments (the second memoryless), GMEM binned", 108, 0, 0, 0, false, true, 1, true, 0},
+         {"Q", "the same with every 4th draw a framebuffer fetch (27 runs of fetch after no-fetch)", 108, 0, 0, 0, false, true, 1, true, 4},
+         {"R", "the main pass of P recorded once, in sysmem (GMEM off)", 108, 0, 0, 0, false, false, 1, true, 0},
+         {"G", "one draw alone in a command buffer (the fixed cost of a pass and a submit)", 1, 0, 0, 0, false, true, 1},

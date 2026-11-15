@@ -1,0 +1,1960 @@
+Subject: Tools: drawbench and the golden streams (tools/dev.mk check)
+
+What the work on a draw's CPU cost is measured and held with:
+
+- tools/drawbench.cpp: frames a window server draws at the phone's size, recorded on the fake GPU, the time inside the
+  draw calls alone taken a draw, the heap allocations in them counted. Scenes A-H, P, Q, R are the performance
+  audit's (the core's interface, hand-made programs); J, K, L drive the C interface the plug-in drives, with linked
+  programs, vertex and index buffers, uniforms bound at multiples of 8, a stage of ten texture slots with one bound,
+  fetches, two colour outputs, programs changing from draw to draw; S, T (--stages DIR) do the same with the stages of
+  a phone's own cache. --cold KB empties the processor's caches of the driver before each draw.
+- the golden streams: FakeGpu::submitHook hands every submission over as it arrives, tests/golden.hpp sums the words
+  the command processor reads (bodies each time they are called) and, apart, the bytes every indirect load names (a
+  draw's tables, the programs). `drawbench --golden` prints a line a scene, `tests --golden` a line a test;
+  tests/golden/ holds them for both chips and `make -f tools/dev.mk check` compares. A change that is meant to leave
+  the stream as it was is held to that word for word. (One test and one scene whose addresses the threads decide
+  are counted, not summed.)
+- include/hakios-metal/testing.hpp: hakios_metal_program_from_stages, a program as the C interface holds one made
+  from two Stages without the compiler, so that a build without Mesa drives the plug-in's own entry points.
+- tools/dev.mk: the tests and drawbench built object by object, for either chip's constants (CHIP=a610).
+
+
+---
+diff --git a/hakios-metal/include/hakios-metal/fake_gpu.hpp b/hakios-metal/include/hakios-metal/fake_gpu.hpp
+index 713f94d..1e07829 100644
+--- a/hakios-metal/include/hakios-metal/fake_gpu.hpp
++++ b/hakios-metal/include/hakios-metal/fake_gpu.hpp
+@@ -185,6 +185,12 @@ public:
+     // stop running submissions until resume(): to see what a program does while the GPU is behind
+     void pause();
+     void resume();
++    // A submission as it arrives, before it runs: the GPU address and the words of its command stream. For whoever reads
++    // streams back word for word (tests/golden.hpp: the golden streams of the tests and of drawbench). Called on the
++    // submitting thread under the fake's lock, so the hook reads memory through peek(), not through memory().
++    static void (*submitHook)(FakeGpu& gpu, uint64_t address, uint32_t words, void* context);
++    static void* submitHookContext;
++    const uint8_t* peek(uint64_t iova, uint64_t length) { return at(iova, length); }   // (inside the hook alone)
+ 
+     // what the kernel says about this GPU, for the fake to say the same and for a test to check it does
+     static constexpr uint64_t kChipId = 0x06030500;      // dt qcom,chipid: an A635-family part, "Adreno 7c+ Gen 3" to Mesa
+diff --git a/hakios-metal/include/hakios-metal/testing.hpp b/hakios-metal/include/hakios-metal/testing.hpp
+new file mode 100644
+index 0000000..10f0036
+--- /dev/null
++++ b/hakios-metal/include/hakios-metal/testing.hpp
+@@ -0,0 +1,20 @@
++// What the host's tests and tools/drawbench need of the C interface beyond hakios_metal.h: its own objects made
++// without the compiler, so that a build without Mesa can still drive the interface the plug-in drives.
++#pragma once
++
++#include "hakios-metal/hakios_metal.h"
++#include "hakios-metal/render.hpp"
++
++namespace hakios::metal {
++
++// A program of two stages compiled elsewhere -- a test's fixtures, a stage cache's files -- as the C interface holds
++// one: what hakios_metal_program_new_bitcode makes of two functions' bitcode, here from their Stages (the words and the
++// immediates copied, the stages linked by render::link). No resources: a stage's argument buffers are not known here.
++// FS_IBO_BASE: what the fragment stage was compiled with (compileStage's IBO_BASE: the vertex stage's device buffers).
++// SSBO_WRITES: Program::ssboWrites (bit 0 the vertex stage stores to its device buffers, bit 1 the fragment stage);
++// by default every stage that has device buffers is taken to write them.
++// nullptr with hakios_metal_error(): a stage of the wrong kind, or a link render::link refuses.
++hakios_metal_program* hakios_metal_program_from_stages(const Stage& vs, const Stage& fs, unsigned colorPixelFormat, unsigned fsIboBase = 0,
++                                                       unsigned ssboWrites = 3);
++
++}  // namespace hakios::metal
+diff --git a/hakios-metal/src/c_api.cpp b/hakios-metal/src/c_api.cpp
+index dd2891f..30a4aca 100644
+--- a/hakios-metal/src/c_api.cpp
++++ b/hakios-metal/src/c_api.cpp
+@@ -22,6 +22,7 @@
+ #include "hakios-metal/hakios_metal.h"
+ #include "hakios-metal/a6xx.hpp"
+ #include "hakios-metal/metallib.hpp"
++#include "hakios-metal/testing.hpp"
+ #include "../tests/fixtures/null_fs_bc.hpp"
+ #include "hakios-metal/texture.hpp"
+ 
+@@ -1184,6 +1185,54 @@ hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base
+     return r;
+ }
+ 
++}   // extern "C"
++
++namespace hakios::metal {
++hakios_metal_program* hakios_metal_program_from_stages(const Stage& vs, const Stage& fs, unsigned colorPixelFormat, unsigned fsIboBase, unsigned ssboWrites) {
++    if (vs.kind != kStageVertex || fs.kind != kStageFragment) {
++        failed("hakios_metal_program_from_stages: a vertex stage and a fragment stage, in that order");
++        return nullptr;
++    }
++    // each stage as compileStage leaves one: its Kernel pointing into vectors the CompiledStage owns
++    auto own = [](const Stage& s) {
++        auto c = std::make_shared<CompiledStage>();
++        c->stage = s;
++        c->words.assign(s.k.words, s.k.words + s.k.numWords);
++        if (s.k.immediates != nullptr) c->immediates.assign(s.k.immediates, s.k.immediates + s.k.numImmediates);
++        c->name = s.k.name != nullptr ? s.k.name : (s.kind == kStageVertex ? "vs" : "fs");
++        c->stage.k.words = c->words.data();
++        c->stage.k.immediates = c->immediates.empty() ? nullptr : c->immediates.data();
++        c->stage.k.name = c->name.c_str();
++        c->stage.k.source = "";
++        return c;
++    };
++    auto out = std::make_unique<CompiledProgram>();
++    out->vs = own(vs);
++    out->fs = own(fs);
++    out->fs->iboBase = fsIboBase;
++    out->vs->writesMemory = (ssboWrites & 1) != 0 && vs.k.numSsbos != 0;
++    out->fs->writesMemory = (ssboWrites & 2) != 0 && fs.k.numSsbos != 0;
++    std::string why;
++    if (!render::link(out->vs->stage, out->fs->stage, &out->program.link, &why)) {
++        failed(why);
++        return nullptr;
++    }
++    // (linkProgram's own tail)
++    out->name = out->vs->name + "+" + out->fs->name;
++    out->program.vs = out->vs->stage;
++    out->program.fs = out->fs->stage;
++    out->program.fsIboBase = out->fs->iboBase;
++    out->program.ssboWrites = uint8_t((out->vs->writesMemory ? 1 : 0) | (out->fs->writesMemory ? 2 : 0));
++    out->program.name = out->name.c_str();
++    auto* r = new hakios_metal_program;
++    r->program = std::move(out);
++    r->color = colorPixelFormat;
++    return r;
++}
++}  // namespace hakios::metal
++
++extern "C" {
++
+ unsigned hakios_metal_program_stage_words(hakios_metal_program* p, unsigned stage) {
+     if (p == nullptr || stage > 1) return 0;
+     return (stage == 0 ? p->program->program.vs : p->program->program.fs).k.numWords;
+diff --git a/hakios-metal/src/fake_gpu.cpp b/hakios-metal/src/fake_gpu.cpp
+index 679b68f..3eaf214 100644
+--- a/hakios-metal/src/fake_gpu.cpp
++++ b/hakios-metal/src/fake_gpu.cpp
+@@ -257,6 +257,9 @@ std::vector<uint8_t> FakeGpu::memory(uint64_t iova, uint64_t length) {
+     return p ? std::vector<uint8_t>(p, p + length) : std::vector<uint8_t>{};
+ }
+ 
++void (*FakeGpu::submitHook)(FakeGpu&, uint64_t, uint32_t, void*) = nullptr;
++void* FakeGpu::submitHookContext = nullptr;
++
+ uint8_t* FakeGpu::at(uint64_t iova, uint64_t length) {
+     for (auto& [handle, b] : buffers_) {
+         if (iova >= b.iova && length <= b.bytes.size() && iova - b.iova <= b.bytes.size() - length) {
+@@ -2555,6 +2558,7 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
+         if (uint64_t(cmd->submit_offset) + cmd->size > c.bytes.size()) return EINVAL;
+         Job job{++submitted_, c.iova + cmd->submit_offset, cmd->size / 4};
+         s->fence = job.fence;
++        if (submitHook != nullptr) submitHook(*this, job.address, job.words, submitHookContext);
+         // (a wedged GPU still takes submissions, as the kernel's ring does until it is full: they are never run)
+         if (wedged_) {
+             return 0;
+diff --git a/hakios-metal/tests/golden.hpp b/hakios-metal/tests/golden.hpp
+new file mode 100644
+index 0000000..0e6be0c
+--- /dev/null
++++ b/hakios-metal/tests/golden.hpp
+@@ -0,0 +1,125 @@
++// Golden streams: every submission the fake GPU is given, summed as it arrives (FakeGpu::submitHook), so that a change
++// meant to leave the command processor's words as they were can be held to that -- word for word.
++//
++//   stream   the words the command processor reads, in the order it reads them: the submission's own and, at each
++//            CP_INDIRECT_BUFFER, the body's (every time it is called). Addresses are words like any other, so a
++//            buffer made earlier, later or at another size shows here.
++//   state    what the indirect loads name: the bytes at each CP_LOAD_STATE6*'s source, as many as it loads (a stage's
++//            program, its constants, the texture, sampler and IBO descriptors of a draw's table) -- the half of a
++//            draw's state that is not in the stream. A source the stream itself fills by CP_MEMCPY before the load
++//            (a constant range bound where the load cannot read) is summed at the copy's own source.
++//
++// Sums, not copies: tests/golden/*.txt holds a line a scene or a test, and `make -f tools/dev.mk check` compares.
++#pragma once
++
++#include <cstdint>
++#include <vector>
++
++#include "hakios-metal/a6xx.hpp"
++#include "hakios-metal/fake_gpu.hpp"
++#include "hakios-metal/pm4.hpp"
++
++namespace golden {
++
++struct Sums {
++    uint64_t stream = 0xcbf29ce484222325ull, state = 0xcbf29ce484222325ull;
++    uint64_t words = 0;                    // read by the command processor, bodies counted each time they are called
++    uint32_t submits = 0, draws = 0, loads = 0;
++    bool bad = false;                      // a header that does not parse, or a body or a load's source outside every buffer
++
++    void reset() { *this = Sums{}; }
++
++private:
++    friend void hook(hakios::metal::FakeGpu&, uint64_t, uint32_t, void*);
++    struct Copy { uint64_t to, from, bytes; };
++    static void mix(uint64_t* h, const void* p, size_t n) {
++        const uint8_t* b = static_cast<const uint8_t*>(p);
++        for (size_t i = 0; i < n; i++) *h = (*h ^ b[i]) * 0x100000001b3ull;
++    }
++    void load(hakios::metal::FakeGpu& gpu, const uint32_t* w, uint32_t count, const std::vector<Copy>& copies) {
++        using namespace hakios::metal::a6xx;
++        if (count < 3) return;
++        const uint32_t type = (w[0] & CP_LOAD_STATE6_0_STATE_TYPE__MASK) >> CP_LOAD_STATE6_0_STATE_TYPE__SHIFT;
++        const uint32_t src = (w[0] & CP_LOAD_STATE6_0_STATE_SRC__MASK) >> CP_LOAD_STATE6_0_STATE_SRC__SHIFT;
++        const uint32_t block = (w[0] & CP_LOAD_STATE6_0_STATE_BLOCK__MASK) >> CP_LOAD_STATE6_0_STATE_BLOCK__SHIFT;
++        const uint32_t units = (w[0] & CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> CP_LOAD_STATE6_0_NUM_UNIT__SHIFT;
++        if (src != SS6_INDIRECT) return;   // (a direct load's words are the stream's)
++        // a unit's bytes: in a texture block ST6_SHADER is samplers (16) and ST6_CONSTANTS texture descriptors (64); in
++        // the 3D IBO block descriptors (64); in a stage's own block ST6_SHADER is instruction groups (128) and
++        // ST6_CONSTANTS vec4s (16)
++        const bool tex = block == SB6_VS_TEX || block == SB6_FS_TEX || block == SB6_CS_TEX;
++        uint64_t unit = 16;
++        if (tex) unit = type == ST6_SHADER ? 16 : 64;
++        else if (block == SB6_IBO || type == ST6_IBO) unit = 64;
++        else if (type == ST6_SHADER) unit = 128;
++        uint64_t at = (uint64_t(w[1]) & ~3ull) | uint64_t(w[2]) << 32;
++        const uint64_t bytes = unit * units;
++        for (auto c = copies.rbegin(); c != copies.rend(); ++c) {
++            if (at >= c->to && at + bytes <= c->to + c->bytes) {
++                at = c->from + (at - c->to);
++                break;
++            }
++        }
++        loads++;
++        mix(&state, w, 4);   // (what is loaded where, without the address)
++        const uint8_t* p = gpu.peek(at, bytes);
++        if (p == nullptr) {
++            bad = true;
++            return;
++        }
++        mix(&state, p, size_t(bytes));
++    }
++    void walk(hakios::metal::FakeGpu& gpu, uint64_t address, uint32_t count, std::vector<Copy>& copies, int depth) {
++        using namespace hakios::metal;
++        const uint8_t* bytes = gpu.peek(address, 4ull * count);
++        if (bytes == nullptr) {
++            bad = true;
++            return;
++        }
++        const uint32_t* w = reinterpret_cast<const uint32_t*>(bytes);
++        words += count;
++        mix(&stream, w, 4ull * count);
++        for (uint32_t i = 0; i < count;) {
++            const pm4::Header h = pm4::decode(w[i]);
++            if (h.kind == pm4::Header::kBad || i + 1 + h.count > count) {
++                bad = true;
++                return;
++            }
++            if (h.kind == pm4::Header::kCommand) {
++                const uint32_t* p = &w[i + 1];
++                switch (h.opcode) {
++                case a6xx::CP_LOAD_STATE6_GEOM: case a6xx::CP_LOAD_STATE6_FRAG: case a6xx::CP_LOAD_STATE6:
++                    load(gpu, p, h.count, copies);
++                    break;
++                case a6xx::CP_DRAW_INDX_OFFSET: case a6xx::CP_DRAW_INDIRECT_MULTI:
++                    draws++;
++                    break;
++                case pm4::kMemcpy:
++                    if (h.count == 5) copies.push_back(Copy{uint64_t(p[3]) | uint64_t(p[4]) << 32, uint64_t(p[1]) | uint64_t(p[2]) << 32, 4ull * p[0]});
++                    break;
++                case pm4::kIndirectBuffer:
++                    if (h.count == 3 && depth < 3) walk(gpu, uint64_t(p[0]) | uint64_t(p[1]) << 32, p[2], copies, depth + 1);
++                    break;
++                default:
++                    break;
++                }
++            }
++            i += 1 + h.count;
++        }
++    }
++};
++
++inline void hook(hakios::metal::FakeGpu& gpu, uint64_t address, uint32_t words, void* context) {
++    Sums& s = *static_cast<Sums*>(context);
++    std::vector<Sums::Copy> copies;
++    s.submits++;
++    s.walk(gpu, address, words, copies, 0);
++}
++
++// every submission to any fake GPU summed into INTO from now on (nullptr: no longer)
++inline void sumInto(Sums* into) {
++    hakios::metal::FakeGpu::submitHookContext = into;
++    hakios::metal::FakeGpu::submitHook = into != nullptr ? hook : nullptr;
++}
++
++}  // namespace golden
+diff --git a/hakios-metal/tests/golden/drawbench-a610.txt b/hakios-metal/tests/golden/drawbench-a610.txt
+new file mode 100644
+index 0000000..7b0e617
+--- /dev/null
++++ b/hakios-metal/tests/golden/drawbench-a610.txt
+@@ -0,0 +1,14 @@
++A draws 20 refused 0 submits 1 words 1417 loads 74 stream b2c12ae2aa0988ff state 711c4414f8362c2d
++B draws 20 refused 0 submits 1 words 1564 loads 74 stream 8c0105df923841a1 state defbd1d5ef1dc40f
++C draws 143 refused 0 submits 1 words 316855 loads 29132 stream f9d212ceffc4be37 state 1faf3491473bbab9
++D draws 143 refused 0 submits 1 words 8077 loads 526 stream 126cb0e0874cf315 state 613b84fbf63951c9
++E draws 143 refused 0 submits 1 words 8656 loads 526 stream 15790af798f14e86 state 947ce2b970b8c58e
++F draws 143 refused 0 submits 4 words 316861 loads 29132 stream 0000000000000000 state 1faf3491473bbab9 (stream by timing: not summed)
++P draws 108 refused 0 submits 1 words 490138 loads 44496 stream f52a4cea1dbac2e4 state 6f09c141e0ccc412
++Q draws 108 refused 0 submits 1 words 779668 loads 44496 stream c628bfb2f3f7bad2 state 23ab55fcc807cf7e
++R draws 108 refused 0 submits 1 words 4939 loads 432 stream acf5e230f050aa3e state f90a178aa327c3f2
++G draws 1 refused 0 submits 1 words 602 loads 4 stream 70b09a33bff42227 state f7616e282bf666a6
++H draws 1 refused 0 submits 1 words 654 loads 4 stream 03f40241a9bc8e8f state f7616e282bf666a6
++J draws 20 refused 0 submits 1 words 1508 loads 76 stream 000c0e69e22f980d state 57cf1cdb921b5d8b
++K draws 110 refused 0 submits 1 words 589118 loads 41612 stream 89d97a513b54a3b2 state 5e258e572c0a06cf
++L draws 110 refused 0 submits 1 words 5953 loads 404 stream 1100c23193797e7b state 32718647260908a1
+diff --git a/hakios-metal/tests/golden/drawbench-a635.txt b/hakios-metal/tests/golden/drawbench-a635.txt
+new file mode 100644
+index 0000000..b674cfb
+--- /dev/null
++++ b/hakios-metal/tests/golden/drawbench-a635.txt
+@@ -0,0 +1,14 @@
++A draws 20 refused 0 submits 1 words 1417 loads 74 stream 6de28c2564e9cb52 state 711c4414f8362c2d
++B draws 20 refused 0 submits 1 words 1564 loads 74 stream 322ebed2ca074410 state defbd1d5ef1dc40f
++C draws 143 refused 0 submits 1 words 74911 loads 6732 stream fe4bb4154c4790dd state c9a9899184d80939
++D draws 143 refused 0 submits 1 words 8077 loads 526 stream dee0f846eccc6025 state 613b84fbf63951c9
++E draws 143 refused 0 submits 1 words 8656 loads 526 stream 89ba1522fc6c7286 state 947ce2b970b8c58e
++F draws 143 refused 0 submits 4 words 74917 loads 6732 stream 0000000000000000 state c9a9899184d80939 (stream by timing: not summed)
++P draws 108 refused 0 submits 1 words 105269 loads 9504 stream 709ed5dd6a0fb726 state ce8538b531f9c505
++Q draws 108 refused 0 submits 1 words 167108 loads 9504 stream db49ac0e1ec16844 state 2de507abf9e8a10d
++R draws 108 refused 0 submits 1 words 4939 loads 432 stream 6d4ca98398d1275f state f90a178aa327c3f2
++G draws 1 refused 0 submits 1 words 602 loads 4 stream d18aa5cbb430bc42 state f7616e282bf666a6
++H draws 1 refused 0 submits 1 words 654 loads 4 stream a2837c99c813e12e state f7616e282bf666a6
++J draws 20 refused 0 submits 1 words 1508 loads 76 stream 8aaeef18eb048fa8 state 57cf1cdb921b5d8b
++K draws 110 refused 0 submits 1 words 126408 loads 8888 stream d2ccbdd9c915e765 state 6e861fe947d21dcd
++L draws 110 refused 0 submits 1 words 5953 loads 404 stream f2223875097b5abe state 32718647260908a1
+diff --git a/hakios-metal/tests/golden/tests-a610.txt b/hakios-metal/tests/golden/tests-a610.txt
+new file mode 100644
+index 0000000..065fae0
+--- /dev/null
++++ b/hakios-metal/tests/golden/tests-a610.txt
+@@ -0,0 +1,292 @@
++a6xx_type7_headers_for_the_dispatch_packets submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_register_offsets_are_mesas submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_sp_cs_ctrl_reg0 submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_hlsq_cs_cntl_constlen submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_sp_cs_ctrl_reg1_shared_and_constlen submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_load_state6_word_0 submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_buffer_ibo_descriptor submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_texture2d_descriptor submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_sampler_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_private_memory_fields_are_scaled submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_dispatch_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_batch_start_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_render_opcodes_events_and_enums submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_render_register_offsets_are_mesas submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_fui_is_the_floats_bits submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_first_draw_target_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_first_draw_pass_and_viewport_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_first_draw_program_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_first_draw_link_and_vfd_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_first_draw_fs_input_output_and_raster_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++c_api_copy_and_callbacks submits 21 words 2070 draws 0 loads 0 stream 47d27f29e65ddf65 state cbf29ce484222325
++c_api_free_inside_its_callback submits 51 words 1152 draws 0 loads 0 stream 8cd1911eeb1da2f1 state cbf29ce484222325
++c_api_fail_ends_in_error submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's compile and dispatch did not run)
++c_api_library_and_kernel submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++c_api_texture_replace_and_read_convert_the_stride submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's texture dispatch did not run)
++c_api_texture_dispatch submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's program and draw did not run)
++c_api_program_and_draw submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's textured draw did not run)
++c_api_draw_with_a_fragment_texture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's vertex texture did not run)
++c_api_draw_with_a_vertex_texture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's depth-only pipeline did not run)
++c_api_pipeline_without_a_fragment_function submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's multisampling did not run)
++c_api_multisample_draw_and_resolve submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++c_api_texture_over_an_iosurface_refuses_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's indexed draw did not run)
++c_api_indexed_draw submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's constexpr sampler draw did not run)
++c_api_draw_with_a_constexpr_sampler submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++c_api_the_device_counts_what_it_has_allocated submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++gpu_params submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++copy_moves_the_bytes submits 1 words 18 draws 0 loads 0 stream 281290c7eda89a58 state cbf29ce484222325
++fill_any_length submits 7 words 602 draws 0 loads 0 stream 68268d095fc7f228 state cbf29ce484222325
++copy_then_fill_in_one_buffer_keeps_order submits 1 words 180 draws 0 loads 0 stream ff31bf186aeac164 state cbf29ce484222325
++unaligned_copies_go_through_the_2d_engine_byte_for_byte submits 1 words 668 draws 0 loads 0 stream 36724c882e159661 state cbf29ce484222325
++copies_outside_a_buffer_and_unaligned_fills_are_refused submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++handlers_run_in_commit_order_while_the_gpu_is_behind submits 40 words 320 draws 0 loads 0 stream f19301abe19692d5 state cbf29ce484222325
++command_memory_is_used_again submits 100 words 10300 draws 0 loads 0 stream a2e9cec2b6fa60d5 state cbf29ce484222325
++buffers_are_given_back submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_bad_stream_is_a_hang_the_kernel_resets_the_gpu_for submits 2 words 2 draws 0 loads 0 stream 8aecc7613026cc32 state cbf29ce484222325 (unread)
++a_command_buffer_behind_a_hang_is_given_up_not_run submits 3 words 207 draws 0 loads 0 stream e5a642e8dfcc148a state cbf29ce484222325 (unread)
++without_recovery_the_first_hang_ends_every_later_wait submits 3 words 105 draws 0 loads 0 stream 9efcf556390aec4c state cbf29ce484222325 (unread)
++a_fence_never_handed_out_is_a_hang submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++big_copies_are_cut_into_packets_the_gpu_takes submits 1 words 1167 draws 0 loads 0 stream fb5fa7318f328cc5 state cbf29ce484222325
++       (no compiler in this build: the fixture comparison did not run)
++compiler_without_mesa_refuses_by_name_and_with_it_matches_the_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the query typing did not run)
++a_size_query_after_a_sample_leaves_the_texture_its_class submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the threadgroup layout did not run)
++a_threadgroup_argument_starts_past_the_static_arrays submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the pointer phis did not run)
++a_pointer_phi_into_one_buffer_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the texture fixture comparison did not run)
++compiler_matches_the_texture_fixtures submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++compiler_refuses_a_declaration_that_disagrees_with_the_instructions submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++compiler_reads_the_image_only_kernel_off_the_nir submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++compiler_reads_the_copy_kernel_off_the_nir submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++compiler_reads_the_sampling_kernel_off_the_nir submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the stage fixture comparison did not run)
++compiler_matches_the_stage_fixtures submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++compiler_refuses_a_kernel_as_a_stage_and_a_stage_as_a_kernel submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the link did not run)
++compiler_links_the_two_programs submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++compiler_link_refuses_what_the_first_draw_does_not_serve submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++compiler_specialises_a_stage_by_the_pipelines_function_constants submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: clz did not run)
++a_kernel_counting_leading_zeros_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_kernel_asking_whether_a_value_is_uniform_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_kernel_packing_halves_into_bytes_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_kernel_whose_pointer_phis_are_undef_over_an_edge_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++an_unwritten_output_is_not_the_position submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_kernel_pushing_ten_constant_ranges_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_kernel_taking_a_ballot_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_kernel_taking_its_execution_width_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_fragment_stage_writing_depth_compiles_and_links submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_dual_source_fragment_stage_compiles_and_links submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: bytes_id did not run)
++a_kernel_taking_a_word_into_bytes_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++argument_buffer_layouts_and_compiles_on_many_threads_agree submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: argument buffer layouts did not run)
++the_layout_of_an_argument_buffer_comes_from_the_metadata submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: argument buffers did not run)
++argument_buffer_members_are_bound_from_the_words_in_their_set submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the constant buffer's known reads did not run)
++a_stage_compiled_for_its_constant_buffer_reads_none_of_it submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_stage_compiled_without_the_preamble_is_taken_only_when_it_spills_less submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the device-buffer writes did not run)
++a_stage_that_writes_its_device_buffers_is_told_from_one_that_reads_them submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the cache did not run)
++a_compiled_stage_comes_back_from_the_cache_and_from_a_seed submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets submits 1 words 109 draws 0 loads 2 stream 3ba56fc66894b149 state 73d60166aefc2a51
++an_indirect_dispatch_reads_its_counts_when_it_runs submits 1 words 178 draws 0 loads 4 stream 2132bf9308916576 state 65ad89869881ce17
++a_dispatch_of_fill_id_holds_together_and_the_fake_does_not_run_it submits 1 words 109 draws 0 loads 2 stream 9fc4f61a00b1bad6 state 73d60166aefc2a51
++a_dispatch_of_end_only_needs_no_buffers submits 1 words 92 draws 0 loads 1 stream 60bd94169b40a116 state fcfa8434f89a7626
++a_dispatch_of_the_air_kernel_uploads_what_ir3_asks_for submits 1 words 133 draws 0 loads 3 stream 0e1b26f03b9f97ac state 8c52fffceb2b5e22
++a_constant_shorter_than_its_pushed_range_is_read_from_the_objects_pages submits 1 words 133 draws 0 loads 3 stream 0e1b26f03b9f97ac state 3d0dc67eca1b1a1c
++a_refused_dispatch_is_left_out_when_the_buffer_skips_refusals submits 1 words 109 draws 0 loads 2 stream 143fbeea2691e626 state 73d60166aefc2a51
++a_dispatch_that_does_not_fit_is_refused_before_anything_reaches_the_gpu submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++the_fake_refuses_a_program_preload_of_128_units submits 1 words 4 draws 0 loads 1 stream e509d397f8d2ce75 state eaed796d1368fce3
++the_fake_refuses_exec_cs_without_a_program submits 1 words 5 draws 0 loads 0 stream bde79d55b57ea77b state cbf29ce484222325
++the_fake_refuses_a_grid_that_does_not_match_the_ndrange submits 1 words 106 draws 0 loads 2 stream 94264af454d382ca state 73d60166aefc2a51
++the_fake_refuses_an_ibo_outside_every_buffer submits 1 words 106 draws 0 loads 2 stream a4b80be3a55d0e62 state 1e92867caca7dcda
++the_fake_refuses_constants_past_constlen submits 1 words 106 draws 0 loads 2 stream ac8876ac2f93648e state 73d60166aefc2a51
++the_fake_refuses_a_wait_that_nothing_satisfies submits 2 words 19 draws 0 loads 0 stream 01e23f9065219321 state cbf29ce484222325
++an_event_with_the_timestamp_bit_writes_a_timestamp_not_the_value submits 2 words 184 draws 0 loads 2 stream 971a7e734fa0670d state e05db0ae225f3b59
++the_fake_refuses_id_registers_whose_two_copies_differ submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_texture_dispatch_that_does_not_fit_is_refused_before_anything_reaches_the_gpu submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_dispatch_of_an_image_only_kernel_puts_a_storage_descriptor_at_ibo_0_and_no_texture_state submits 2 words 258 draws 0 loads 4 stream df018dfd16563d21 state c33297f818ec9d34
++an_image_kernel_stores_into_a_2d_array_or_a_3d_texture_through_a_layered_descriptor submits 2 words 258 draws 0 loads 4 stream ba92eb5e5a069711 state bfea58ec3ed85d91
++a_dispatch_of_tex_copy_loads_the_texture_table_with_a_zero_slot_0_and_one_zero_sampler submits 1 words 145 draws 0 loads 4 stream 81da8c285905eeb6 state 04201b3d52ceed6f
++a_dispatch_of_tex_sample_gid_loads_the_sampler_it_was_given submits 2 words 290 draws 0 loads 8 stream 64b4395488903095 state 54292e7cd3a69e39
++an_image_slot_the_kernel_never_addresses_gets_a_hole_descriptor_over_the_table submits 1 words 142 draws 0 loads 4 stream 64c9a6bc74c199d6 state 89383fb08121181d
++the_fake_refuses_a_texture_count_the_load_does_not_match submits 1 words 142 draws 0 loads 4 stream f646ad7c4bb852a1 state 04201b3d52ceed6f
++the_fake_refuses_a_texture_outside_every_buffer submits 1 words 142 draws 0 loads 4 stream 723285e9cefe6832 state c24f4122720d5804
++the_fake_refuses_a_texture_pitch_shorter_than_a_row submits 2 words 284 draws 0 loads 8 stream eca8400f18b86a6d state 649fac805aae8ead
++the_fake_refuses_a_texture_of_a_format_it_does_not_know submits 1 words 142 draws 0 loads 4 stream 723285e9cefe6832 state 3c2106c02fa7c2d8
++the_fake_refuses_a_texture_load_without_a_sampler submits 1 words 142 draws 0 loads 4 stream bf5189e44a5d18f2 state 2651c0f11da1bbaf
++the_fake_refuses_a_border_clamp_with_the_border_registers_unwritten submits 4 words 560 draws 0 loads 16 stream db2e86a7aaa30a66 state b47e1600d4710e60
++the_fake_refuses_an_image_whose_rows_run_off_its_buffer submits 2 words 252 draws 0 loads 4 stream 4af55c98e65b93a1 state a50a184efce5a965
++the_fake_refuses_a_load_of_ibos_into_the_texture_block submits 1 words 142 draws 0 loads 4 stream 5dda58a575bfadf2 state 2ef53f5fd5ca742f
++the_fake_refuses_a_zero_ibo_descriptor submits 2 words 268 draws 0 loads 6 stream f656501605a3ede5 state 81494f49fbe365ae
++a_dispatch_loads_the_ubo_descriptors_an_ldc_reads_through submits 2 words 228 draws 0 loads 4 stream e5232c3cb200baa8 state 01bfc3782cab1405
++a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround submits 1 words 1127 draws 0 loads 3 stream abcfbe21613cc005 state 32f038a0aab14085
++end_only_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++fill_id_text_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++fill_id_air_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++tex_fill_air_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++tex_fill_h_air_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++tex_copy_air_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++tex_sample_gid_air_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++buffer_kernels_have_no_texture_fields submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++texture_fields_refuse_mutations submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++stage_fixtures_hold_the_kernel_invariants submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++stage_fixtures_carry_what_the_listings_say submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++link_tri_flat_is_the_position_alone submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++link_tri_color_puts_the_varying_first_and_the_position_at_4 submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++link_refuses_a_varying_the_vertex_stage_does_not_write submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++link_refuses_more_varyings_than_the_table_holds submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++metallib_reads_its_functions submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++metallib_universal_takes_air64 submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++metallib_refuses_what_does_not_hold_together submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++parity_is_odd submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++headers_match_mesa submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++decode_round_trips_and_catches_bad_parity submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++long_register_writes_are_cut submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++memcpy_layout_is_mesas submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++render_refuses_what_the_first_draw_does_not_serve_by_name submits 2 words 1380 draws 2 loads 8 stream 33b51a13d8703fc1 state 81caf134c68aec65
++render_encodes_the_first_triangles_registers submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++render_encodes_the_varying_link_of_tri_color submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++render_options_switch_each_group_and_each_alternative submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_draw_of_tri_flat_holds_together_and_the_fake_does_not_rasterize_it submits 1 words 684 draws 1 loads 2 stream ad738dcceee15b05 state cb137a44d958688c
++a_draw_of_tri_color_and_of_the_hand_built_pair_hold_together submits 19 words 12610 draws 20 loads 40 stream 97a2627d6fcff627 state e45debd8551c044d
++the_fake_accepts_the_unmutated_flat_draw_raw submits 1 words 588 draws 1 loads 2 stream 88d5833ff5e74cf3 state cb137a44d958688c
++the_fake_refuses_a_draw_packet_that_is_not_the_three_word_triangle_form submits 6 words 3534 draws 6 loads 12 stream d9a43e4371f6792b state 54e81470edcf5a2d
++the_fake_refuses_a_draw_outside_a_begun_sysmem_pass submits 4 words 2324 draws 4 loads 8 stream a1904a4e17b94404 state 1b6f8d91e4c1b5b5
++the_fake_refuses_a_draw_whose_stages_do_not_hold_together submits 14 words 8182 draws 14 loads 27 stream f47e1fe718011d72 state ed39145395c3f9db
++the_fake_refuses_a_draw_whose_target_does_not_hold_together submits 11 words 6445 draws 11 loads 22 stream 86075b0b8226ea6c state 09bde857f6d3d994
++the_fake_refuses_a_draw_whose_fragment_output_path_is_broken submits 13 words 7605 draws 13 loads 26 stream 95181b179a069e6d state 23940b549448dcbc
++the_fake_refuses_a_draw_whose_viewport_scissors_or_fetch_are_off submits 8 words 4683 draws 8 loads 16 stream 7716f2cbbbb8013a state 29f464ce110bdd85
++the_fake_refuses_a_draw_whose_link_or_fs_inputs_disagree submits 10 words 5832 draws 10 loads 20 stream 65b0c7b19dc169b6 state 38d3788868897e50
++the_fake_refuses_a_draw_with_msaa_without_the_ccu_cntl_or_without_its_flushes submits 11 words 6509 draws 11 loads 22 stream 4eac3e47eae10ac6 state 09bde857f6d3d994
++the_fake_refuses_the_packets_a_draw_stream_may_not_carry submits 7 words 4117 draws 7 loads 14 stream 64f28e0968acf610 state be376c9d3df73fc8
++a_draw_pushes_a_fragment_constant_range_out_of_the_bound_buffer submits 1 words 688 draws 1 loads 3 stream 0c15e9a56d036b92 state 2a4251f1a42f82b4
++a_pushed_range_off_16_bytes_is_copied_by_the_gpu submits 2 words 1384 draws 2 loads 6 stream 025f5c98dd2d175c state 9fa69486849bc4f7
++a_draw_refuses_a_constant_range_it_cannot_serve_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_fragment_stage_that_writes_no_colour_is_drawn_with_nothing_written submits 2 words 1292 draws 2 loads 4 stream 1d6a12ba3c1e5631 state 355edb16f056659d
++a_stage_that_wants_private_memory_gets_the_queues submits 1 words 676 draws 1 loads 2 stream 6c38e368a6edc627 state fec70d1c3dce25f1
++lines_are_drawn_as_the_hardwares_line_list_and_strip submits 2 words 1368 draws 2 loads 4 stream d5d6c38e83a20f2c state b2db15d81d80c4dd
++a_vertex_stage_gets_its_driver_params_every_draw submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_draw_fetches_two_attributes_through_the_vertex_descriptor submits 3 words 1875 draws 3 loads 6 stream 44e549c51632debf state af1beff45cf71e23
++each_vertex_format_family_decodes_as_metal_names_it submits 10 words 6890 draws 10 loads 20 stream f21567615ce204bb state 03c0d49008302f41
++a_draw_refuses_a_vertex_fetch_it_cannot_serve_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_turned_copy_sets_the_2d_rotation_and_takes_the_sides_swapped submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_clear_fills_the_target_through_the_2d_engine_before_the_draw submits 2 words 1210 draws 2 loads 4 stream 0faaebdb1475dc03 state b2db15d81d80c4dd
++a_clear_packs_the_colour_as_each_format_holds_it submits 12 words 3744 draws 0 loads 0 stream a31da06708480455 state cbf29ce484222325
++a_clear_without_a_draw_is_a_pass_of_its_own submits 1 words 312 draws 0 loads 0 stream 9eaeb69087df5c81 state cbf29ce484222325
++a_clear_refuses_a_colour_it_cannot_pack submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++the_fake_refuses_a_fill_whose_registers_do_not_hold_together submits 11 words 3399 draws 0 loads 0 stream b8056cf379419ba7 state cbf29ce484222325
++a_draw_blends_as_the_pipeline_says submits 2 words 1338 draws 2 loads 4 stream 503449ac579256df state b2db15d81d80c4dd
++a_command_buffer_counts_its_passes_and_draws submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_profiled_command_buffer_lists_its_passes submits 1 words 1042 draws 2 loads 4 stream c2b04678c858539e state b2db15d81d80c4dd
++       a draw then the same draw: 565 and 322 words written in full, 551 and 23 deduplicated
++a_draw_in_an_open_pass_leaves_out_registers_already_holding_their_values submits 2 words 1517 draws 4 loads 8 stream d90037349d1b1751 state 1b6f8d91e4c1b5b5
++       a draw with its pass start and end: 588 words, 519 of them register writes; opcode 100 2; opcode 101 2; opcode 20 5; opcode 29 2; opcode 38 3; opcode 50 12; opcode 52 4; opcode 56 4; opcode 60 7; opcode 67 4; opcode 70 20; opcode 99 4
++the_words_of_a_draw_counted submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_draw_refuses_a_blend_it_cannot_serve submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_draw_like_the_last_leaves_out_its_program_and_pass_state submits 2 words 1496 draws 4 loads 14 stream 726221fda4756e0e state bfca4afb33d1aa29
++       (no Mesa in this build: a compressed texture: the UBWC layout is Mesa's, and this build has none; the compressed copy-in did not run)
++a_compressed_texture_is_copied_in_before_a_draw_samples_it_after_its_rows_changed submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_draw_samples_a_texture_through_the_fs_prefetch submits 1 words 699 draws 1 loads 4 stream 68a3cd40f2accd65 state 39f18c791455d198
++a_draw_samples_a_texture_in_the_vertex_stage submits 2 words 1384 draws 2 loads 6 stream d9d1486513c1ccdb state c15bf093ab8c4fb5
++a_draw_refuses_a_texture_the_fs_cannot_sample submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++the_fake_refuses_fs_textures_or_a_prefetch_that_do_not_hold_together submits 9 words 5411 draws 9 loads 34 stream df598d74e9615f30 state 1b7d07060e9b0ded
++a_depth32float_texture_is_tiled_and_an_attachment_only submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_draw_tests_and_writes_depth_through_its_attachment submits 2 words 995 draws 1 loads 2 stream be0ff587bfd611ef state cb137a44d958688c
++a_pass_of_depth_alone_draws_depth submits 1 words 659 draws 1 loads 2 stream fc5a84be53722540 state cb137a44d958688c
++a_draw_refuses_a_depth_setup_it_cannot_serve submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++the_fake_refuses_a_depth_draw_that_does_not_hold_together submits 6 words 3612 draws 6 loads 12 stream fb6fdb5720a37449 state 54e81470edcf5a2d
++a_texture_over_an_iosurface_draws_into_the_surfaces_memory submits 2 words 624 draws 0 loads 0 stream bb9f92ecc7565312 state cbf29ce484222325
++a_two_plane_surface_is_one_ycbcr_texture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_texture_over_an_iosurface_refuses_what_the_gpu_cannot_take submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++an_indexed_draw_is_the_seven_word_form_with_primitive_restart submits 3 words 2079 draws 3 loads 6 stream 7085db4ff12f7e48 state af1beff45cf71e23
++an_indexed_or_instanced_draw_refuses_what_it_cannot_serve submits 1 words 689 draws 1 loads 2 stream 0cf31e6cd3a9b511 state 58699d5de9f40f97
++a_draw_loads_the_ubo_descriptors_an_ldc_reads_through submits 3 words 1950 draws 3 loads 6 stream 88f348539f5bb432 state cbf1a96e2a2cfabb
++a_draw_loads_the_3d_ibo_table_an_ldib_reads_through submits 3 words 1752 draws 3 loads 9 stream 73fcd8ef6be7ef5e state 14cb646489072ce4
++draws_into_the_same_attachments_share_one_pass submits 4 words 5531 draws 10 loads 20 stream 649322a44b42f342 state 12bc3357a14e6a3d
++a_command_buffer_released_in_flight_gives_its_buffers_back submits 51 words 37184 draws 151 loads 302 stream 0000000000000000 state 0000000000000000 (by timing: not summed)
++draws_take_their_tables_and_programs_from_a_few_buffers_and_upload_changed_words_again submits 4 words 5452 draws 122 loads 244 stream 43a2a25b4d422fed state aa418883f5481e7d
++a_draw_binds_the_queues_null_texture_at_the_reserved_slot_over_anything_bound_there submits 2 words 1398 draws 2 loads 8 stream c0c644a04a3601a9 state d520161e911e7cbd
++a_draw_writes_two_colour_targets_each_into_its_own_attachment submits 5 words 4336 draws 7 loads 14 stream 65410993eb01d54a state 4149d82559294f4e
++a_draw_that_reads_its_target_gets_the_target_as_a_texture_and_a_barrier_before_it submits 2 words 1432 draws 4 loads 16 stream a7e5e3799ad7317a state 5192068cf15a6c09
++mip_levels_are_drawn_into_copied_and_generated submits 4 words 3456 draws 1 loads 2 stream 1e1f5d391287c10b state cb137a44d958688c
++a_draw_that_writes_only_color_1_leaves_attachment_0_unwritten submits 1 words 701 draws 1 loads 2 stream f7241d254dfbab31 state 8984d8c1e40a1343
++a_stencil_attachment_is_the_s8_plane_and_its_test_the_draws_state submits 1 words 664 draws 1 loads 2 stream 6cadd47deb574e66 state cb137a44d958688c
++a_program_longer_than_the_instruction_cache_is_preloaded_in_part submits 2 words 1256 draws 2 loads 4 stream 6d115dc8ebdcd8eb state db419c10f101c5d5
++an_occlusion_query_adds_the_draws_samples_to_its_word submits 4 words 2545 draws 4 loads 8 stream 00289b8f8fbe5be5 state 1b6f8d91e4c1b5b5
++a_multisample_pass_draws_under_its_count submits 1 words 579 draws 1 loads 2 stream 1f851c77edd73505 state cb137a44d958688c
++a_multisample_texture_is_cleared_whole_and_resolved_to_the_mean submits 2 words 952 draws 0 loads 0 stream 3c06986946b4c16d state cbf29ce484222325
++a_draw_samples_a_depth_texture_through_a_compare_sampler submits 3 words 1938 draws 3 loads 15 stream 2344b2e9e58f9041 state 6e74c6fd08d15dd3
++a_draw_culls_as_its_cull_mode_and_winding_say submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_draw_into_a_cube_face_aims_at_that_face submits 1 words 684 draws 1 loads 2 stream 7a417738a511b821 state cb137a44d958688c
++a_draw_into_a_depth_mip_level_aims_at_that_level submits 2 words 1318 draws 2 loads 4 stream e05b8a41f67a207c state b2db15d81d80c4dd
++a_vertex_stage_reads_its_constant_table submits 1 words 712 draws 1 loads 2 stream 737260d776b82df1 state 1782243338e5b3cd
++an_indirect_draw_reads_its_arguments_when_it_runs submits 1 words 679 draws 1 loads 2 stream b513ce663acacadb state fec70d1c3dce25f1
++append_runs_another_command_buffers_work_after_this_ones submits 2 words 2704 draws 4 loads 8 stream 33e7a1574ff8845d state 98844b1048b23435
++generate_mipmaps_of_a_cube_makes_each_faces_own_levels submits 1 words 3830 draws 0 loads 0 stream e661984418370fe1 state cbf29ce484222325
++rgb10a2_is_drawn_through_its_own_colour_format submits 3 words 1689 draws 2 loads 4 stream 807f56ef67ef44c6 state b2db15d81d80c4dd
++a_depth_array_is_drawn_layer_by_layer_and_sampled_whole submits 2 words 1318 draws 2 loads 4 stream c36966fecb892f31 state b2db15d81d80c4dd
++a_depth_slice_past_the_layers_is_refused submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_surface_texture_views_in_a_format_of_the_same_size submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_surface_reads_in_the_formats_of_its_fourccs_size submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_wider_format_reads_a_surface_as_fewer_pixels submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       1125x2436 BGRA8Unorm: 2 x 51 tiles of 576 x 48
++       1125x2436 RGBA16Float: 2 x 153 tiles of 576 x 16
++       64x64 RGBA8Unorm: 1 x 1 tiles of 64 x 64
++       2048x100 RGBA8Unorm: 2 x 4 tiles of 1024 x 32
++       17x3 RGBA8Unorm: 1 x 1 tiles of 32 x 16
++the_gmem_plan_fits_the_bins_in_gmem_and_covers_the_target submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_pass_in_gmem_loads_and_stores_every_tile_in_place submits 6 words 45741 draws 214 loads 428 stream da61ec13c7775516 state 7adcb20e6d3073ed
++a_gmem_store_without_its_load_shows submits 1 words 669 draws 1 loads 2 stream d662a41065e4f7b0 state cb137a44d958688c
++a_draw_gmem_cannot_replay_sends_the_pass_to_sysmem submits 1 words 1621 draws 3 loads 6 stream aa1854e12c2b1958 state 6daed77ff6dca4f4
++a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn submits 2 words 268336 draws 1224 loads 2448 stream 73ab71a318183aa9 state afd17ce9ff7829d5
++a_gmem_pass_is_tiled_over_its_render_area submits 1 words 1135 draws 4 loads 8 stream c2fd0ca351cf665f state 1b6f8d91e4c1b5b5
++a_fetch_in_a_corner_reads_bins_of_the_width_its_descriptor_has submits 1 words 1133 draws 2 loads 8 stream 60cc699e7c49898b state f16c719038013b45
++the_queue_picks_gmem_or_sysmem_by_what_each_cost_a_target submits 3 words 1963 draws 3 loads 6 stream fc65fa1453cf2d4a state 6daed77ff6dca4f4
++gmem_for_a_pass_of_enough_draws_decided_at_its_end submits 6 words 4235 draws 11 loads 28 stream 756707daf27964a3 state 1b86c0f68d511005
++a_pass_whose_like_was_light_is_recorded_for_sysmem_alone submits 5 words 3736 draws 32 loads 64 stream 741acb79b011181f state 179f28010791cba5
++a_dontcare_attachment_is_loaded_only_when_the_granules_pass_its_last_row submits 2 words 1353 draws 2 loads 4 stream 1e58b9a3b387a29f state b2db15d81d80c4dd
++a_clear_in_gmem_comes_out_as_the_fill_does submits 8 words 5302 draws 8 loads 16 stream 34a0c296131e86dd state 29f464ce110bdd85
++a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams submits 2 words 14480 draws 90 loads 180 stream 2d2f3874c9b18d2a state 2c0398c8c5da39fd
++a_visibility_stream_overflow_turns_the_binning_off submits 3 words 20919 draws 132 loads 264 stream bbfcfda70222098d state 31a0804e72e2c7b5
++each_profiled_pass_says_why_it_was_drawn_in_sysmem submits 3 words 1867 draws 3 loads 6 stream 4b7078b702ff2658 state 6daed77ff6dca4f4
++texture_pitch_is_mesas_layout_rule submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++texture_make_lays_the_memory_out_and_refuses_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++texture_replace_and_read_convert_the_callers_stride submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++texture_replace_of_a_sub_region_leaves_everything_else_alone submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++texture_descriptors_are_the_worked_example_at_the_textures_address submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++texture_takes_the_render_target_usage_and_its_fields_give_the_mrt_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++sampler_words_follow_galliums_encoding_of_metals_descriptor submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++texture_levels_are_laid_out_as_fdl6_layout_does_it submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++an_astc_texture_is_laid_out_in_blocks submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_3d_texture_is_slices_of_a_2d_layout submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_2d_array_is_layers_of_a_2d_layout submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_cube_is_six_faces_under_the_cube_type submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_multisample_texture_is_its_samples_side_by_side submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_multisample_depth_is_tiled_at_its_samples_cpp submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_texture_view_names_a_level_or_a_slice_of_its_parents_memory submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_textures_plan_is_the_memory_make_gives_it submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_1d_array_is_stored_through_the_2d_image_of_its_layers submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_2d_texture_views_as_an_array_and_a_cube_as_a_cube_array submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++an_etc2_texture_is_laid_out_in_blocks_of_its_size submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++an_array_or_a_cube_with_mip_levels_is_layer_after_layer submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_2d_chain_and_a_depth_buffer_view_as_one_slice_arrays submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++pvrtc_decodes_its_two_colours_its_modulation_and_its_block_order submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_layer_of_a_depth_array_views_as_2d submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_swizzled_view_composes_with_what_its_parent_reads submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_1d_texture_views_as_a_one_slice_1d_array submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_stencil_view_reads_the_s8_plane submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
+diff --git a/hakios-metal/tests/golden/tests-a635.txt b/hakios-metal/tests/golden/tests-a635.txt
+new file mode 100644
+index 0000000..faea75d
+--- /dev/null
++++ b/hakios-metal/tests/golden/tests-a635.txt
+@@ -0,0 +1,292 @@
++a6xx_type7_headers_for_the_dispatch_packets submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_register_offsets_are_mesas submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_sp_cs_ctrl_reg0 submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_hlsq_cs_cntl_constlen submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_sp_cs_ctrl_reg1_shared_and_constlen submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_load_state6_word_0 submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_buffer_ibo_descriptor submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_texture2d_descriptor submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_sampler_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_private_memory_fields_are_scaled submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_dispatch_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_batch_start_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_render_opcodes_events_and_enums submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_render_register_offsets_are_mesas submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_fui_is_the_floats_bits submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_first_draw_target_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_first_draw_pass_and_viewport_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_first_draw_program_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_first_draw_link_and_vfd_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a6xx_first_draw_fs_input_output_and_raster_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++c_api_copy_and_callbacks submits 21 words 2070 draws 0 loads 0 stream 47d27f29e65ddf65 state cbf29ce484222325
++c_api_free_inside_its_callback submits 51 words 1152 draws 0 loads 0 stream 8cd1911eeb1da2f1 state cbf29ce484222325
++c_api_fail_ends_in_error submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's compile and dispatch did not run)
++c_api_library_and_kernel submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++c_api_texture_replace_and_read_convert_the_stride submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's texture dispatch did not run)
++c_api_texture_dispatch submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's program and draw did not run)
++c_api_program_and_draw submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's textured draw did not run)
++c_api_draw_with_a_fragment_texture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's vertex texture did not run)
++c_api_draw_with_a_vertex_texture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's depth-only pipeline did not run)
++c_api_pipeline_without_a_fragment_function submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's multisampling did not run)
++c_api_multisample_draw_and_resolve submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++c_api_texture_over_an_iosurface_refuses_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's indexed draw did not run)
++c_api_indexed_draw submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the C interface's constexpr sampler draw did not run)
++c_api_draw_with_a_constexpr_sampler submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++c_api_the_device_counts_what_it_has_allocated submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++gpu_params submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++copy_moves_the_bytes submits 1 words 18 draws 0 loads 0 stream 281290c7eda89a58 state cbf29ce484222325
++fill_any_length submits 7 words 602 draws 0 loads 0 stream 68268d095fc7f228 state cbf29ce484222325
++copy_then_fill_in_one_buffer_keeps_order submits 1 words 180 draws 0 loads 0 stream ff31bf186aeac164 state cbf29ce484222325
++unaligned_copies_go_through_the_2d_engine_byte_for_byte submits 1 words 668 draws 0 loads 0 stream 4eaa47c2c9714855 state cbf29ce484222325
++copies_outside_a_buffer_and_unaligned_fills_are_refused submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++handlers_run_in_commit_order_while_the_gpu_is_behind submits 40 words 320 draws 0 loads 0 stream f19301abe19692d5 state cbf29ce484222325
++command_memory_is_used_again submits 100 words 10300 draws 0 loads 0 stream a2e9cec2b6fa60d5 state cbf29ce484222325
++buffers_are_given_back submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_bad_stream_is_a_hang_the_kernel_resets_the_gpu_for submits 2 words 2 draws 0 loads 0 stream 8aecc7613026cc32 state cbf29ce484222325 (unread)
++a_command_buffer_behind_a_hang_is_given_up_not_run submits 3 words 207 draws 0 loads 0 stream e5a642e8dfcc148a state cbf29ce484222325 (unread)
++without_recovery_the_first_hang_ends_every_later_wait submits 3 words 105 draws 0 loads 0 stream 9efcf556390aec4c state cbf29ce484222325 (unread)
++a_fence_never_handed_out_is_a_hang submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++big_copies_are_cut_into_packets_the_gpu_takes submits 1 words 1167 draws 0 loads 0 stream fb5fa7318f328cc5 state cbf29ce484222325
++       (no compiler in this build: the fixture comparison did not run)
++compiler_without_mesa_refuses_by_name_and_with_it_matches_the_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the query typing did not run)
++a_size_query_after_a_sample_leaves_the_texture_its_class submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the threadgroup layout did not run)
++a_threadgroup_argument_starts_past_the_static_arrays submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the pointer phis did not run)
++a_pointer_phi_into_one_buffer_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the texture fixture comparison did not run)
++compiler_matches_the_texture_fixtures submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++compiler_refuses_a_declaration_that_disagrees_with_the_instructions submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++compiler_reads_the_image_only_kernel_off_the_nir submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++compiler_reads_the_copy_kernel_off_the_nir submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++compiler_reads_the_sampling_kernel_off_the_nir submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the stage fixture comparison did not run)
++compiler_matches_the_stage_fixtures submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++compiler_refuses_a_kernel_as_a_stage_and_a_stage_as_a_kernel submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the link did not run)
++compiler_links_the_two_programs submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++compiler_link_refuses_what_the_first_draw_does_not_serve submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++compiler_specialises_a_stage_by_the_pipelines_function_constants submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: clz did not run)
++a_kernel_counting_leading_zeros_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_kernel_asking_whether_a_value_is_uniform_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_kernel_packing_halves_into_bytes_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_kernel_whose_pointer_phis_are_undef_over_an_edge_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++an_unwritten_output_is_not_the_position submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_kernel_pushing_ten_constant_ranges_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_kernel_taking_a_ballot_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_kernel_taking_its_execution_width_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_fragment_stage_writing_depth_compiles_and_links submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_dual_source_fragment_stage_compiles_and_links submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: bytes_id did not run)
++a_kernel_taking_a_word_into_bytes_compiles submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++argument_buffer_layouts_and_compiles_on_many_threads_agree submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: argument buffer layouts did not run)
++the_layout_of_an_argument_buffer_comes_from_the_metadata submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: argument buffers did not run)
++argument_buffer_members_are_bound_from_the_words_in_their_set submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the constant buffer's known reads did not run)
++a_stage_compiled_for_its_constant_buffer_reads_none_of_it submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_stage_compiled_without_the_preamble_is_taken_only_when_it_spills_less submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the device-buffer writes did not run)
++a_stage_that_writes_its_device_buffers_is_told_from_one_that_reads_them submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       (no compiler in this build: the cache did not run)
++a_compiled_stage_comes_back_from_the_cache_and_from_a_seed submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets submits 1 words 112 draws 0 loads 2 stream 0459b476d8d32e2f state 73d60166aefc2a51
++an_indirect_dispatch_reads_its_counts_when_it_runs submits 1 words 181 draws 0 loads 4 stream 514a751e163e70ec state 65ad89869881ce17
++a_dispatch_of_fill_id_holds_together_and_the_fake_does_not_run_it submits 1 words 112 draws 0 loads 2 stream efb1320aababb718 state 73d60166aefc2a51
++a_dispatch_of_end_only_needs_no_buffers submits 1 words 95 draws 0 loads 1 stream c24ff6d18a99ab80 state fcfa8434f89a7626
++a_dispatch_of_the_air_kernel_uploads_what_ir3_asks_for submits 1 words 136 draws 0 loads 3 stream 449c19db9735da7e state 8c52fffceb2b5e22
++a_constant_shorter_than_its_pushed_range_is_read_from_the_objects_pages submits 1 words 136 draws 0 loads 3 stream 449c19db9735da7e state 3d0dc67eca1b1a1c
++a_refused_dispatch_is_left_out_when_the_buffer_skips_refusals submits 1 words 112 draws 0 loads 2 stream ee153db4dd4e1278 state 73d60166aefc2a51
++a_dispatch_that_does_not_fit_is_refused_before_anything_reaches_the_gpu submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++the_fake_refuses_a_program_preload_of_128_units submits 1 words 4 draws 0 loads 1 stream e509d397f8d2ce75 state eaed796d1368fce3
++the_fake_refuses_exec_cs_without_a_program submits 1 words 5 draws 0 loads 0 stream bde79d55b57ea77b state cbf29ce484222325
++the_fake_refuses_a_grid_that_does_not_match_the_ndrange submits 1 words 109 draws 0 loads 2 stream 8443117bfa5c7ac4 state 73d60166aefc2a51
++the_fake_refuses_an_ibo_outside_every_buffer submits 1 words 109 draws 0 loads 2 stream 5924ee0ef9b79adc state 1e92867caca7dcda
++the_fake_refuses_constants_past_constlen submits 1 words 109 draws 0 loads 2 stream 291eabda58ccb2e8 state 73d60166aefc2a51
++the_fake_refuses_a_wait_that_nothing_satisfies submits 2 words 19 draws 0 loads 0 stream 01e23f9065219321 state cbf29ce484222325
++an_event_with_the_timestamp_bit_writes_a_timestamp_not_the_value submits 2 words 190 draws 0 loads 2 stream 41e6d3a9fb2ebd49 state e05db0ae225f3b59
++the_fake_refuses_id_registers_whose_two_copies_differ submits 1 words 109 draws 0 loads 2 stream 7a040b8142ec5f80 state 73d60166aefc2a51
++a_texture_dispatch_that_does_not_fit_is_refused_before_anything_reaches_the_gpu submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_dispatch_of_an_image_only_kernel_puts_a_storage_descriptor_at_ibo_0_and_no_texture_state submits 2 words 264 draws 0 loads 4 stream bb3c4485c3ef5501 state c33297f818ec9d34
++an_image_kernel_stores_into_a_2d_array_or_a_3d_texture_through_a_layered_descriptor submits 2 words 264 draws 0 loads 4 stream adb47ccb19eaf3c1 state bfea58ec3ed85d91
++a_dispatch_of_tex_copy_loads_the_texture_table_with_a_zero_slot_0_and_one_zero_sampler submits 1 words 148 draws 0 loads 4 stream 7d80296886cf7580 state 04201b3d52ceed6f
++a_dispatch_of_tex_sample_gid_loads_the_sampler_it_was_given submits 2 words 296 draws 0 loads 8 stream 131d67a4cf994995 state 54292e7cd3a69e39
++an_image_slot_the_kernel_never_addresses_gets_a_hole_descriptor_over_the_table submits 1 words 145 draws 0 loads 4 stream ef92eafd93562be8 state 89383fb08121181d
++the_fake_refuses_a_texture_count_the_load_does_not_match submits 1 words 145 draws 0 loads 4 stream a55280ef45c2facf state 04201b3d52ceed6f
++the_fake_refuses_a_texture_outside_every_buffer submits 1 words 145 draws 0 loads 4 stream b85bad31e27cefa4 state c24f4122720d5804
++the_fake_refuses_a_texture_pitch_shorter_than_a_row submits 2 words 290 draws 0 loads 8 stream 4e595ac125037445 state 649fac805aae8ead
++the_fake_refuses_a_texture_of_a_format_it_does_not_know submits 1 words 145 draws 0 loads 4 stream b85bad31e27cefa4 state 3c2106c02fa7c2d8
++the_fake_refuses_a_texture_load_without_a_sampler submits 1 words 145 draws 0 loads 4 stream 3bcf169bce0462e4 state 2651c0f11da1bbaf
++the_fake_refuses_a_border_clamp_with_the_border_registers_unwritten submits 4 words 572 draws 0 loads 16 stream 1aadf8b3a4ed0e66 state b47e1600d4710e60
++the_fake_refuses_an_image_whose_rows_run_off_its_buffer submits 2 words 258 draws 0 loads 4 stream d0b52bff187a5a91 state a50a184efce5a965
++the_fake_refuses_a_load_of_ibos_into_the_texture_block submits 1 words 145 draws 0 loads 4 stream f6f4a772727c7664 state 2ef53f5fd5ca742f
++the_fake_refuses_a_zero_ibo_descriptor submits 2 words 274 draws 0 loads 6 stream 63c73bc6ec578015 state 81494f49fbe365ae
++a_dispatch_loads_the_ubo_descriptors_an_ldc_reads_through submits 2 words 234 draws 0 loads 4 stream 1c284906c094d544 state 01bfc3782cab1405
++a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround submits 1 words 1130 draws 0 loads 3 stream 8dcbe08bc49a37d2 state 767fa2306040d214
++end_only_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++fill_id_text_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++fill_id_air_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++tex_fill_air_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++tex_fill_h_air_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++tex_copy_air_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++tex_sample_gid_air_fixture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++buffer_kernels_have_no_texture_fields submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++texture_fields_refuse_mutations submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++stage_fixtures_hold_the_kernel_invariants submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++stage_fixtures_carry_what_the_listings_say submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++link_tri_flat_is_the_position_alone submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++link_tri_color_puts_the_varying_first_and_the_position_at_4 submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++link_refuses_a_varying_the_vertex_stage_does_not_write submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++link_refuses_more_varyings_than_the_table_holds submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++metallib_reads_its_functions submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++metallib_universal_takes_air64 submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++metallib_refuses_what_does_not_hold_together submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++parity_is_odd submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++headers_match_mesa submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++decode_round_trips_and_catches_bad_parity submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++long_register_writes_are_cut submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++memcpy_layout_is_mesas submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++render_refuses_what_the_first_draw_does_not_serve_by_name submits 2 words 1380 draws 2 loads 8 stream 4087634dec79238d state 81caf134c68aec65
++render_encodes_the_first_triangles_registers submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++render_encodes_the_varying_link_of_tri_color submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++render_options_switch_each_group_and_each_alternative submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_draw_of_tri_flat_holds_together_and_the_fake_does_not_rasterize_it submits 1 words 684 draws 1 loads 2 stream 5cb91e7c2ec037df state cb137a44d958688c
++a_draw_of_tri_color_and_of_the_hand_built_pair_hold_together submits 19 words 12610 draws 20 loads 40 stream f01c8c70bed3b3b1 state e45debd8551c044d
++the_fake_accepts_the_unmutated_flat_draw_raw submits 1 words 588 draws 1 loads 2 stream 3e6a10a153c92302 state cb137a44d958688c
++the_fake_refuses_a_draw_packet_that_is_not_the_three_word_triangle_form submits 6 words 3534 draws 6 loads 12 stream 7ce5282c0cc93ea7 state 54e81470edcf5a2d
++the_fake_refuses_a_draw_outside_a_begun_sysmem_pass submits 4 words 2324 draws 4 loads 8 stream b86294b161513dc0 state 1b6f8d91e4c1b5b5
++the_fake_refuses_a_draw_whose_stages_do_not_hold_together submits 14 words 8182 draws 14 loads 27 stream 6f79801b8676d5ba state ed39145395c3f9db
++the_fake_refuses_a_draw_whose_target_does_not_hold_together submits 11 words 6445 draws 11 loads 22 stream 9acf632f88d9021d state 09bde857f6d3d994
++the_fake_refuses_a_draw_whose_fragment_output_path_is_broken submits 13 words 7605 draws 13 loads 26 stream fc7bfa1da072db58 state 23940b549448dcbc
++the_fake_refuses_a_draw_whose_viewport_scissors_or_fetch_are_off submits 8 words 4683 draws 8 loads 16 stream 14e9692adadf90da state 29f464ce110bdd85
++the_fake_refuses_a_draw_whose_link_or_fs_inputs_disagree submits 10 words 5832 draws 10 loads 20 stream 1cba6d8ce222dba6 state 38d3788868897e50
++the_fake_refuses_a_draw_with_msaa_without_the_ccu_cntl_or_without_its_flushes submits 11 words 6509 draws 11 loads 22 stream 2108070a8e95a584 state 09bde857f6d3d994
++the_fake_refuses_the_packets_a_draw_stream_may_not_carry submits 7 words 4117 draws 7 loads 14 stream f9aa81f9989e75e9 state be376c9d3df73fc8
++a_draw_pushes_a_fragment_constant_range_out_of_the_bound_buffer submits 1 words 688 draws 1 loads 3 stream d7cc710f48bc405c state 2a4251f1a42f82b4
++a_pushed_range_off_16_bytes_is_copied_by_the_gpu submits 2 words 1384 draws 2 loads 6 stream 3cf7c60365cf8db8 state 9fa69486849bc4f7
++a_draw_refuses_a_constant_range_it_cannot_serve_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_fragment_stage_that_writes_no_colour_is_drawn_with_nothing_written submits 2 words 1292 draws 2 loads 4 stream 0ed4c278dc20d085 state 355edb16f056659d
++a_stage_that_wants_private_memory_gets_the_queues submits 1 words 676 draws 1 loads 2 stream 75d7cb3e37eed4cd state fec70d1c3dce25f1
++lines_are_drawn_as_the_hardwares_line_list_and_strip submits 2 words 1368 draws 2 loads 4 stream f0c6cb7e6a1cc714 state b2db15d81d80c4dd
++a_vertex_stage_gets_its_driver_params_every_draw submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_draw_fetches_two_attributes_through_the_vertex_descriptor submits 3 words 1875 draws 3 loads 6 stream f251df2aa45988fd state af1beff45cf71e23
++each_vertex_format_family_decodes_as_metal_names_it submits 10 words 6890 draws 10 loads 20 stream 557eb1d5bce6c833 state 03c0d49008302f41
++a_draw_refuses_a_vertex_fetch_it_cannot_serve_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_turned_copy_sets_the_2d_rotation_and_takes_the_sides_swapped submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_clear_fills_the_target_through_the_2d_engine_before_the_draw submits 2 words 1210 draws 2 loads 4 stream 0b0a97526713f30b state b2db15d81d80c4dd
++a_clear_packs_the_colour_as_each_format_holds_it submits 12 words 3744 draws 0 loads 0 stream 6ed81c1395b013f9 state cbf29ce484222325
++a_clear_without_a_draw_is_a_pass_of_its_own submits 1 words 312 draws 0 loads 0 stream 15f8026f1d329880 state cbf29ce484222325
++a_clear_refuses_a_colour_it_cannot_pack submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++the_fake_refuses_a_fill_whose_registers_do_not_hold_together submits 11 words 3399 draws 0 loads 0 stream 6cdab99705930c4e state cbf29ce484222325
++a_draw_blends_as_the_pipeline_says submits 2 words 1338 draws 2 loads 4 stream 7dc38e1ec1ee0b07 state b2db15d81d80c4dd
++a_command_buffer_counts_its_passes_and_draws submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_profiled_command_buffer_lists_its_passes submits 1 words 1042 draws 2 loads 4 stream b7f6b4897dbe2749 state b2db15d81d80c4dd
++       a draw then the same draw: 565 and 322 words written in full, 551 and 23 deduplicated
++a_draw_in_an_open_pass_leaves_out_registers_already_holding_their_values submits 2 words 1517 draws 4 loads 8 stream 9f26004ef0651a61 state 1b6f8d91e4c1b5b5
++       a draw with its pass start and end: 588 words, 519 of them register writes; opcode 100 2; opcode 101 2; opcode 20 5; opcode 29 2; opcode 38 3; opcode 50 12; opcode 52 4; opcode 56 4; opcode 60 7; opcode 67 4; opcode 70 20; opcode 99 4
++the_words_of_a_draw_counted submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_draw_refuses_a_blend_it_cannot_serve submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_draw_like_the_last_leaves_out_its_program_and_pass_state submits 2 words 1496 draws 4 loads 14 stream a0927314b42150ba state bfca4afb33d1aa29
++       (no Mesa in this build: a compressed texture: the UBWC layout is Mesa's, and this build has none; the compressed copy-in did not run)
++a_compressed_texture_is_copied_in_before_a_draw_samples_it_after_its_rows_changed submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_draw_samples_a_texture_through_the_fs_prefetch submits 1 words 699 draws 1 loads 4 stream e5efd0eb0719180b state 39f18c791455d198
++a_draw_samples_a_texture_in_the_vertex_stage submits 2 words 1384 draws 2 loads 6 stream e7f6ec525829faeb state c15bf093ab8c4fb5
++a_draw_refuses_a_texture_the_fs_cannot_sample submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++the_fake_refuses_fs_textures_or_a_prefetch_that_do_not_hold_together submits 9 words 5411 draws 9 loads 34 stream aadf2818b6d9ec29 state 1b7d07060e9b0ded
++a_depth32float_texture_is_tiled_and_an_attachment_only submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_draw_tests_and_writes_depth_through_its_attachment submits 2 words 995 draws 1 loads 2 stream 9ded2efcbf7bd79f state cb137a44d958688c
++a_pass_of_depth_alone_draws_depth submits 1 words 659 draws 1 loads 2 stream fd53589d43bfe70d state cb137a44d958688c
++a_draw_refuses_a_depth_setup_it_cannot_serve submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++the_fake_refuses_a_depth_draw_that_does_not_hold_together submits 6 words 3612 draws 6 loads 12 stream c4340e836b3eeee9 state 54e81470edcf5a2d
++a_texture_over_an_iosurface_draws_into_the_surfaces_memory submits 2 words 624 draws 0 loads 0 stream 5ab1b1a1cde14512 state cbf29ce484222325
++a_two_plane_surface_is_one_ycbcr_texture submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_texture_over_an_iosurface_refuses_what_the_gpu_cannot_take submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++an_indexed_draw_is_the_seven_word_form_with_primitive_restart submits 3 words 2079 draws 3 loads 6 stream 59553d81950982ce state af1beff45cf71e23
++an_indexed_or_instanced_draw_refuses_what_it_cannot_serve submits 1 words 689 draws 1 loads 2 stream 27af40ab9bfe7c67 state 58699d5de9f40f97
++a_draw_loads_the_ubo_descriptors_an_ldc_reads_through submits 3 words 1950 draws 3 loads 6 stream 78b0be44c726a793 state cbf1a96e2a2cfabb
++a_draw_loads_the_3d_ibo_table_an_ldib_reads_through submits 3 words 1752 draws 3 loads 9 stream c43d45ef50889b8b state 14cb646489072ce4
++draws_into_the_same_attachments_share_one_pass submits 4 words 5531 draws 10 loads 20 stream 2d244476da693d4e state 12bc3357a14e6a3d
++a_command_buffer_released_in_flight_gives_its_buffers_back submits 51 words 37184 draws 151 loads 302 stream 0000000000000000 state 0000000000000000 (by timing: not summed)
++draws_take_their_tables_and_programs_from_a_few_buffers_and_upload_changed_words_again submits 4 words 5452 draws 122 loads 244 stream c5d54b4cf4ad1ac1 state aa418883f5481e7d
++a_draw_binds_the_queues_null_texture_at_the_reserved_slot_over_anything_bound_there submits 2 words 1398 draws 2 loads 8 stream 00589408667cf061 state d520161e911e7cbd
++a_draw_writes_two_colour_targets_each_into_its_own_attachment submits 5 words 4336 draws 7 loads 14 stream 28074839119657d9 state 4149d82559294f4e
++a_draw_that_reads_its_target_gets_the_target_as_a_texture_and_a_barrier_before_it submits 2 words 1432 draws 4 loads 16 stream d13a09cb5d99444d state fd0786e6f63b8aa9
++mip_levels_are_drawn_into_copied_and_generated submits 4 words 3456 draws 1 loads 2 stream f60d3abf44cb0353 state cb137a44d958688c
++a_draw_that_writes_only_color_1_leaves_attachment_0_unwritten submits 1 words 701 draws 1 loads 2 stream a67a85fa83449979 state 8984d8c1e40a1343
++a_stencil_attachment_is_the_s8_plane_and_its_test_the_draws_state submits 1 words 664 draws 1 loads 2 stream e0746650d7dfb3b7 state cb137a44d958688c
++a_program_longer_than_the_instruction_cache_is_preloaded_in_part submits 2 words 1256 draws 2 loads 4 stream 94f00222f870a0bd state b9b7f16a46e9b608
++an_occlusion_query_adds_the_draws_samples_to_its_word submits 4 words 2545 draws 4 loads 8 stream 1389ba39f0a47e9e state 1b6f8d91e4c1b5b5
++a_multisample_pass_draws_under_its_count submits 1 words 579 draws 1 loads 2 stream 46d47072494972ac state cb137a44d958688c
++a_multisample_texture_is_cleared_whole_and_resolved_to_the_mean submits 2 words 952 draws 0 loads 0 stream c10ff337edaa1590 state cbf29ce484222325
++a_draw_samples_a_depth_texture_through_a_compare_sampler submits 3 words 1938 draws 3 loads 15 stream 3c6062821573111b state 6e74c6fd08d15dd3
++a_draw_culls_as_its_cull_mode_and_winding_say submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_draw_into_a_cube_face_aims_at_that_face submits 1 words 684 draws 1 loads 2 stream b555efaa39e408e3 state cb137a44d958688c
++a_draw_into_a_depth_mip_level_aims_at_that_level submits 2 words 1318 draws 2 loads 4 stream e21ef62209586014 state b2db15d81d80c4dd
++a_vertex_stage_reads_its_constant_table submits 1 words 712 draws 1 loads 2 stream 5ad91c298dba14ff state 1782243338e5b3cd
++an_indirect_draw_reads_its_arguments_when_it_runs submits 1 words 679 draws 1 loads 2 stream 5d066884dfde2a09 state fec70d1c3dce25f1
++append_runs_another_command_buffers_work_after_this_ones submits 2 words 2704 draws 4 loads 8 stream 41810589042d14d5 state 98844b1048b23435
++generate_mipmaps_of_a_cube_makes_each_faces_own_levels submits 1 words 3830 draws 0 loads 0 stream fc4d588c7f05f1d1 state cbf29ce484222325
++rgb10a2_is_drawn_through_its_own_colour_format submits 3 words 1689 draws 2 loads 4 stream 0e1fb56e5c420747 state b2db15d81d80c4dd
++a_depth_array_is_drawn_layer_by_layer_and_sampled_whole submits 2 words 1318 draws 2 loads 4 stream d54d2f20dee12d85 state b2db15d81d80c4dd
++a_depth_slice_past_the_layers_is_refused submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_surface_texture_views_in_a_format_of_the_same_size submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_surface_reads_in_the_formats_of_its_fourccs_size submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_wider_format_reads_a_surface_as_fewer_pixels submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++       1125x2436 BGRA8Unorm: 2 x 12 tiles of 576 x 208
++       1125x2436 RGBA16Float: 2 x 26 tiles of 576 x 96
++       64x64 RGBA8Unorm: 1 x 1 tiles of 64 x 64
++       2048x100 RGBA8Unorm: 2 x 1 tiles of 1024 x 112
++       17x3 RGBA8Unorm: 1 x 1 tiles of 32 x 16
++the_gmem_plan_fits_the_bins_in_gmem_and_covers_the_target submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_pass_in_gmem_loads_and_stores_every_tile_in_place submits 6 words 13449 draws 58 loads 116 stream 8fc846bebd93cf25 state 70b05ed0e66ed57d
++a_gmem_store_without_its_load_shows submits 1 words 669 draws 1 loads 2 stream 71a1ea9c92722d5e state cb137a44d958688c
++a_draw_gmem_cannot_replay_sends_the_pass_to_sysmem submits 1 words 1621 draws 3 loads 6 stream 7784410851d68867 state 6daed77ff6dca4f4
++a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn submits 2 words 46086 draws 208 loads 416 stream c7e2e522dcd691ad state 609065a46d12d745
++a_gmem_pass_is_tiled_over_its_render_area submits 1 words 714 draws 2 loads 4 stream 896cddea85218c74 state b2db15d81d80c4dd
++a_fetch_in_a_corner_reads_bins_of_the_width_its_descriptor_has submits 1 words 713 draws 1 loads 4 stream 81ff037a2f426069 state accb62ce2869ae1b
++the_queue_picks_gmem_or_sysmem_by_what_each_cost_a_target submits 3 words 1963 draws 3 loads 6 stream 2a2200ea517c691b state 6daed77ff6dca4f4
++gmem_for_a_pass_of_enough_draws_decided_at_its_end submits 6 words 4235 draws 11 loads 28 stream 4eae8fc58ce2a337 state 44e549e09cea1985
++a_pass_whose_like_was_light_is_recorded_for_sysmem_alone submits 5 words 3736 draws 32 loads 64 stream 4aba82bef7c44036 state 179f28010791cba5
++a_dontcare_attachment_is_loaded_only_when_the_granules_pass_its_last_row submits 2 words 1353 draws 2 loads 4 stream 41847c8a56cf0cf3 state b2db15d81d80c4dd
++a_clear_in_gmem_comes_out_as_the_fill_does submits 8 words 5302 draws 8 loads 16 stream 35d6a13df4462175 state 29f464ce110bdd85
++a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams submits 2 words 5232 draws 30 loads 60 stream e6ccaa499e1e026e state ec11bedfb1e9734d
++a_visibility_stream_overflow_turns_the_binning_off submits 3 words 7281 draws 42 loads 84 stream a10b70f57eb5313f state a1ca9d874ad3dcbd
++each_profiled_pass_says_why_it_was_drawn_in_sysmem submits 3 words 1867 draws 3 loads 6 stream b911ba4b51bf9332 state 6daed77ff6dca4f4
++texture_pitch_is_mesas_layout_rule submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++texture_make_lays_the_memory_out_and_refuses_by_name submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++texture_replace_and_read_convert_the_callers_stride submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++texture_replace_of_a_sub_region_leaves_everything_else_alone submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++texture_descriptors_are_the_worked_example_at_the_textures_address submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++texture_takes_the_render_target_usage_and_its_fields_give_the_mrt_words submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++sampler_words_follow_galliums_encoding_of_metals_descriptor submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++texture_levels_are_laid_out_as_fdl6_layout_does_it submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++an_astc_texture_is_laid_out_in_blocks submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_3d_texture_is_slices_of_a_2d_layout submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_2d_array_is_layers_of_a_2d_layout submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_cube_is_six_faces_under_the_cube_type submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_multisample_texture_is_its_samples_side_by_side submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_multisample_depth_is_tiled_at_its_samples_cpp submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_texture_view_names_a_level_or_a_slice_of_its_parents_memory submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_textures_plan_is_the_memory_make_gives_it submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_1d_array_is_stored_through_the_2d_image_of_its_layers submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_2d_texture_views_as_an_array_and_a_cube_as_a_cube_array submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++an_etc2_texture_is_laid_out_in_blocks_of_its_size submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++an_array_or_a_cube_with_mip_levels_is_layer_after_layer submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_2d_chain_and_a_depth_buffer_view_as_one_slice_arrays submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++pvrtc_decodes_its_two_colours_its_modulation_and_its_block_order submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_layer_of_a_depth_array_views_as_2d submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_swizzled_view_composes_with_what_its_parent_reads submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_1d_texture_views_as_a_one_slice_1d_array submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
++a_stencil_view_reads_the_s8_plane submits 0 words 0 draws 0 loads 0 stream 0000000000000000 state 0000000000000000
+diff --git a/hakios-metal/tests/main.cpp b/hakios-metal/tests/main.cpp
+index bd037ec..a4e6e6b 100644
+--- a/hakios-metal/tests/main.cpp
++++ b/hakios-metal/tests/main.cpp
+@@ -1,18 +1,44 @@
+ #include <cstring>
+ 
++#include "golden.hpp"
+ #include "test.hpp"
+ 
++// tests [--golden] [NAME]: every test whose name holds NAME. With --golden, instead of the verdicts, what each test
++// submitted to the fake GPU, summed (golden.hpp): a line a test, compared with tests/golden/tests-<chip>.txt by
++// `make -f tools/dev.mk check`.
+ int main(int argc, char** argv) {
+     int ran = 0;
++    bool sums = false;
++    const char* only = nullptr;
++    for (int i = 1; i < argc; i++) {
++        if (strcmp(argv[i], "--golden") == 0) sums = true;
++        else only = argv[i];
++    }
++    golden::Sums s;
++    if (sums) golden::sumInto(&s);
++    // tests whose submissions depend on which thread got there first (a command buffer let go while the GPU has it:
++    // whether its memory is back in the queue's pools when the next one asks is the race the test is about), so that
++    // the addresses in their streams differ from run to run: counted, not summed
++    static const char* const kTimed[] = {"a_command_buffer_released_in_flight_gives_its_buffers_back"};
+     for (const test::Case& c : test::cases()) {
+-        if (argc > 1 && strstr(c.name, argv[1]) == nullptr) {
++        if (only != nullptr && strstr(c.name, only) == nullptr) {
+             continue;
+         }
+         int before = test::failures();
++        s.reset();
+         c.run();
+-        std::printf("%s %s\n", test::failures() == before ? "ok  " : "FAIL", c.name);
++        if (sums) {
++            bool timed = false;
++            for (const char* t : kTimed) timed |= strcmp(t, c.name) == 0;
++            // (a test that submits nothing says so with zeros: its line still tells a test added or taken away)
++            std::printf("%s submits %u words %llu draws %u loads %u stream %016llx state %016llx%s%s\n", c.name, s.submits, (unsigned long long)s.words, s.draws,
++                        s.loads, (unsigned long long)(s.submits && !timed ? s.stream : 0), (unsigned long long)(s.submits && !timed ? s.state : 0),
++                        s.bad ? " (unread)" : "", timed ? " (by timing: not summed)" : "");
++        } else {
++            std::printf("%s %s\n", test::failures() == before ? "ok  " : "FAIL", c.name);
++        }
+         ran++;
+     }
+-    std::printf("%d tests, %d failed checks\n", ran, test::failures());
++    if (!sums) std::printf("%d tests, %d failed checks\n", ran, test::failures());
+     return test::failures() == 0 ? 0 : 1;
+ }
+diff --git a/hakios-metal/tools/dev.mk b/hakios-metal/tools/dev.mk
+new file mode 100644
+index 0000000..b8fe8ee
+--- /dev/null
++++ b/hakios-metal/tools/dev.mk
+@@ -0,0 +1,53 @@
++# tools/dev.mk: the host tests and drawbench built object by object and in parallel, for either chip's constants
++# (the Makefile's own `make test` compiles every source in one compiler run, a minute each time).
++#
++#   make -f tools/dev.mk -j4 [CHIP=a635|a610] [OPT="-O2 -g"] tests       out/dev-$(CHIP)/tests
++#   make -f tools/dev.mk -j4 [CHIP=...] drawbench                       out/dev-$(CHIP)/drawbench (tools/drawbench.cpp)
++#   make -f tools/dev.mk -j4 [CHIP=...] check                           the tests, then the golden streams (tests/golden/)
++#   make -f tools/dev.mk -j4 [CHIP=...] golden                          write the golden streams again (a change of the stream, said in its commit)
++#
++# CHIP=a610 builds with -DHAKIOS_CHIP_A610, the constants the phone's bundle is built with (make ios CHIP=a610).
++CHIP ?= a635
++CXX  ?= c++
++OPT  ?= -O2 -g
++OUT   = out/dev-$(CHIP)
++DEFS  = $(if $(filter a610,$(CHIP)),-DHAKIOS_CHIP_A610)
++CXXFLAGS = $(OPT) -std=c++17 -Wall -Wextra -Werror -Iinclude $(DEFS) -MMD -MP
++
++CORE  = pm4 gpu command compute texture render link compiler metallib c_api fake_gpu
++TESTS = $(basename $(notdir $(wildcard tests/*_test.cpp))) main
++
++CORE_O = $(CORE:%=$(OUT)/obj/src/%.o)
++TEST_O = $(TESTS:%=$(OUT)/obj/tests/%.o)
++
++.PHONY: tests drawbench check golden
++tests: $(OUT)/tests
++drawbench: $(OUT)/drawbench
++
++$(OUT)/obj/src/%.o: src/%.cpp
++	@mkdir -p $(dir $@)
++	$(CXX) $(CXXFLAGS) -c -o $@ $<
++$(OUT)/obj/tests/%.o: tests/%.cpp
++	@mkdir -p $(dir $@)
++	$(CXX) $(CXXFLAGS) -Itests -c -o $@ $<
++$(OUT)/obj/tools/%.o: tools/%.cpp
++	@mkdir -p $(dir $@)
++	$(CXX) $(CXXFLAGS) -Itests -c -o $@ $<
++$(OUT)/tests: $(CORE_O) $(TEST_O)
++	$(CXX) $(OPT) -pthread -o $@ $^
++$(OUT)/drawbench: $(CORE_O) $(OUT)/obj/tools/drawbench.o
++	$(CXX) $(OPT) -pthread -o $@ $^
++
++# the golden streams: every scene of drawbench and every test's submissions, word for word what they were when
++# tests/golden/ was written (drawbench --golden, tests --golden)
++check: $(OUT)/tests $(OUT)/drawbench
++	$(OUT)/tests > $(OUT)/tests.log 2>&1; tail -1 $(OUT)/tests.log; grep -q ' 0 failed checks' $(OUT)/tests.log
++	$(OUT)/drawbench --golden | diff -u tests/golden/drawbench-$(CHIP).txt -
++	$(OUT)/tests --golden | diff -u tests/golden/tests-$(CHIP).txt -
++	@echo "golden streams: the same ($(CHIP))"
++golden: $(OUT)/tests $(OUT)/drawbench
++	@mkdir -p tests/golden
++	$(OUT)/drawbench --golden > tests/golden/drawbench-$(CHIP).txt
++	$(OUT)/tests --golden > tests/golden/tests-$(CHIP).txt
++
++-include $(CORE_O:.o=.d) $(TEST_O:.o=.d) $(OUT)/obj/tools/drawbench.d
+diff --git a/hakios-metal/tools/drawbench.cpp b/hakios-metal/tools/drawbench.cpp
+new file mode 100644
+index 0000000..4bbf198
+--- /dev/null
++++ b/hakios-metal/tools/drawbench.cpp
+@@ -0,0 +1,922 @@
++// drawbench: what recording a compositor's frame costs this driver's CPU, on the fake GPU -- and, word for word, what
++// it records (the golden streams, tests/golden.hpp).
++//
++//   drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv]     the measurements
++//   drawbench --golden                                                                     each scene's sums, nothing else
++//
++// The scenes are frames a window server draws, at the phone's size (750 x 1624):
++//   A B C D E F P Q R G H   the core's own interface (CommandBuffer::draw) with hand-made Programs: the scenes of the
++//                           performance audit (ios-sapphire dev-notes/investigacion/10, its framecount), kept as they were
++//   J K L                   the C interface the plug-in drives (hakios_metal_cb_draw3 / _draw_indexed) with linked
++//                           programs: vertex buffers and an index buffer, uniforms bound at multiples of 8, a stage that
++//                           declares ten texture slots and binds one, framebuffer fetches, two colour outputs, the
++//                           programs changing from draw to draw as a compositor's layers change them
++//   S T                     with --stages DIR: the same through the C interface with the stages of a phone's own cache
++//                           (<DIR>/*.stage, compiler.cpp's stageCacheSave: CoreAnimation's functions as the driver
++//                           compiled them there), every vertex stage linked with every fragment stage that links
++// Each scene is recorded once to warm the queue's pools, then N times measured (--runs, 5): the time inside the draw
++// calls alone, a draw; the heap allocations in them; the words the command processor is given.
++// --cold KB touches KB kilobytes before each draw, so that a draw starts with as little in the processor's caches as
++// the window server's own work between two draws leaves it (the host's caches hold the whole driver otherwise, which
++// is not what the phone's do).
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <dirent.h>
++#include <map>
++#include <memory>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "golden.hpp"
++#include "hakios-metal/a6xx.hpp"
++#include "hakios-metal/command.hpp"
++#include "hakios-metal/fake_gpu.hpp"
++#include "hakios-metal/hakios_metal.h"
++#include "hakios-metal/render.hpp"
++#include "hakios-metal/testing.hpp"
++#include "hakios-metal/texture.hpp"
++#include "fixtures/tri_attr_vs_air.hpp"
++#include "fixtures/tri_cflat_fs_air.hpp"
++#include "fixtures/tri_color_vs_air.hpp"
++#include "fixtures/tri_fb_fs_air.hpp"
++#include "fixtures/tri_flat_fs_air.hpp"
++#include "fixtures/tri_flat_vs_air.hpp"
++#include "fixtures/tri_mrt_fs_air.hpp"
++#include "fixtures/tri_tex39_fs_air.hpp"
++#include "fixtures/tri_tex_fs_air.hpp"
++
++using namespace hakios::metal;
++namespace kernels = hakios::metal::kernels;
++
++// every heap allocation of the process, counted (operator new is what std::vector, std::string and make_shared use)
++static std::atomic<uint64_t> gAllocs{0}, gAllocBytes{0};
++void* operator new(size_t n) {
++    gAllocs.fetch_add(1, std::memory_order_relaxed);
++    gAllocBytes.fetch_add(n, std::memory_order_relaxed);
++    void* p = malloc(n ? n : 1);
++    if (p == nullptr) abort();
++    return p;
++}
++void operator delete(void* p) noexcept { free(p); }
++void operator delete(void* p, size_t) noexcept { free(p); }
++
++namespace {
++
++// --- what is asked -------------------------------------------------------------------------------------------------
++struct Asked {
++    bool golden = false, hist = false, csv = false;
++    uint32_t runs = 5;
++    size_t coldBytes = 0;
++    std::string scenes, stages;
++} asked;
++
++uint64_t nowNs() { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
++
++// --cold: the caches emptied of the driver before a draw, by touching this much of something else
++std::vector<uint8_t> gCold;
++void chill() {
++    if (asked.coldBytes == 0) return;
++    if (gCold.size() != asked.coldBytes) gCold.assign(asked.coldBytes, 1);
++    uint8_t* p = gCold.data();
++    for (size_t i = 0; i < gCold.size(); i += 64) p[i]++;
++}
++
++// Between two frames: the queue's thread puts a completed command buffer's stream memory back after the waiters are
++// woken (CommandQueue::waiter), and a frame that commits before it has makes a new one -- which moves every address
++// handed out after it. A frame of the window server comes milliseconds later; here it is waited for, so that the
++// streams are the same every run.
++void settle() { std::this_thread::sleep_for(std::chrono::milliseconds(asked.golden ? 4 : 1)); }
++
++// one frame's draw calls, timed one by one (the chill between them is not theirs)
++struct Clock {
++    uint64_t ns = 0, allocs = 0, allocBytes = 0;
++    uint32_t draws = 0;
++    uint64_t t0 = 0, a0 = 0, b0 = 0;
++    void begin() {
++        chill();
++        a0 = gAllocs.load(std::memory_order_relaxed);
++        b0 = gAllocBytes.load(std::memory_order_relaxed);
++        t0 = nowNs();
++    }
++    void end() {
++        ns += nowNs() - t0;
++        allocs += gAllocs.load(std::memory_order_relaxed) - a0;
++        allocBytes += gAllocBytes.load(std::memory_order_relaxed) - b0;
++        draws++;
++    }
++};
++// what two readings of the clock around nothing cost, taken off every draw's time
++double clockNs() {
++    static double cost = -1;
++    if (cost < 0) {
++        uint64_t best = ~0ull;
++        for (int k = 0; k < 2000; k++) {
++            const uint64_t a = nowNs(), b = nowNs();
++            best = std::min(best, b - a);
++        }
++        cost = double(best);
++    }
++    return cost;
++}
++
++struct Result {
++    std::string letter, name;
++    uint32_t draws = 0;
++    std::vector<double> usPerDraw;       // one a measured frame
++    double allocsPerDraw = 0, allocBytesPerDraw = 0;
++    std::vector<double> commitUs;        // closing the last pass, the submission
++    golden::Sums sums;                   // the last measured frame's submissions
++    uint32_t refused = 0;
++    std::string error;
++};
++std::vector<Result> gResults;
++
++double median(std::vector<double> v) {
++    if (v.empty()) return 0;
++    std::sort(v.begin(), v.end());
++    return v.size() % 2 ? v[v.size() / 2] : 0.5 * (v[v.size() / 2 - 1] + v[v.size() / 2]);
++}
++
++bool wanted(const char* letter) { return asked.scenes.empty() || asked.scenes.find(letter) != std::string::npos; }
++
++// --- the packets of a frame, by kind (--hist) -----------------------------------------------------------------------
++struct Histogram {
++    std::map<std::string, uint64_t> n;
++    uint64_t words = 0, regPackets = 0, regWords = 0;
++};
++Histogram gHist;
++const char* opcodeName(uint32_t op) {
++    using namespace a6xx;
++    switch (op) {
++    case pm4::kNop: return "CP_NOP";
++    case pm4::kWaitMemWrites: return "CP_WAIT_MEM_WRITES";
++    case pm4::kWaitForMe: return "CP_WAIT_FOR_ME";
++    case pm4::kWaitForIdle: return "CP_WAIT_FOR_IDLE";
++    case pm4::kMemWrite: return "CP_MEM_WRITE";
++    case pm4::kIndirectBuffer: return "CP_INDIRECT_BUFFER";
++    case pm4::kMemcpy: return "CP_MEMCPY";
++    case CP_SET_BIN_DATA5: return "CP_SET_BIN_DATA5";
++    case CP_SET_BIN_DATA5_OFFSET: return "CP_SET_BIN_DATA5_OFFSET";
++    case CP_COND_WRITE5: return "CP_COND_WRITE5";
++    case CP_WAIT_MEM_GTE: return "CP_WAIT_MEM_GTE";
++    case CP_SKIP_IB2_ENABLE_GLOBAL: return "CP_SKIP_IB2_ENABLE_GLOBAL";
++    case CP_BLIT: return "CP_BLIT";
++    case CP_LOAD_STATE6_GEOM: return "CP_LOAD_STATE6_GEOM";
++    case CP_LOAD_STATE6_FRAG: return "CP_LOAD_STATE6_FRAG";
++    case CP_LOAD_STATE6: return "CP_LOAD_STATE6";
++    case CP_DRAW_INDX_OFFSET: return "CP_DRAW_INDX_OFFSET";
++    case CP_DRAW_INDIRECT_MULTI: return "CP_DRAW_INDIRECT_MULTI";
++    case CP_WAIT_REG_MEM: return "CP_WAIT_REG_MEM";
++    case CP_REG_TO_MEM: return "CP_REG_TO_MEM";
++    case CP_SET_DRAW_STATE: return "CP_SET_DRAW_STATE";
++    case CP_EVENT_WRITE: return "CP_EVENT_WRITE";
++    case CP_SET_MODE: return "CP_SET_MODE";
++    case CP_SET_VISIBILITY_OVERRIDE: return "CP_SET_VISIBILITY_OVERRIDE";
++    case CP_SET_MARKER: return "CP_SET_MARKER";
++    case CP_MEM_TO_MEM: return "CP_MEM_TO_MEM";
++    default: return "type-7 other";
++    }
++}
++void histWalk(FakeGpu& gpu, uint64_t address, uint32_t count, int depth) {
++    const uint8_t* bytes = gpu.peek(address, 4ull * count);
++    if (bytes == nullptr) return;
++    const uint32_t* w = reinterpret_cast<const uint32_t*>(bytes);
++    gHist.words += count;
++    for (uint32_t i = 0; i < count;) {
++        const pm4::Header h = pm4::decode(w[i]);
++        if (h.kind == pm4::Header::kBad) return;
++        if (h.kind == pm4::Header::kRegisters) {
++            gHist.regPackets++;
++            gHist.regWords += h.count;
++        } else {
++            gHist.n[opcodeName(h.opcode)]++;
++            if (h.opcode == pm4::kIndirectBuffer && h.count == 3 && depth < 3) {
++                histWalk(gpu, uint64_t(w[i + 1]) | uint64_t(w[i + 2]) << 32, w[i + 3], depth + 1);
++            }
++        }
++        i += 1 + h.count;
++    }
++}
++golden::Sums gSums;
++void onSubmit(FakeGpu& gpu, uint64_t address, uint32_t words, void*) {
++    golden::hook(gpu, address, words, &gSums);
++    if (asked.hist) histWalk(gpu, address, words, 0);
++}
++
++// ====================================================================================================================
++// The core's interface: the audit's scenes
++// ====================================================================================================================
++struct Rig {
++    Rig() {
++        auto t = std::make_unique<FakeGpu>();
++        fake = t.get();
++        gpu = std::make_unique<Gpu>(std::move(t));
++        std::string why;
++        queue = CommandQueue::make(*gpu, &why);
++    }
++    FakeGpu* fake;
++    std::unique_ptr<Gpu> gpu;
++    std::unique_ptr<CommandQueue> queue;
++};
++
++std::shared_ptr<Texture> texture(Rig& r, uint32_t w, uint32_t h, uint32_t usage, PixelFormat f = PixelFormat::kBGRA8Unorm) {
++    TextureDesc d;
++    d.format = f;
++    d.width = w;
++    d.height = h;
++    d.usage = usage;
++    std::string why;
++    auto t = Texture::make(*r.gpu, d, &why);
++    if (t == nullptr) std::printf("texture %ux%u: %s\n", w, h, why.c_str());
++    return t;
++}
++
++// the command buffer as the CoreAnimation plug-in sets one up with no metal_* boot-arg (HakiosMetalCA.m: -initWithQueue:)
++std::shared_ptr<CommandBuffer> pluginBuffer(Rig& r, bool gmem) {
++    auto cb = r.queue->commandBuffer();
++    cb->setSkipRefused(true);
++    cb->setProfile(false);
++    cb->setGmem(gmem);
++    cb->setGmemMinDraws(gmem ? 56 : 0);
++    cb->setGmemBinning(true);
++    cb->setNullFsTextures(false);
++    cb->setGmemOff(0);
++    cb->setGmemTuned(true);
++    cb->setProfileDraws(false);
++    return cb;
++}
++
++struct Scene {
++    const char* letter;
++    const char* name;
++    uint32_t draws;          // draws of the main pass: textured ones first, then FETCH, then UNIFORM
++    uint32_t fetch;          // ...of which read their target (framebuffer fetch)
++    uint32_t uniform;        // ...of which read a constant buffer bound at a multiple of 8 that is not one of 16
++    uint32_t offscreen;      // extra passes of one draw each into smaller targets before the main one (a blur chain)
++    bool clear;              // the main pass's load action is Clear
++    bool gmem;               // as the plug-in: GMEM allowed for passes of 56 draws or more
++    uint32_t commandBuffers; // the frame split over this many command buffers (the main pass in the last)
++    bool second = false;     // a second colour attachment the size of the first (DontCare/DontCare): CoreAnimation's main pass
++    uint32_t fetchEvery = 0; // every Nth textured draw reads its target instead (fetch and no-fetch draws interleaved)
++};
++
++void runCore(const Scene& s) {
++    if (!wanted(s.letter)) return;
++    Rig r;
++    Result res;
++    res.letter = s.letter;
++    res.name = s.name;
++    const uint32_t W = 750, H = 1624;
++    auto fb = texture(r, W, H, kTextureUsageRenderTarget | kTextureUsageRead);
++    std::vector<std::shared_ptr<Texture>> icons;
++    for (uint32_t i = 0; i < 24; i++) icons.push_back(texture(r, 120, 120, kTextureUsageRead));
++    auto wallpaper = texture(r, W, H, kTextureUsageRead);
++    auto fb2 = texture(r, W, H, kTextureUsageRenderTarget | kTextureUsageRead);
++    std::vector<std::shared_ptr<Texture>> off;
++    for (uint32_t i = 0; i < s.offscreen; i++) off.push_back(texture(r, std::max(W >> (i + 1), 16u), std::max(H >> (i + 1), 16u), kTextureUsageRenderTarget | kTextureUsageRead));
++    Sampler smp;
++    std::string why;
++    makeSampler(SamplerDesc{}, &smp, &why);
++    // one buffer of uniforms, bound at multiples of 8 as CoreAnimation binds its own (render.cpp: PushedRange)
++    auto uniforms = newBuffer(*r.gpu, 64 * 1024, &why);
++
++    Program tex{kernels::tri_color_vs_air, kernels::tri_tex_fs_air, Linkage{}, "tri_tex"};
++    Program flat{kernels::tri_flat_vs_air, kernels::tri_cflat_fs_air, Linkage{}, "tri_cflat"};
++    Program fetch{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "tri_fb"};
++    for (Program* p : {&tex, &flat}) {
++        p->blend.enabled = true;   // premultiplied source-over
++        p->blend.srcRgb = 1, p->blend.dstRgb = 5, p->blend.srcAlpha = 1, p->blend.dstAlpha = 5;
++    }
++
++    // frame 0 warms the queue's pools as a second frame finds them (the program buffers, the slabs, the command BO)
++    const uint32_t frames = 1 + (asked.golden ? 1 : asked.runs);
++    for (uint32_t frame = 0; frame < frames; frame++) {
++        Clock clock;
++        gSums.reset();
++        std::vector<std::shared_ptr<CommandBuffer>> cbs;
++        auto cb = pluginBuffer(r, s.gmem);
++        for (uint32_t i = 0; i < s.offscreen; i++) {
++            RenderPass p;
++            p.color0 = off[i].get();
++            p.load = LoadAction::kDontCare;
++            Draw d;
++            d.vertexCount = 6;
++            d.viewport = Viewport{0, 0, double(off[i]->width()), double(off[i]->height()), 0, 1};
++            Bindings fsb;
++            fsb.textures = {i == 0 ? wallpaper.get() : off[i - 1].get()};
++            fsb.samplers = {&smp};
++            clock.begin();
++            const bool ok = cb->draw(tex, p, d, Bindings{}, fsb);
++            clock.end();
++            if (!ok) res.refused++, res.error = cb->lastSkipped() + " | " + cb->error();
++            if (s.commandBuffers > 1 && i + 1 < s.commandBuffers) {
++                cbs.push_back(cb);
++                cb = pluginBuffer(r, s.gmem);
++            }
++        }
++        RenderPass pass;
++        pass.color0 = fb.get();
++        pass.load = s.clear ? LoadAction::kClear : LoadAction::kLoad;
++        if (s.second) {
++            pass.more[0].texture = fb2.get();
++            pass.more[0].load = LoadAction::kDontCare;
++            pass.more[0].store = StoreAction::kDontCare;
++        }
++        for (uint32_t i = 0; i < s.draws; i++) {
++            Draw d;
++            d.vertexCount = 6;
++            // the first draw the wallpaper over everything, the rest icon-sized quads on a grid
++            const double x = i == 0 ? 0 : 30 + 180 * (i % 4), y = i == 0 ? 0 : 60 + 200 * ((i / 4) % 7);
++            d.viewport = Viewport{x, y, i == 0 ? double(W) : 120.0, i == 0 ? double(H) : 120.0, 0, 1};
++            RenderPass p = pass;
++            if (i != 0) p.load = LoadAction::kLoad;   // (the plug-in spends the Clear on the first draw: hm_spend_clears)
++            Bindings fsb;
++            // (the textured draws first and the uniform ones after them: the fake GPU keeps every constant load of a
++            // submission and holds it to the constlen of each later draw, so a constlen-0 stage after a constlen-4 one
++            // is a fault of the model's bookkeeping, not of the stream)
++            const bool uniform = i >= s.draws - s.uniform;
++            const bool isFetch = !uniform && (i >= s.draws - s.uniform - s.fetch || (s.fetchEvery != 0 && i != 0 && i % s.fetchEvery == 0));
++            const Program* prog = isFetch ? &fetch : uniform ? &flat : &tex;
++            if (prog == &tex) {
++                fsb.textures = {i == 0 ? wallpaper.get() : icons[i % icons.size()].get()};
++                fsb.samplers = {&smp};
++            } else if (prog == &flat) {
++                fsb.buffers = {Binding{uniforms.get(), 8ull * (1 + 2 * i)}};   // 8, 24, 40...: never a multiple of 16
++            }
++            clock.begin();
++            const bool ok = cb->draw(*prog, p, d, Bindings{}, fsb);
++            clock.end();
++            if (!ok) res.refused++, res.error = cb->lastSkipped() + " | " + cb->error();
++        }
++        cbs.push_back(cb);
++        const uint64_t c0 = nowNs();
++        for (auto& b : cbs) b->commit();
++        const uint64_t c1 = nowNs();
++        for (auto& b : cbs) b->waitUntilCompleted();
++        for (auto& b : cbs) {
++            if (b->status() != CommandBuffer::kCompleted) res.error = "a command buffer ended in error: " + b->error() + " | " + r.fake->stats().lastFault;
++        }
++        if (frame != 0) {
++            res.draws = clock.draws;
++            res.usPerDraw.push_back((double(clock.ns) / clock.draws - clockNs()) / 1e3);
++            res.commitUs.push_back(double(c1 - c0) / 1e3);
++            res.allocsPerDraw = double(clock.allocs) / clock.draws;
++            res.allocBytesPerDraw = double(clock.allocBytes) / clock.draws;
++            res.sums = gSums;
++        }
++        cbs.clear();
++        cb.reset();
++        settle();
++    }
++    gResults.push_back(res);
++}
++
++// ====================================================================================================================
++// The C interface: what the plug-in calls
++// ====================================================================================================================
++constexpr unsigned kBGRA8 = 80, kUsageRead = 1, kUsageTarget = 4, k2D = 2;
++
++struct CRig {
++    hakios_metal_device* device = hakios_metal_open_fake();
++    hakios_metal_queue* queue = hakios_metal_queue_new(device);
++    ~CRig() {
++        hakios_metal_queue_free(queue);
++        hakios_metal_close(device);
++    }
++};
++
++// -initWithQueue: of the plug-in's command buffer, with no metal_* boot-arg
++hakios_metal_cb* pluginCb(CRig& r, bool gmem) {
++    hakios_metal_cb* cb = hakios_metal_cb_new(r.queue);
++    hakios_metal_cb_skip_refused(cb, 1);
++    hakios_metal_cb_set_profile(cb, 0);
++    hakios_metal_cb_set_gmem(cb, gmem ? 1 : 0);
++    hakios_metal_cb_set_gmem_min_draws(cb, gmem ? 56 : 0);
++    hakios_metal_cb_set_gmem_binning(cb, 1);
++    hakios_metal_cb_set_null_fs_textures(cb, 0);
++    hakios_metal_cb_set_gmem_off(cb, 0);
++    hakios_metal_cb_set_gmem_tuned(cb, 1);
++    hakios_metal_cb_set_profile_draws(cb, 0);
++    return cb;
++}
++
++// one kind of draw: a program, and what an encoder has bound when it draws with it
++struct Layer {
++    hakios_metal_program* program = nullptr;
++    std::string name;
++    bool indexed = false;                                 // drawn from the index buffer, its vertex buffer at vsVertexAt
++    unsigned vsCount = 0, fsCount = 0;                    // the buffer tables' sizes (highest index bound + 1)
++    hakios_metal_buffer* vs[31] = {};
++    hakios_metal_buffer* fs[31] = {};
++    uint64_t vsOffsets[31] = {}, fsOffsets[31] = {};
++    bool vsUniform[31] = {}, fsUniform[31] = {};          // a constant buffer, its offset moved a draw (as an encoder's ring)
++    unsigned texCount = 0, sampCount = 0;
++    hakios_metal_texture* tex[16] = {};
++    bool texVaries[16] = {};                              // a slot whose texture changes from draw to draw
++    hakios_metal_sampler* samp[16] = {};
++};
++
++struct Frame {
++    hakios_metal_render_pass pass{};
++    std::vector<Layer> layers;
++    std::vector<uint32_t> order;                          // the main pass's draws: which layer each is
++    std::vector<hakios_metal_texture*> icons;
++    hakios_metal_buffer* index = nullptr;
++    bool gmem = true;
++};
++
++// one frame through the C interface: the draws of F in order; false with the first refusal when one is refused
++void drawFrame(CRig& r, Frame& f, Result& res, bool measured) {
++    Clock clock;
++    gSums.reset();
++    hakios_metal_cb* cb = pluginCb(r, f.gmem);
++    hakios_metal_render_pass pass = f.pass;
++    for (size_t i = 0; i < f.order.size(); i++) {
++        Layer& l = f.layers[f.order[i]];
++        hakios_metal_viewport vp{0, 0, 750, 1624, 0, 1};
++        hakios_metal_scissor sc{};
++        const bool scissored = i % 3 != 0;   // (most of a compositor's layers are clipped to their bounds)
++        if (scissored) sc = hakios_metal_scissor{unsigned(30 + 180 * (i % 4)), unsigned(60 + 200 * ((i / 4) % 7)), 120, 120};
++        // what the encoder has bound by now: each uniform buffer further along its ring, the layer's own texture
++        uint64_t vso[31], fso[31];
++        for (unsigned k = 0; k < l.vsCount; k++) vso[k] = l.vsOffsets[k] + (l.vsUniform[k] ? 8ull * (1 + 2 * (i % 512)) : 0);
++        for (unsigned k = 0; k < l.fsCount; k++) fso[k] = l.fsOffsets[k] + (l.fsUniform[k] ? 8ull * (1 + 2 * (i % 512)) : 0);
++        hakios_metal_texture* tex[16];
++        for (unsigned k = 0; k < l.texCount; k++) tex[k] = l.texVaries[k] ? f.icons[(i + k) % f.icons.size()] : l.tex[k];
++        clock.begin();
++        hakios_metal_cb_set_vertex_textures(cb, nullptr, 0, nullptr, 0);   // (-hakiosDrawOnce: sets them before every draw)
++        int drawn;
++        if (l.indexed) {
++            drawn = hakios_metal_cb_draw_indexed(cb, l.program, &pass, &vp, scissored ? &sc : nullptr, 3, 6, 0, f.index, 12 * (i % 64), 1, 0, 0, l.vs, vso,
++                                                 l.vsCount, l.fs, fso, l.fsCount, tex, l.texCount, l.samp, l.sampCount);
++        } else {
++            drawn = hakios_metal_cb_draw3(cb, l.program, &pass, &vp, scissored ? &sc : nullptr, 3, 0, 6, 1, 0, l.vs, vso, l.vsCount, l.fs, fso, l.fsCount, tex,
++                                          l.texCount, l.samp, l.sampCount);
++        }
++        clock.end();
++        if (drawn != 0) {
++            res.refused++;
++            if (res.error.empty()) res.error = l.name + ": " + hakios_metal_error();
++        }
++        pass.load_action = 1;   // (hm_spend_clears: a Clear is the first draw's)
++    }
++    const uint64_t c0 = nowNs();
++    hakios_metal_cb_commit(cb, nullptr, nullptr);
++    const uint64_t c1 = nowNs();
++    hakios_metal_cb_wait(cb);
++    if (hakios_metal_cb_status(cb) != HAKIOS_METAL_COMPLETED) res.error = std::string("the command buffer ended in error: ") + hakios_metal_cb_error(cb);
++    hakios_metal_cb_free(cb);
++    settle();
++    if (measured) {
++        res.draws = clock.draws;
++        res.usPerDraw.push_back((double(clock.ns) / clock.draws - clockNs()) / 1e3);
++        res.commitUs.push_back(double(c1 - c0) / 1e3);
++        res.allocsPerDraw = double(clock.allocs) / clock.draws;
++        res.allocBytesPerDraw = double(clock.allocBytes) / clock.draws;
++        res.sums = gSums;
++    }
++}
++
++void runFrames(CRig& r, Frame& f, const char* letter, const std::string& name) {
++    Result res;
++    res.letter = letter;
++    res.name = name;
++    const uint32_t frames = 1 + (asked.golden ? 1 : asked.runs);
++    for (uint32_t frame = 0; frame < frames; frame++) drawFrame(r, f, res, frame != 0);
++    gResults.push_back(res);
++}
++
++// the things every C scene binds from
++struct Common {
++    hakios_metal_texture *fb, *fb2, *wallpaper;
++    std::vector<hakios_metal_texture*> icons;
++    hakios_metal_sampler* sampler;
++    hakios_metal_buffer *uniforms, *vertices, *index, *device;
++    explicit Common(CRig& r) {
++        device = hakios_metal_buffer_new(r.device, 64 * 1024);
++        fb = hakios_metal_texture_new(r.device, k2D, kBGRA8, 750, 1624, kUsageRead | kUsageTarget);
++        fb2 = hakios_metal_texture_new(r.device, k2D, kBGRA8, 750, 1624, kUsageRead | kUsageTarget);
++        wallpaper = hakios_metal_texture_new(r.device, k2D, kBGRA8, 750, 1624, kUsageRead);
++        for (int i = 0; i < 24; i++) icons.push_back(hakios_metal_texture_new(r.device, k2D, kBGRA8, 120, 120, kUsageRead));
++        hakios_metal_sampler_desc sd{};
++        sd.min_filter = sd.mag_filter = 1;
++        sd.normalized_coordinates = 1;
++        sd.lod_max_clamp = 1000.0f;
++        sd.max_anisotropy = 1;
++        sampler = hakios_metal_sampler_new(r.device, &sd);
++        uniforms = hakios_metal_buffer_new(r.device, 256 * 1024);
++        vertices = hakios_metal_buffer_new(r.device, 64 * 1024);
++        index = hakios_metal_buffer_new(r.device, 4096);
++        if (fb == nullptr || sampler == nullptr || uniforms == nullptr) std::printf("drawbench: %s\n", hakios_metal_error());
++    }
++    hakios_metal_render_pass mainPass(bool second) const {
++        hakios_metal_render_pass p{};
++        p.color0 = fb;
++        p.load_action = 1;
++        p.store_action = 1;
++        if (second) {
++            p.more[0].texture = fb2;   // CoreAnimation's second screen: DontCare / DontCare
++            p.more[0].load_action = 0;
++            p.more[0].store_action = 0;
++        }
++        return p;
++    }
++};
++
++hakios_metal_program* linked(const Stage& vs, const Stage& fs, bool blend) {
++    hakios_metal_program* p = hakios_metal_program_from_stages(vs, fs, kBGRA8);
++    if (p == nullptr) {
++        std::printf("drawbench: %s + %s: %s\n", vs.k.name, fs.k.name, hakios_metal_error());
++        return nullptr;
++    }
++    if (blend) hakios_metal_program_set_blend(p, 1, 0, 0, 1, 5, 1, 5, 0xf);   // premultiplied source-over
++    return p;
++}
++
++// the fixtures' programs as a compositor's layers
++void fixtureLayers(Common& c, Frame* f) {
++    f->index = c.index;
++    f->icons = c.icons;
++    // 0: a textured quad from a vertex buffer (two attributes) and the index buffer: an icon, a label
++    {
++        Layer l;
++        l.name = "attr+tex";
++        l.program = linked(kernels::tri_attr_vs_air, kernels::tri_tex_fs_air, true);
++        hakios_metal_program_set_vertex_attribute(l.program, 0, 29, 0, 0);    // Float2 at 0
++        hakios_metal_program_set_vertex_attribute(l.program, 1, 9, 8, 0);     // UChar4Normalized at 8
++        hakios_metal_program_set_vertex_layout(l.program, 0, 12, 1, 1);
++        l.indexed = true;
++        l.vs[0] = c.vertices, l.vsCount = 1;
++        l.tex[0] = c.icons[0], l.texVaries[0] = true, l.texCount = 1;
++        l.samp[0] = c.sampler, l.sampCount = 1;
++        f->layers.push_back(l);
++    }
++    // 1: the same vertex stage with a fragment stage that declares ten texture slots and samples two of them, one of
++    // which the encoder leaves unbound (an uber shader's variant: the null texture goes there)
++    {
++        Layer l;
++        l.name = "attr+tex39";
++        l.program = linked(kernels::tri_attr_vs_air, kernels::tri_tex39_fs_air, true);
++        hakios_metal_program_set_vertex_attribute(l.program, 0, 29, 0, 0);
++        hakios_metal_program_set_vertex_attribute(l.program, 1, 9, 8, 0);
++        hakios_metal_program_set_vertex_layout(l.program, 0, 12, 1, 1);
++        l.indexed = true;
++        l.vs[0] = c.vertices, l.vsCount = 1;
++        l.tex[3] = c.icons[1], l.texVaries[3] = true, l.texCount = 4;
++        l.samp[0] = c.sampler, l.sampCount = 10;
++        for (unsigned k = 1; k < 10; k++) l.samp[k] = c.sampler;
++        f->layers.push_back(l);
++    }
++    // 2: a colour from a constant buffer bound at a multiple of 8: a backdrop, a separator
++    {
++        Layer l;
++        l.name = "flat+cflat";
++        l.program = linked(kernels::tri_flat_vs_air, kernels::tri_cflat_fs_air, true);
++        l.fs[0] = c.uniforms, l.fsUniform[0] = true, l.fsCount = 1;
++        f->layers.push_back(l);
++    }
++    // 3: a framebuffer fetch: programmable blending
++    {
++        Layer l;
++        l.name = "flat+fb";
++        l.program = linked(kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, false);
++        f->layers.push_back(l);
++    }
++    // 4: two colour outputs into the pass's two attachments
++    {
++        Layer l;
++        l.name = "flat+mrt";
++        l.program = linked(kernels::tri_flat_vs_air, kernels::tri_mrt_fs_air, false);
++        f->layers.push_back(l);
++    }
++    // 5: the wallpaper: a textured quad without a vertex buffer
++    {
++        Layer l;
++        l.name = "color+tex";
++        l.program = linked(kernels::tri_color_vs_air, kernels::tri_tex_fs_air, false);
++        l.tex[0] = c.wallpaper, l.texCount = 1;
++        l.samp[0] = c.sampler, l.sampCount = 1;
++        f->layers.push_back(l);
++    }
++}
++
++void runFixtureScenes() {
++    struct { const char* letter; const char* name; uint32_t draws; bool gmem; bool fetch; } scenes[] = {
++        {"J", "C interface: a light frame, 20 draws of 3 programs in runs, sysmem", 20, false, false},
++        {"K", "C interface: a main pass of 110 draws, 6 programs changing as layers do, two attachments, GMEM binned", 110, true, true},
++        {"L", "C interface: the main pass of K in sysmem (GMEM off)", 110, false, true},
++    };
++    for (const auto& s : scenes) {
++        if (!wanted(s.letter)) continue;
++        CRig r;
++        Common c(r);
++        Frame f;
++        f.gmem = s.gmem;
++        f.pass = c.mainPass(true);
++        fixtureLayers(c, &f);
++        // the wallpaper first; then icons and labels in runs of one program with other layers between them, as a
++        // compositor's tree gives them (the fake holds every constant load of a submission to each later draw's
++        // constlen, so the layers with uniforms come last, as in the audit's scenes)
++        f.order.push_back(5);
++        const uint32_t uniform = s.draws / 5;
++        for (uint32_t i = 1; i + uniform < s.draws; i++) {
++            const uint32_t k = i % 12;
++            f.order.push_back(k < 5 ? 0 : k < 8 ? 1 : k == 8 && s.fetch ? 3 : k == 9 && s.fetch ? 4 : k == 10 ? 1 : 0);
++        }
++        for (uint32_t i = 0; i < uniform; i++) f.order.push_back(2);
++        runFrames(r, f, s.letter, s.name);
++    }
++}
++
++// --- a phone's own stages (--stages) -------------------------------------------------------------------------------
++struct LoadedStage {
++    Stage stage{};
++    std::vector<uint32_t> words, immediates;
++    std::string name, file;
++    uint32_t iboBase = 0;   // a fragment stage's: the vertex stage's device buffers it was compiled past (compileStage)
++    bool writesMemory = true;   // CompiledStage::writesMemory: it stores to a device buffer (a draw of it is not replayed per tile)
++};
++
++// compiler.cpp's stageCacheLoad, for a file another build of the driver wrote: the Stage as it lay in that build's
++// memory (the same layout: Stage and Kernel have not changed), its words and immediates; the rest is skipped
++bool loadStage(const std::string& path, LoadedStage* out) {
++    FILE* f = fopen(path.c_str(), "rb");
++    if (f == nullptr) return false;
++    std::string data;
++    char chunk[65536];
++    for (size_t n; (n = fread(chunk, 1, sizeof(chunk), f)) > 0;) data.append(chunk, n);
++    fclose(f);
++    const uint8_t* p = reinterpret_cast<const uint8_t*>(data.data());
++    const uint8_t* end = p + data.size();
++    auto u32 = [&](uint32_t* v) {
++        if (size_t(end - p) < 4) return false;
++        memcpy(v, p, 4);
++        p += 4;
++        return true;
++    };
++    auto skip = [&](size_t n) {
++        if (size_t(end - p) < n) return false;
++        p += n;
++        return true;
++    };
++    uint32_t magic = 0, n = 0;
++    if (!u32(&magic) || magic != 0x53434d48 || size_t(end - p) < sizeof(Stage)) return false;
++    memcpy(&out->stage, p, sizeof(Stage));
++    p += sizeof(Stage);
++    if (!u32(&n) || size_t(end - p) < 4ull * n) return false;
++    out->words.resize(n);
++    memcpy(out->words.data(), p, 4ull * n);
++    p += 4ull * n;
++    if (!u32(&n) || size_t(end - p) < 4ull * n) return false;
++    out->immediates.resize(n);
++    memcpy(out->immediates.data(), p, 4ull * n);
++    p += 4ull * n;
++    if (!u32(&n)) return false;
++    for (uint32_t i = 0; i < n; i++) {   // the resources
++        uint32_t len = 0;
++        if (!skip(12 + 8) || !u32(&len) || !skip(len) || !skip(8)) return false;
++    }
++    if (!u32(&n)) return false;
++    for (uint32_t i = 0; i < n; i++) {   // the varyings' names
++        uint32_t len = 0;
++        if (!u32(&len) || !skip(len)) return false;
++    }
++    uint32_t writes = 0;
++    if (!u32(&n) || !skip(size_t(n) * (4 + sizeof(Sampler))) || !u32(&out->iboBase) || !u32(&writes)) return false;   // inline samplers, iboBase, writesMemory
++    out->writesMemory = writes != 0;
++    uint32_t len = 0;
++    if (!u32(&len) || size_t(end - p) < len) return false;
++    out->name.assign(reinterpret_cast<const char*>(p), len);
++    out->stage.k.words = out->words.data();
++    out->stage.k.numWords = uint32_t(out->words.size());
++    out->stage.k.immediates = out->immediates.empty() ? nullptr : out->immediates.data();
++    out->stage.k.numImmediates = uint32_t(out->immediates.size());
++    out->stage.k.name = out->name.c_str();
++    out->stage.k.source = "";
++    return true;
++}
++
++void runStageScenes() {
++    if (asked.stages.empty() || !(wanted("S") || wanted("T"))) return;
++    std::vector<std::unique_ptr<LoadedStage>> vss, fss;
++    {
++        std::vector<std::string> files;
++        if (DIR* d = opendir(asked.stages.c_str())) {
++            while (dirent* e = readdir(d)) {
++                const std::string n = e->d_name;
++                if (n.size() > 6 && n.compare(n.size() - 6, 6, ".stage") == 0) files.push_back(n);
++            }
++            closedir(d);
++        }
++        std::sort(files.begin(), files.end());
++        for (const std::string& n : files) {
++            auto s = std::make_unique<LoadedStage>();
++            s->file = n;
++            if (!loadStage(asked.stages + "/" + n, s.get())) continue;
++            (s->stage.kind == kStageVertex ? vss : fss).push_back(std::move(s));
++        }
++    }
++    if (vss.empty() || fss.empty()) {
++        std::printf("drawbench: no stages in %s\n", asked.stages.c_str());
++        return;
++    }
++    for (const char* letter : {"S", "T"}) {
++        if (!wanted(letter)) continue;
++        CRig r;
++        Common c(r);
++        Frame f;
++        f.gmem = letter[0] == 'S';
++        f.pass = c.mainPass(true);
++        f.index = c.index;
++        f.icons = c.icons;
++        hakios_metal_texture* lut = hakios_metal_texture_new_3d(r.device, kBGRA8, 16, 16, 16, kUsageRead);
++        // every fragment stage with the first vertex stage it links with -- the one of its own family first, by the
++        // names' common beginning (variable_blur_frag_lph with variable_blur_vert_lph) -- bound as its tables ask
++        for (const auto& fs : fss) {
++            std::vector<const LoadedStage*> order;
++            for (const auto& vs : vss) order.push_back(vs.get());
++            auto common = [&](const LoadedStage* v) {
++                size_t n = 0;
++                while (n < v->name.size() && n < fs->name.size() && v->name[n] == fs->name[n]) n++;
++                return n;
++            };
++            std::stable_sort(order.begin(), order.end(), [&](const LoadedStage* a, const LoadedStage* b) { return common(a) > common(b); });
++            for (const LoadedStage* vs : order) {
++                Linkage link{};
++                std::string why;
++                // (a fragment stage was compiled past its own vertex stage's device buffers: another's is not its pair)
++                if (fs->iboBase != vs->stage.k.numSsbos && !(fs->iboBase == 0 && fs->stage.k.numSsbos == 0)) continue;
++                if (!render::link(vs->stage, fs->stage, &link, &why)) continue;
++                Layer l;
++                l.name = vs->name + "+" + fs->name + " (" + fs->file.substr(0, 8) + ")";
++                l.program = hakios_metal_program_from_stages(vs->stage, fs->stage, kBGRA8, fs->iboBase, (vs->writesMemory ? 1u : 0u) | (fs->writesMemory ? 2u : 0u));
++                if (l.program == nullptr) continue;
++                hakios_metal_program_set_blend(l.program, 1, 0, 0, 1, 5, 1, 5, 0xf);
++                // the vertex stage's attributes from one vertex buffer, at the index past every constant buffer's
++                unsigned attributes = 0, vertexAt = 0;
++                for (const Stage* s : {&vs->stage}) {
++                    for (uint32_t k = 0; k < s->k.numUboRanges; k++) vertexAt = std::max(vertexAt, s->k.uboRanges[k].block + 1);
++                    vertexAt = std::max(vertexAt, std::max(s->k.numUbos, s->k.numSsbos));
++                }
++                if (vertexAt > 30) continue;
++                for (uint32_t k = 0; k < vs->stage.numInputs; k++) {
++                    const StageInput& in = vs->stage.inputs[k];
++                    if (in.sysval || in.regid == a6xx::kRegidNone || in.slot < 15) continue;
++                    hakios_metal_program_set_vertex_attribute(l.program, in.slot - 15u, 31, 16 * attributes, vertexAt);   // Float4
++                    attributes++;
++                }
++                if (attributes != 0) {
++                    hakios_metal_program_set_vertex_layout(l.program, vertexAt, 16 * attributes, 1, 1);
++                    l.indexed = true;
++                    l.vs[vertexAt] = c.vertices;
++                    l.vsCount = vertexAt + 1;
++                }
++                // each stage's constant buffers: the pushed ranges' blocks and the UBOs an ldc reads, from the uniforms'
++                // buffer at a place of their own, moved a draw
++                auto constants = [&](const Stage& s, hakios_metal_buffer** table, uint64_t* offsets, bool* uniform, unsigned* count, unsigned skipIndex, bool skip) {
++                    auto bind = [&](uint32_t block) {
++                        if (block >= 31 || (skip && block == skipIndex) || (s.k.constantDataUbo != 0 && block == s.k.constantDataUbo - 1)) return;
++                        table[block] = c.uniforms;
++                        offsets[block] = 16384ull * block;
++                        uniform[block] = true;
++                        *count = std::max(*count, block + 1);
++                    };
++                    for (uint32_t k = 0; k < s.k.numUboRanges; k++) bind(s.k.uboRanges[k].block);
++                    for (uint32_t k = 0; k < s.k.numUbos; k++) bind(k);
++                };
++                constants(vs->stage, l.vs, l.vsOffsets, l.vsUniform, &l.vsCount, vertexAt, attributes != 0);
++                constants(fs->stage, l.fs, l.fsOffsets, l.fsUniform, &l.fsCount, 0, false);
++                // ...and its device buffers, the one 3D IBO table's slots: the vertex stage's by its own indices, the
++                // fragment stage's past them (a buffer of their own, bound where it is and left there)
++                for (uint32_t k = 0; k < vs->stage.k.numSsbos && k < 31; k++) {
++                    if (l.vs[k] == nullptr) l.vs[k] = c.device, l.vsCount = std::max(l.vsCount, k + 1);
++                }
++                for (uint32_t k = fs->iboBase; k < fs->stage.k.numSsbos && k - fs->iboBase < 31; k++) {
++                    const uint32_t at = k - fs->iboBase;
++                    if (l.fs[at] == nullptr) l.fs[at] = c.device, l.fsCount = std::max(l.fsCount, at + 1);
++                }
++                // the fragment stage's textures: what it samples, in the shape it samples it; every other draw of the
++                // layer only the first of them (an uber shader's variant declares more than a layer binds)
++                const Kernel& k = fs->stage.k;
++                for (uint32_t t = 0; t < kMaxTextureSlots && t < k.numTextureSlots; t++) {
++                    const KernelTexture& kt = k.textures[t];
++                    if (kt.kind != kTexSampled || kt.isNull || kt.fbTarget != 0) continue;
++                    if (kt.dim == kTexDim3D) l.tex[t] = lut;
++                    else if (kt.dim == kTexDim2D && !kt.isArray && kt.element == kElemFloat) l.tex[t] = c.icons[t % c.icons.size()], l.texVaries[t] = l.texCount == 0;
++                    else continue;   // (left unbound: the null texture)
++                    l.texCount = t + 1;
++                }
++                for (uint32_t m = 0; m < kMaxTextureSlots; m++) {
++                    if ((k.samplerMask >> m) & 1) l.samp[m] = c.sampler, l.sampCount = m + 1;
++                }
++                f.layers.push_back(l);
++                break;
++            }
++        }
++        // one frame of every layer to see which the driver takes; the main pass is then made of those, in runs
++        {
++            Result probe;
++            f.order.clear();
++            std::vector<uint32_t> taken;
++            for (uint32_t i = 0; i < f.layers.size(); i++) {
++                f.order.assign(1, i);
++                Result one;
++                drawFrame(r, f, one, false);
++                if (one.refused == 0 && one.error.empty()) taken.push_back(i);
++                else if (!asked.golden && !asked.csv) std::printf("   (left out: %s: %s)\n", f.layers[i].name.c_str(), one.error.c_str());
++            }
++            if (taken.empty()) {
++                std::printf("drawbench: none of %zu programs of %s was drawn\n", f.layers.size(), asked.stages.c_str());
++                return;
++            }
++            f.order.clear();
++            // 110 draws: a program stays for 1 to 4 draws, then the next one of the cache
++            for (uint32_t i = 0, at = 0; f.order.size() < 110; i++, at++) {
++                for (uint32_t run = 0; run < 1 + i % 4 && f.order.size() < 110; run++) f.order.push_back(taken[at % taken.size()]);
++            }
++            char name[200];
++            snprintf(name, sizeof name, "C interface: %zu programs of the phone's stage cache (%zu drawn), a main pass of 110 draws, two attachments, %s",
++                     f.layers.size(), taken.size(), f.gmem ? "GMEM binned" : "sysmem");
++            runFrames(r, f, letter, name);
++        }
++    }
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    for (int i = 1; i < argc; i++) {
++        const std::string a = argv[i];
++        auto value = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
++        if (a == "--golden") asked.golden = true;
++        else if (a == "--hist") asked.hist = true;
++        else if (a == "--csv") asked.csv = true;
++        else if (a == "--runs") asked.runs = std::max(1, atoi(value()));
++        else if (a == "--cold") asked.coldBytes = size_t(atoi(value())) * 1024;
++        else if (a == "--scene") asked.scenes = value();
++        else if (a == "--stages") asked.stages = value();
++        else {
++            std::printf("drawbench [--runs N] [--cold KB] [--scene LETTERS] [--stages DIR] [--hist] [--csv] | --golden\n");
++            return 2;
++        }
++    }
++    if (asked.golden) asked.coldBytes = 0;
++    FakeGpu::submitHook = onSubmit;
++    const Scene scenes[] = {
++        {"A", "light frame: 1 command buffer, 1 pass (Load), 20 blended draws (14 textured, 6 with uniforms), sysmem", 20, 0, 6, 0, false, true, 1},
++        {"B", "the same frame with 5 of the textured draws reading their target (framebuffer fetch), sysmem", 20, 5, 6, 0, false, true, 1},
++        {"C", "heavy frame: 3 offscreen passes of 1 draw + a main pass of 140 textured draws (>= 56: GMEM, binned)", 140, 0, 0, 3, false, true, 1},
++        {"D", "the heavy frame with GMEM off (every pass sysmem), 46 of its draws with uniforms", 140, 0, 46, 3, false, false, 1},
++        {"E", "the same with 23 framebuffer-fetch draws, GMEM off", 140, 23, 46, 3, false, false, 1},
++        {"F", "the heavy frame of C split over 4 command buffers (3 offscreen + main)", 140, 0, 0, 3, false, true, 4},
++        {"P", "the phone's main pass: 108 textured draws into two 750x1624 attachments (the second DontCare), GMEM binned", 108, 0, 0, 0, false, true, 1, true, 0},
++        {"Q", "the same with every 4th draw a framebuffer fetch (27 runs of fetch after no-fetch)", 108, 0, 0, 0, false, true, 1, true, 4},
++        {"R", "the main pass of P recorded once, in sysmem (GMEM off)", 108, 0, 0, 0, false, false, 1, true, 0},
++        {"G", "one draw alone in a command buffer (the fixed cost of a pass and a submit)", 1, 0, 0, 0, false, true, 1},
++        {"H", "one draw into a pass whose load action is Clear", 1, 0, 0, 0, true, true, 1},
++    };
++    for (const Scene& s : scenes) runCore(s);
++    runFixtureScenes();
++    runStageScenes();
++
++    if (asked.golden) {
++        for (const Result& r : gResults) {
++            // (a frame of several command buffers in flight at once: which of their counter-stamp buffers comes back to the
++            // queue's pool first is the threads' to decide, and the next frame's addresses with it -- its state alone is summed)
++            const bool timed = r.sums.submits > 1;
++            std::printf("%s draws %u refused %u submits %u words %llu loads %u stream %016llx state %016llx%s%s%s\n", r.letter.c_str(), r.draws, r.refused,
++                        r.sums.submits, (unsigned long long)r.sums.words, r.sums.loads, (unsigned long long)(timed ? 0 : r.sums.stream),
++                        (unsigned long long)r.sums.state, r.sums.bad ? " (unread)" : "", r.error.empty() ? "" : " (error)", timed ? " (stream by timing: not summed)" : "");
++        }
++        return 0;
++    }
++    if (asked.csv) {
++        std::printf("scene,draws,us_min,us_median,us_max,allocs_per_draw,alloc_bytes_per_draw,words_per_draw,commit_us_median,runs,cold_kb\n");
++        for (const Result& r : gResults) {
++            std::printf("%s,%u,%.3f,%.3f,%.3f,%.2f,%.0f,%.1f,%.1f,%zu,%zu\n", r.letter.c_str(), r.draws, *std::min_element(r.usPerDraw.begin(), r.usPerDraw.end()),
++                        median(r.usPerDraw), *std::max_element(r.usPerDraw.begin(), r.usPerDraw.end()), r.allocsPerDraw, r.allocBytesPerDraw,
++                        double(r.sums.words) / r.draws, median(r.commitUs), r.usPerDraw.size(), asked.coldBytes / 1024);
++        }
++        return 0;
++    }
++    std::printf("drawbench: %u measured frame(s) a scene after one to warm up%s; us a draw: the time inside the draw calls\n", asked.runs,
++                asked.coldBytes ? (", " + std::to_string(asked.coldBytes / 1024) + " KB touched before each draw").c_str() : "");
++    std::printf("%-2s %6s %27s %10s %10s %10s %10s  %s\n", "", "draws", "us a draw (min median max)", "allocs", "bytes", "words", "commit us", "");
++    for (const Result& r : gResults) {
++        std::printf("%-2s %6u %9.2f %8.2f %8.2f %10.2f %10.0f %10.1f %10.0f  %s\n", r.letter.c_str(), r.draws,
++                    *std::min_element(r.usPerDraw.begin(), r.usPerDraw.end()), median(r.usPerDraw), *std::max_element(r.usPerDraw.begin(), r.usPerDraw.end()),
++                    r.allocsPerDraw, r.allocBytesPerDraw, double(r.sums.words) / r.draws, median(r.commitUs), r.name.c_str());
++        if (r.refused != 0 || !r.error.empty()) std::printf("   !! %u refused; %s\n", r.refused, r.error.c_str());
++    }
++    if (asked.hist) {
++        std::printf("\nall scenes' packets: %llu words, %llu register packets writing %llu registers\n", (unsigned long long)gHist.words,
++                    (unsigned long long)gHist.regPackets, (unsigned long long)gHist.regWords);
++        for (const auto& [k, v] : gHist.n) std::printf("   %-32s %llu\n", k.c_str(), (unsigned long long)v);
++    }
++    return 0;
++}
