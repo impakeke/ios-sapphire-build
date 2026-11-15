@@ -1,0 +1,44 @@
+# device dumps: persist/modemst/fsg hold IMEI + calibration; live DT holds the serial
+backup/
+dtb/
+/recovery/
+# tools/mkpwdb.c built on the host (installer/overlay/scrub.py runs it)
+/tools/mkpwdb
+# third-party/Apple sources fetched for reading
+research/
+shim/out/
+xnu/out/
+xnu/out-*/
+__pycache__/
+# boot logs: SSIDs nearby, device identifiers
+logs/
+metal/out/
+metal/ir3/sapphire-ir3as
+metal/ir3/*.o
+metal/capture/out/
+userland/obj/
+userland/stage/
+# build outputs and downloads (release assets are published on GitHub, not committed)
+installer/out/
+installer/release/
+installer/overlay/out/
+installer/tools-arm64/build/
+installer/tools-arm64/dl/
+installer/tools-arm64/out/
+installer/tools-arm64/prefix/
+installer/tools-arm64/qemu/
+installer/tools-arm64/src/
+installer/tools-arm64/build.log
+installer/tools-arm64/heic/build/
+installer/tools-arm64/heic/dl/
+installer/tools-arm64/heic/out/
+installer/tools-arm64/heic/prefix-x86/
+installer/tools-arm64/heic/src/
+installer/tools-arm64/heic/testout/
+installer/tools-arm64/heic/build.log
+userland/heif/build/
+userland/heif/prefix/
+android/dualboot/out/
+userland/dualboot/out/
+installer/tools-arm64/heic/testdata/
+installer/tools-arm64/heic/wallpaper-notes/raw/
