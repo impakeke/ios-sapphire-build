@@ -1,0 +1,38 @@
+#!/sbin/sh
+# Sapphire's recovery ZIP: unpacks the installer's tools to /tmp/sapphire, shows the credits, and hands the
+# screen to the installer (sapphire.sh screen-on). Nothing is written to the phone's storage here: the
+# Windows app drives every step over adb.
+OUTFD=/proc/self/fd/$2
+ZIP=$3
+ui_print() { echo "ui_print $1" > $OUTFD; echo "ui_print" > $OUTFD; }
+
+ui_print " "
+ui_print "  Sapphire: iOS + Android on the Redmi Note 13"
+ui_print " "
+ui_print "  Sapphire: Angelpro09xd and contributors"
+ui_print "  Apple XNU kernel (open source)"
+ui_print "  OrangeFox, Magisk, apfs-fuse, hfsprogs,"
+ui_print "  Procursus, ElleKit, Sileo"
+ui_print "  Not affiliated with Apple or Xiaomi"
+ui_print " "
+
+S=/tmp/sapphire
+rm -rf $S
+mkdir -p $S
+if ! unzip -o -q "$ZIP" 'sapphire/*' -d /tmp; then
+	ui_print "  ERROR: the ZIP could not be unpacked"
+	exit 1
+fi
+chmod 755 $S/sapphire.sh $S/bin/*
+case "$(getprop ro.product.device)$(getprop ro.boot.hwname)" in
+*sapphire*) ;;
+*)
+	ui_print "  ERROR: this ZIP is only for the Redmi Note 13 4G (sapphire)"
+	exit 1
+	;;
+esac
+ui_print "  Complete the steps on the PC / Completa los pasos en el PC"
+ui_print " "
+# the installer's own screen is started by the PC over adb (sapphire.sh screen-on): stopping OrangeFox's UI
+# kills everything this ZIP could leave running
+exit 0
