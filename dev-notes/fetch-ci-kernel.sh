@@ -21,7 +21,7 @@ REPO=${REPO:-giovannipodesta/ios-sapphire}
 WORKFLOW=xnu-4k
 ARTIFACT=xnu-kernel-4k
 KERNEL=kernel.development.sweet
-PATCH=${PATCH:-0380-sapphire-gpu-user-memory.patch}
+PATCH=${PATCH:-0393-sapphire-fb-regs-mdss-ubwc.patch}
 INTERVAL=${INTERVAL:-30}
 
 fail() { printf '\n\033[1;31m*** FALLO: %s ***\033[0m\n' "$*" >&2; exit 1; }
