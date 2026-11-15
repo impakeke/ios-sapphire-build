@@ -1,0 +1,36 @@
+From: giovannipodesta
+Subject: [PATCH] xnu: usb 0332 — UTMI-as-PIPE clock (0331) and data path v2 (0330) on by default
+
+Both stay switchable by boot-arg for A/B (sweetusb_utmipipe=0, sweetusb_dp=0). Evidence in
+dev-notes/investigacion/03: E3/E4 (5/5 normal boots enumerate with utmipipe; R1 and E2-R1 do
+not without) and carga-1 (20 x 30 MB intact with dp=2, 0 refused starts). With the defaults in
+the kernel the cmdline is back to its original length, so the shim passes sweet_splash again.
+---
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 5797784..f019530 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -286,7 +286,12 @@ static struct {
+ } ud;
+ 
+ /* 0330: sweetusb_dp=2 selects the data path v2 (below, before ud_thread); 0 = unchanged */
+-static int ud_dp;
++/*
++ * 0332: data path v2 (0330) is the default; sweetusb_dp=0 selects the old path for an A/B.
++ * Evidence (dev-notes/investigacion/03, E4 / carga-1): 20 x 30 MB both ways intact, 0 refused
++ * Start Transfer, against the old path dying after 192 KiB (130538 refusals).
++ */
++static int ud_dp = 2;
+ #define DP_TRB_RX       0x1400          /* one data TRB per 64-byte line, away from ep0's (0x1000-0x107f) */
+ #define DP_TRB_TX       0x1440
+ #define DP_TRB_INT      0x1480
+@@ -2122,7 +2127,8 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	 * PHY being identical on both paths, and QSCRATCH GENERAL_CFG 0x4 on both (never selected).
+ 	 */
+ 	{
+-		int utmipipe = 0;
++		/* 0332: on by default (5/5 normal boots enumerate with it, 0/3 without); sweetusb_utmipipe=0 disables */
++		int utmipipe = 1;
+ 		PE_parse_boot_argn("sweetusb_utmipipe", &utmipipe, sizeof(utmipipe));
+ 		if (utmipipe) {
+ 			vm_offset_t qsg = ml_io_map(QSCRATCH_PA, 0x100);
